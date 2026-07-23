@@ -1,0 +1,79 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "data4simplace"
+version = "0.1.0"
+description = "Ingest, process and format climate (MSWX), soil (SoilGrids) and nutrient (NPK) data into SIMPLACE-ready inputs on a unified 10 km grid."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "ZALF", email = "msm-pb4@zalf.de" }]
+keywords = ["climate", "soil", "SIMPLACE", "crop-model", "geospatial", "MSWX", "SoilGrids"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Topic :: Scientific/Engineering :: GIS",
+    "Topic :: Scientific/Engineering :: Atmospheric Science",
+]
+
+dependencies = [
+    "xarray>=2024.0",
+    "rioxarray>=0.15",
+    "rasterio>=1.3",
+    "geopandas>=0.14",
+    "pandas>=2.0",
+    "numpy>=1.24",
+    "dask[complete]>=2024.0",
+    "netCDF4>=1.6",
+    "pyproj>=3.5",
+    "pyyaml>=6.0",
+    "pydantic>=2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "black>=24.0",
+    "ruff>=0.4",
+    "mypy>=1.8",
+    "build>=1.0",
+]
+docs = [
+    "mkdocs>=1.6",
+    "mkdocs-material>=9.5",
+    "mkdocs-jupyter>=0.24",
+    "mkdocstrings[python]>=0.25",
+    "pymdown-extensions>=10.0",
+]
+
+[project.scripts]
+data4simplace = "data4simplace.cli:main"
+simplace-pipeline = "data4simplace.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+data4simplace = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.black]
+line-length = 100
+target-version = ["py310"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.mypy]
+python_version = "3.10"
+warn_unused_ignores = true
+ignore_missing_imports = true

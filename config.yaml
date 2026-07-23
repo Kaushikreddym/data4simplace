@@ -1,0 +1,70 @@
+# =============================================================================
+# data4simplace — execution configuration
+# =============================================================================
+# Every pipeline step is toggled by an explicit boolean flag. Paths and the
+# target grid are validated by data4simplace.config.PipelineConfig (pydantic).
+# =============================================================================
+
+# --- Module execution flags --------------------------------------------------
+flags:
+  run_climate_processing: true      # MSWX climate processing
+  run_soil_processing: true         # SoilGrids soil processing
+  compute_ptf: false                # Optional pedotransfer functions (hydraulics)
+  run_npk_processing: true          # NPK / fertilizer processing
+  apply_agricultural_mask: true     # Cropland mask filtering
+  export_simplace_weather: true     # SIMPLACE weather file export
+  export_simplace_soil: true        # SIMPLACE soil file export
+  export_simplace_management: true  # SIMPLACE management / fertilizer export
+
+# --- Target 10 km grid (WGS84 degrees) ---------------------------------------
+# Brandenburg (Germany) default bounding box. 10 km ~= 0.1 degrees.
+grid:
+  resolution_deg: 0.1
+  min_lon: 11.2
+  max_lon: 14.8
+  min_lat: 51.3
+  max_lat: 53.6
+  crs: "EPSG:4326"
+
+# --- Time window (used by the climate handler) -------------------------------
+time:
+  start: "1979-01-01"
+  end: "1979-01-31"
+
+# --- Input data sources ------------------------------------------------------
+paths:
+  mswx_root: "/data01/FDS/muduchuru/Atmos/MSWX"
+  soilgrids_root: null              # local SoilGrids tiles; null -> fetch via WCS
+  npk_root: null                    # local NPK rasters; null -> skip alignment
+  cropland_mask: null               # raster/vector cropland mask; null -> no mask
+  output_dir: "./output"
+
+# --- SIMPLACE reference files (source of truth for output structure) ---------
+reference:
+  weather_dir: "/beegfs/muduchuru/simplace/Brandenburg_1KM_winter_wheat/data/weather"
+  soil_dir: "/beegfs/muduchuru/simplace/Brandenburg_1KM_winter_wheat/data/soil"
+  management_file: "/beegfs/muduchuru/simplace/Brandenburg_1KM_winter_wheat/data/management/fertilizer_winter_wheat.csv"
+
+# --- MSWX variable folder -> canonical name mapping --------------------------
+climate:
+  variables:
+    TASMIN: tasmin      # daily minimum air temperature [degC]
+    TASMAX: tasmax      # daily maximum air temperature [degC]
+    TAS: tas            # daily mean air temperature [degC]
+    RSDS: rsds          # surface downwelling shortwave radiation [W m-2]
+    PR: pr              # precipitation [mm day-1]
+    HURS: hurs          # near-surface relative humidity [%]
+  chunks:
+    time: 30
+    lat: 512
+    lon: 512
+
+# --- SoilGrids configuration -------------------------------------------------
+soil:
+  layers: [clay, silt, sand, bdod, soc, phh2o, nitrogen]
+  depths: ["0-5cm", "5-15cm", "15-30cm", "30-60cm", "60-100cm", "100-200cm"]
+  homolosine_crs: "EPSG:152160"
+  target_crs: "EPSG:4326"
+
+# --- Missing-value sentinel (overridden by reference inspection when present) -
+missing_value: -99

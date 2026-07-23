@@ -1,0 +1,100 @@
+site_name: data4simplace
+site_description: >-
+  Ingest, process and format climate (MSWX), soil (SoilGrids) and nutrient
+  (NPK) data into SIMPLACE-ready inputs on a unified 10 km grid.
+site_author: ZALF
+repo_name: data4simplace
+# repo_url: https://github.com/<org>/data4simplace   # set when the repo is public
+copyright: Copyright &copy; ZALF
+
+theme:
+  name: material
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: green
+      accent: teal
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: green
+      accent: teal
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+  features:
+    - navigation.instant
+    - navigation.tracking
+    - navigation.sections
+    - navigation.top
+    - navigation.indexes
+    - content.code.copy
+    - content.code.annotate
+    - toc.follow
+    - search.suggest
+    - search.highlight
+  icon:
+    repo: fontawesome/brands/github
+
+nav:
+  - Home: index.md
+  - Getting started:
+      - Installation: installation.md
+      - Configuration: configuration.md
+      - Command line: cli.md
+  - Examples:
+      - Overview: examples/index.md
+      - 1 · Quickstart: examples/01_quickstart.ipynb
+      - 2 · The 10 km target grid: examples/02_target_grid.ipynb
+      - 3 · Pedotransfer functions: examples/03_pedotransfer_functions.ipynb
+      - 4 · Running the full pipeline: examples/04_full_pipeline.ipynb
+  - API reference:
+      - Overview: api/index.md
+      - Configuration: api/config.md
+      - Target grid: api/grid.md
+      - Pipeline: api/pipeline.md
+      - Handlers: api/handlers.md
+      - Exporters: api/exporters.md
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+
+plugins:
+  - search
+  - mkdocs-jupyter:
+      include_source: true
+      execute: false          # set true in CI once input datasets are reachable
+      allow_errors: false
+  - mkdocstrings:
+      default_handler: python
+      handlers:
+        python:
+          paths: [src]
+          options:
+            docstring_style: numpy
+            show_source: true
+            show_root_heading: true
+            show_signature_annotations: true
+            separate_signature: true
+            merge_init_into_class: true
+            members_order: source
+
+extra_css:
+  - stylesheets/extra.css
