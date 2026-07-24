@@ -21,3 +21,6 @@ venv/
 
 # Personal Claude Code settings
 .claude/settings.local.json
+
+# Demo notebook downloads
+outputs_demo/

@@ -20,9 +20,10 @@ conventions required by the **SIMPLACE** crop-model simulation framework.
 | Purpose | Path |
 | --- | --- |
 | Climate input (MSWX) | `/data01/FDS/muduchuru/Atmos/MSWX` |
-| SIMPLACE reference — weather | `/beegfs/halder/SIMPLACE_WDIR/Brandenburg_1KM_winter_wheat/data/weather` |
-| SIMPLACE reference — soil | `/beegfs/halder/SIMPLACE_WDIR/Brandenburg_1KM_winter_wheat/data/soil` |
-| SIMPLACE reference — management | `/beegfs/halder/SIMPLACE_WDIR/Brandenburg_1KM_winter_wheat/data/management/fertilizer_winter_wheat.csv` |
+| Cropland cover (Copernicus PROBA-V LC100) | `/data01/FDS/muduchuru/Land/LULC/CopernicusLandCover` |
+| SIMPLACE reference — weather | `/beegfs/muduchuru/simplace/Brandenburg_1KM_winter_wheat/data/weather` |
+| SIMPLACE reference — soil | `/beegfs/muduchuru/simplace/Brandenburg_1KM_winter_wheat/data/soil` |
+| SIMPLACE reference — management | `/beegfs/muduchuru/simplace/Brandenburg_1KM_winter_wheat/data/management/fertilizer_winter_wheat.csv` |
 
 The reference files above are the source of truth for output structure. Inspect
 them dynamically rather than hard-coding headers.
@@ -106,7 +107,12 @@ Every pipeline step is controlled by an explicit boolean flag:
 - **CRS reprojection:** reproject from Homolosine (`EPSG:152160`) to `EPSG:4326`
   **before** 10 km spatial aggregation.
 - **Optional PTF:** if `compute_ptf=true`, derive hydraulic parameters
-  (Saxton-Rawls or Wösten); otherwise skip hydraulic derivations.
+  (Saxton-Rawls or Wösten); otherwise skip hydraulic derivations. PTFs are
+  non-linear, so they must be computed at **250 m before aggregation** — see
+  [Agricultural Mask & Soil Aggregation Workflow](#agricultural-mask--soil-aggregation-workflow).
+- **Cropland masking & aggregation:** the soil pipeline masks to the dominant
+  soil type per cell using cropland weights and aggregates at 250 m; see the
+  dedicated workflow section below for the full procedure.
 
 ### NPK Handler
 
@@ -119,6 +125,75 @@ Every pipeline step is controlled by an explicit boolean flag:
   missing-value sentinels (`-99`), and depth horizons.
 - Generate weather, soil, and management/fertilizer files matching SIMPLACE
   input standards.
+
+## Agricultural Mask & Soil Aggregation Workflow
+
+Cropland masking and soil aggregation are performed at the **native 250 m
+resolution first**, then aggregated to the 10 km target grid. Never aggregate
+raw inputs before masking or before running non-linear equations.
+
+**Cropland weights** come from the Copernicus PROBA-V LC100 100 m
+`Crops-CoverFraction` layer under
+`/data01/FDS/muduchuru/Land/LULC/CopernicusLandCover`:
+
+```text
+PROBAV_LC100_global_v3.0.1_2019-nrt_Crops-CoverFraction-layer_EPSG-4326.tif
+```
+
+### 1. Core workflow
+
+1. Load SoilGrids 250 m rasters and un-scale them via the standard module logic.
+2. Align and apply the PROBA-V 100 m cropland `Crops-CoverFraction` weights to
+   the 250 m soil grid.
+3. Classify/select the **dominant soil type** per target cell according to the
+   `config.yaml` setting (`usda` or `wrb`; see §2).
+4. Mask 250 m pixels to keep **only** the selected dominant soil type within each
+   target grid cell.
+5. Compute non-linear Pedotransfer Functions (PTFs) at **250 m first**, on the
+   masked pixels.
+6. Aggregate properties spatially over the dominant soil type using cropland
+   weights and the variable-specific rules (see §3).
+7. Post-normalize texture fractions so `clay + silt + sand = 100 %`.
+
+### 2. Dominant soil-type selection (`config.yaml`)
+
+Selected via a config setting, e.g. `soil.dominant_mode: usda | wrb`.
+
+**Mode A — `usda` (USDA texture-class dominance)**
+
+1. Derive the 250 m USDA soil texture class (12 classes) from unscaled sand,
+   silt and clay.
+2. Sum cropland weights per USDA class within each target grid cell.
+3. Select the USDA texture class with the highest total cropland weight as the
+   dominant class.
+4. Mask 250 m pixels: keep **only** pixels matching the dominant USDA class in
+   that cell.
+
+**Mode B — `wrb` (WRB Reference Soil Group dominance)**
+
+1. Load the 250 m SoilGrids WRB `MostProbable` layer.
+2. Sum cropland weights per WRB soil code within each target grid cell.
+3. Select the WRB class with the highest total cropland weight as the dominant
+   class.
+4. Mask 250 m pixels: keep **only** pixels matching the dominant WRB class in
+   that cell.
+
+### 3. Variable-specific aggregation rules
+
+Run on the masked dominant pixels, weighted by cropland cover fraction `W`.
+
+| Variable group | Variables | Aggregation |
+| --- | --- | --- |
+| Linear | `clay`, `silt`, `sand`, `bdod`, `cfvo` | Cropland-weighted arithmetic mean |
+| Skewed / log-normal | `soc`, `nitrogen` | Cropland-weighted geometric mean: `exp(Σ(ln(X)·W) / ΣW)` |
+| Logarithmic | `phh2o` | Convert to `[H⁺] = 10^(−pH)`, weighted mean, back-convert `−log₁₀(mean[H⁺])` |
+| Non-linear PTFs | `AWC`, `Ksat` | Compute the PTF at 250 m **first**, then aggregate the output — never aggregate the inputs before a non-linear equation |
+
+### 4. Post-processing & gap filling
+
+- **Texture normalization:** `out_fraction = (fraction / (clay + silt + sand)) × 100`.
+- **Missing target cells** (coastal / islands): fill via nearest-neighbour
+  distance search from the nearest valid land cell.
 
 ## Code Standards
 

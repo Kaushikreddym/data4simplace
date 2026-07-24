@@ -13,6 +13,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import xarray as xr
 
@@ -30,9 +31,8 @@ _CANONICAL_TO_SIMPLACE = {
     "rsds": "Radiation",
     "hurs": "RelHumCalc",
 }
-# Reference columns that cannot be derived from MSWX inputs (filled with the
-# sentinel via conform()): wind speed and reference evapotranspiration.
-_UNAVAILABLE = ("Windspeed", "RefET")
+# Reference columns MSWX cannot provide (Windspeed, RefET) are left for
+# conform() to fill with the reference sentinel.
 
 
 class WeatherExporter(BaseExporter):
@@ -63,9 +63,21 @@ class WeatherExporter(BaseExporter):
         )
 
     @staticmethod
-    def _gridcell_id(cell: pd.Series) -> str:
-        """SIMPLACE ``C_<col>:R_<row>`` identifier from grid indices."""
-        return f"C_{int(cell['col'])}:R_{int(cell['row'])}"
+    def _identity(cell: pd.Series) -> tuple[int, int]:
+        """Global ``(col, row)`` for naming: ``gcol``/``grow`` if present, else local.
+
+        Under tiled execution the cell table carries local ``row``/``col`` (for
+        indexing the tile's data arrays) plus global ``grow``/``gcol`` so that
+        output filenames and ``Gridcell`` ids stay consistent across tiles.
+        """
+        col = int(cell["gcol"]) if "gcol" in cell.index else int(cell["col"])
+        row = int(cell["grow"]) if "grow" in cell.index else int(cell["row"])
+        return col, row
+
+    def _gridcell_id(self, cell: pd.Series) -> str:
+        """SIMPLACE ``C_<col>:R_<row>`` identifier from (global) grid indices."""
+        col, row = self._identity(cell)
+        return f"C_{col}:R_{row}"
 
     def build_frame(self, cell: pd.Series, climate: xr.Dataset) -> pd.DataFrame:
         """Build a daily weather table for a single grid cell.
@@ -76,16 +88,18 @@ class WeatherExporter(BaseExporter):
             One row of :meth:`TargetGrid.cell_table` (``SimplaceID``, row, col,
             lat, lon).
         climate:
-            Regridded climate dataset with dims ``(time, lat, lon)``.
+            Regridded climate dataset with dims ``(time, lat, lon)``. For a
+            single cell this materialises only that column; :meth:`export`
+            materialises the whole (small) grid once for bulk output.
         """
-        point = climate.sel(lat=cell["lat"], lon=cell["lon"], method="nearest")
-        times = pd.to_datetime(point["time"].values)
-        frame = pd.DataFrame({"Date": times.strftime("%Y-%m-%d")})
+        dates = pd.to_datetime(climate["time"].values).strftime("%Y-%m-%d")
+        point = climate.isel(lat=int(cell["row"]), lon=int(cell["col"]))
+        frame = pd.DataFrame({"Date": dates})
 
         for canonical, column in _CANONICAL_TO_SIMPLACE.items():
             if canonical in point.data_vars:
-                values = point[canonical].compute().values
-                frame[column] = pd.Series(values).round(2).to_numpy()
+                values = np.asarray(point[canonical].values)
+                frame[column] = np.round(values, 2)
 
         frame["Gridcell"] = self._gridcell_id(cell)
         return frame
@@ -96,18 +110,38 @@ class WeatherExporter(BaseExporter):
         cell_table: pd.DataFrame,
         output_dir: str | Path,
     ) -> list[Path]:
-        """Write one gzipped weather file per cell; return the written paths."""
+        """Write one gzipped weather file per cell; return the written paths.
+
+        The regridded dataset is materialised **once** up front so per-cell
+        extraction is pure in-memory indexing — the whole 10 km grid is small
+        (``n_time × n_lat × n_lon``) even for a full domain, whereas computing
+        lazily per cell would re-run the regrid graph for every cell.
+        """
         out_dir = Path(output_dir) / "weather"
         out_dir.mkdir(parents=True, exist_ok=True)
-        weather_cols = [c for c in _CANONICAL_TO_SIMPLACE.values()]
+
+        logger.debug("Materialising regridded climate grid before per-cell export")
+        climate = climate.load()
+
+        # Precompute the shared date column and the per-variable value cubes.
+        dates = pd.to_datetime(climate["time"].values).strftime("%Y-%m-%d")
+        present = {c: v for c, v in _CANONICAL_TO_SIMPLACE.items() if c in climate.data_vars}
+        cubes = {col: np.round(np.asarray(climate[canon].values), 2)
+                 for canon, col in present.items()}  # each shaped (time, lat, lon)
         written: list[Path] = []
 
         for _, cell in cell_table.iterrows():
-            frame = self.build_frame(cell, climate)
-            present = [c for c in weather_cols if c in frame.columns]
-            if not present or frame[present].dropna(how="all").empty:
-                continue  # no valid climate data for this cell (e.g. masked)
-            fname = f"daily_mean_RES1_C{int(cell['col'])}R{int(cell['row'])}.csv.gz"
+            # Local row/col index the tile's data cube; global (g)col/(g)row name
+            # the output so files stay unique and consistent across tiles.
+            row, col = int(cell["row"]), int(cell["col"])
+            gcol, grow = self._identity(cell)
+            columns = {name: cube[:, row, col] for name, cube in cubes.items()}
+            # Skip cells with no valid climate data anywhere (e.g. masked out).
+            if not columns or all(np.isnan(v).all() for v in columns.values()):
+                continue
+            frame = pd.DataFrame({"Date": dates, **columns})
+            frame["Gridcell"] = self._gridcell_id(cell)
+            fname = f"daily_mean_RES1_C{gcol}R{grow}.csv.gz"
             written.append(self.write_csv(frame, out_dir / fname))
 
         logger.info("Exported %d weather files to %s", len(written), out_dir)

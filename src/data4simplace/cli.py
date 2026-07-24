@@ -37,6 +37,21 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Validate the configuration and report enabled stages without running them.",
     )
     parser.add_argument(
+        "--tile-deg",
+        type=float,
+        default=None,
+        help="Run tile by tile with ~this edge length in degrees (restartable). "
+        "Required for large domains (e.g. continental) to bound memory and keep "
+        "SoilGrids WCS requests within limits. Omit for a single in-memory run.",
+    )
+    parser.add_argument(
+        "--combine-only",
+        action="store_true",
+        help="Skip processing; just combine existing tile outputs into final "
+        "files (mosaic soil shards into soil.csv). Weather files are already "
+        "per-cell global. Pass --tile-deg to also check tile completeness.",
+    )
+    parser.add_argument(
         "--verbose",
         "-v",
         action="store_true",
@@ -84,12 +99,33 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     try:
-        result = Pipeline(config).run()
+        if args.combine_only:
+            from data4simplace.tiling import combine_tiles
+
+            stats = combine_tiles(config, tile_deg=args.tile_deg)
+            log.info(
+                "Combined tiles: %d weather files, soil.csv %d rows (%d/%d tiles done) under %s",
+                stats["weather_files"], stats["soil_rows"],
+                stats["tiles_done"], stats["tiles_expected"], config.paths.output_dir,
+            )
+        elif args.tile_deg is not None:
+            from data4simplace.tiling import run_tiled
+
+            stats = run_tiled(config, tile_deg=args.tile_deg)
+            log.info(
+                "Done (tiled). %d/%d tiles, %d cells exported under %s",
+                stats["done"], stats["tiles"], stats["cells"], config.paths.output_dir,
+            )
+        else:
+            result = Pipeline(config).run()
+            log.info(
+                "Done. Wrote %d output file(s) under %s",
+                len(result.written), config.paths.output_dir,
+            )
     except Exception as exc:  # noqa: BLE001 - surface any stage failure to the CLI
         log.error("Pipeline failed: %s", exc, exc_info=args.verbose)
         return 1
 
-    log.info("Done. Wrote %d output file(s) under %s", len(result.written), config.paths.output_dir)
     return 0
 
 

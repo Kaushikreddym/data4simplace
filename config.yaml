@@ -17,26 +17,28 @@ flags:
   export_simplace_management: true  # SIMPLACE management / fertilizer export
 
 # --- Target 10 km grid (WGS84 degrees) ---------------------------------------
-# Brandenburg (Germany) default bounding box. 10 km ~= 0.1 degrees.
+# Europe: 17W..52E, 34N..72N (Mediterranean islands to North Cape). 10 km ~= 0.1 deg.
+# => 690 x 380 = 262,200 cells. See the memory/runtime notes before running whole.
 grid:
   resolution_deg: 0.1
-  min_lon: 11.2
-  max_lon: 14.8
-  min_lat: 51.3
-  max_lat: 53.6
+  min_lon: -17.0
+  max_lon: 52.0
+  min_lat: 34.0
+  max_lat: 72.0
   crs: "EPSG:4326"
 
 # --- Time window (used by the climate handler) -------------------------------
 time:
   start: "1979-01-01"
-  end: "1979-01-31"
+  end: "2024-12-31"
 
 # --- Input data sources ------------------------------------------------------
 paths:
   mswx_root: "/data01/FDS/muduchuru/Atmos/MSWX"
-  soilgrids_root: null              # local SoilGrids tiles; null -> fetch via WCS
+  soilgrids_root: "/data01/FDS/muduchuru/Land/SoilGrids"             # local SoilGrids tiles; null -> fetch via WCS
   npk_root: null                    # local NPK rasters; null -> skip alignment
   cropland_mask: null               # raster/vector cropland mask; null -> no mask
+  cropland_weights_path: "/data01/FDS/muduchuru/Land/LULC/CopernicusLandCover/PROBAV_LC100_global_v3.0.1_2019-nrt_Crops-CoverFraction-layer_EPSG-4326.tif"
   output_dir: "./output"
 
 # --- SIMPLACE reference files (source of truth for output structure) ---------
@@ -65,6 +67,37 @@ soil:
   depths: ["0-5cm", "5-15cm", "15-30cm", "30-60cm", "60-100cm", "100-200cm"]
   homolosine_crs: "EPSG:152160"
   target_crs: "EPSG:4326"
+  # Dominant soil-type aggregation: usda | usda_profile | wrb | none. All but
+  # none filter 250 m pixels to cropland (>= cropland_min_fraction), pick the
+  # dominant class per target cell and aggregate only those pixels.
+  #   usda         -> 12 USDA texture classes of the topsoil layer
+  #   usda_profile -> 12 x 12 composite (topsoil, rooting-zone) texture classes,
+  #                   so layered profiles (sandy cover over loamy till) are not
+  #                   merged by a shared surface texture
+  #   wrb          -> WRB Reference Soil Group (whole-profile classification)
+  #   none         -> legacy plain-mean regrid
+  dominant_mode: usda_profile
+  rootzone_bottom_cm: 100    # rooting zone = topsoil bottom (5 cm) .. this depth
+  cropland_min_fraction: 0.8
+  wrb_layer: MostProbable    # WRB coverage id, used when dominant_mode: wrb
+  fill_missing: true         # nearest-neighbour fill for empty coastal/island cells
+  # WCS fallback: when a coverage is not found under paths.soilgrids_root, fetch
+  # it from the ISRIC SoilGrids service (subset to the grid bbox, disk-cached).
+  use_wcs: true
+  wcs_stat: mean
+  wcs_crs: "EPSG:4326"      # request CRS; 4326 fetches directly in lon/lat
+  wcs_cache_dir: null       # null -> <soilgrids_root>/_wcs_cache or a temp dir
+  wcs_timeout: 180
+
+# --- Agricultural mask -------------------------------------------------------
+mask:
+  # auto -> use paths.cropland_mask if set, else fetch CORINE Land Cover.
+  source: auto              # auto | file | corine | none
+  threshold: 0.5            # min agricultural fraction (0-1) to keep a cell
+  corine_year: 2018
+  resolution_m: 100.0       # CLC sampling resolution for the fraction estimate
+  max_pixels: 2048          # per-axis WMS request cap (coarsens if exceeded)
+  cache_dir: "/data01/FDS/muduchuru/Land/LULC/CopernicusLandCover"
 
 # --- Missing-value sentinel (overridden by reference inspection when present) -
 missing_value: -99

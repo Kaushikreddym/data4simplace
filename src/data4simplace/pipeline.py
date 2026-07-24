@@ -22,7 +22,6 @@ from data4simplace.exporters import ManagementExporter, SoilExporter, WeatherExp
 from data4simplace.grid import TargetGrid
 from data4simplace.npk import NPKHandler
 from data4simplace.soil import SoilGridsHandler
-from data4simplace.soil.ptf import saxton_rawls
 from data4simplace.spatial import CroplandMask
 
 logger = logging.getLogger(__name__)
@@ -64,21 +63,20 @@ class Pipeline:
             result.climate = MSWXHandler(self._config).load()
 
         if flags.run_soil_processing:
-            logger.info("Stage: soil processing (SoilGrids)")
-            soil = SoilGridsHandler(self._config).load()
-            soil = SoilGridsHandler.normalise_texture(soil)
-            result.soil = soil
-
-            if flags.compute_ptf and {"sand", "clay"}.issubset(soil.data_vars):
-                logger.info("Stage: pedotransfer functions (Saxton-Rawls)")
-                om = None
-                if "soc" in soil.data_vars:
-                    om = soil["soc"] * 0.1 * 1.724  # g/kg SOC -> % organic matter
-                result.hydraulic = saxton_rawls(soil["sand"], soil["clay"], om)
+            logger.info(
+                "Stage: soil processing (SoilGrids, mode=%s)",
+                self._config.soil.dominant_mode,
+            )
+            result.soil, result.hydraulic = SoilGridsHandler(self._config).load_processed()
 
         if flags.run_npk_processing:
             logger.info("Stage: NPK processing")
-            result.npk = NPKHandler(self._config).load()
+            npk = NPKHandler(self._config).load()
+            # An empty dataset (no rasters found) carries no lat/lon; treat it as
+            # absent so masking and management export skip it cleanly.
+            result.npk = npk if len(npk.data_vars) else None
+            if result.npk is None:
+                logger.warning("NPK processing produced no layers; downstream NPK steps will skip")
 
         # --- Cropland masking -------------------------------------------------
         if flags.apply_agricultural_mask:

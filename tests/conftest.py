@@ -49,10 +49,10 @@ def config(config_dict) -> PipelineConfig:
 
 @pytest.fixture()
 def soil_dataset() -> xr.Dataset:
-    """A tiny depth-resolved soil dataset on a 2x2 grid."""
+    """A depth-resolved soil dataset on a 2x2 grid with SoilGrids depths."""
     lat = np.array([52.25, 52.15])
     lon = np.array([11.25, 11.35])
-    depth = ["0-5cm", "5-15cm"]
+    depth = ["0-5cm", "5-15cm", "15-30cm", "30-60cm", "60-100cm", "100-200cm"]
     shape = (len(depth), len(lat), len(lon))
 
     def layer(value):
