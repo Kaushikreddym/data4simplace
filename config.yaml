@@ -12,6 +12,7 @@ flags:
   compute_ptf: false                # Optional pedotransfer functions (hydraulics)
   run_npk_processing: true          # NPK / fertilizer processing
   apply_agricultural_mask: true     # Cropland mask filtering
+  write_soil_statistics: true       # Per-class NetCDF stats + class-share table
   export_simplace_weather: true     # SIMPLACE weather file export
   export_simplace_soil: true        # SIMPLACE soil file export
   export_simplace_management: true  # SIMPLACE management / fertilizer export
@@ -79,6 +80,12 @@ soil:
   dominant_mode: usda_profile
   rootzone_bottom_cm: 100    # rooting zone = topsoil bottom (5 cm) .. this depth
   cropland_min_fraction: 0.8
+  # Three-primary-class statistics (flags.write_soil_statistics). Rank 1 is the
+  # dominant class the CSVs carry; ranks 2..n quantify the inter-class spread.
+  n_primary_classes: 3
+  # Statistic written to the SIMPLACE CSVs: mean (variable-specific mean rules:
+  # arithmetic, geometric for soc/nitrogen, H+ mean for phh2o) | median.
+  export_statistic: mean
   wrb_layer: MostProbable    # WRB coverage id, used when dominant_mode: wrb
   fill_missing: true         # nearest-neighbour fill for empty coastal/island cells
   # WCS fallback: when a coverage is not found under paths.soilgrids_root, fetch

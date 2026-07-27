@@ -17,6 +17,8 @@ import logging
 import tempfile
 from pathlib import Path
 
+from typing import TYPE_CHECKING
+
 import requests
 import rioxarray  # noqa: F401  (registers the .rio accessor)
 import xarray as xr
@@ -24,6 +26,9 @@ from pyproj import CRS, Transformer
 
 from data4simplace.config import PipelineConfig
 from data4simplace.grid import TargetGrid
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from data4simplace.soil.statistics import PrimaryClassStatistics
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +54,14 @@ SCALE_FACTORS: dict[str, float] = {
     "cfvo": 10.0,      # cm3/dm3 -> %
 }
 
+# Layers where a stored ``0`` means "no data" rather than a measurement. The
+# GeoTIFFs carry no nodata tag, so the sentinel has to be masked by value; see
+# :meth:`SoilGridsHandler.mask_nodata`. ``cfvo`` is deliberately absent: a soil
+# with no coarse fragments legitimately reads 0.
+ZERO_IS_NODATA: frozenset[str] = frozenset(
+    {"clay", "silt", "sand", "bdod", "soc", "phh2o", "nitrogen", "cec"}
+)
+
 # WCS base per property (SoilGrids v2 Web Coverage Service, Homolosine grid).
 _WCS_BASE = "https://maps.isric.org/mapserv?map=/map/{layer}.map"
 
@@ -69,6 +82,9 @@ class SoilGridsHandler:
         self._root = config.paths.soilgrids_root
         self._cache_dir = self._resolve_cache_dir()
         self._homolosine: CRS | None = None
+        # Populated by :meth:`load_dominant` when ``flags.write_soil_statistics``
+        # is set; the pipeline writes it to the intermediate NetCDF/CSV files.
+        self.class_statistics: "PrimaryClassStatistics | None" = None
 
     def _resolve_cache_dir(self) -> Path:
         """Directory for cached WCS downloads (created lazily on first fetch)."""
@@ -271,6 +287,24 @@ class SoilGridsHandler:
             return da
         return da / factor
 
+    @staticmethod
+    def mask_nodata(da: xr.DataArray, layer: str) -> xr.DataArray:
+        """Mask the SoilGrids no-data sentinel for ``layer``.
+
+        The GeoTIFFs (WCS subsets in particular) carry **no nodata tag** and
+        write ``0`` over water, ice and other gaps, so ``masked=True`` on open
+        does not catch them. Left in, such a pixel reads as a real measurement:
+        a 0/0/0 texture pixel classifies as USDA *sand* and joins the majority
+        vote, and a pH of 0 dominates the H+ mean (``10**-0 = 1``).
+
+        Zero is masked for every layer where it is physically impossible; see
+        :data:`ZERO_IS_NODATA`. ``cfvo`` is excluded because a soil genuinely
+        free of coarse fragments is 0.
+        """
+        if layer not in ZERO_IS_NODATA:
+            return da
+        return da.where(da > 0)
+
     def reproject(self, da: xr.DataArray) -> xr.DataArray:
         """Reproject a coverage to the target CRS (WGS84), if needed.
 
@@ -306,7 +340,7 @@ class SoilGridsHandler:
                 raw = self._open_coverage(layer, depth)
                 if raw is None:
                     continue
-                unscaled = self.unscale(raw, layer)
+                unscaled = self.mask_nodata(self.unscale(raw, layer), layer)
                 wgs84 = self.reproject(unscaled)
                 regridded = self._grid.regrid(wgs84, method="mean")
                 depth_slices.append(regridded)
@@ -339,6 +373,10 @@ class SoilGridsHandler:
         Returns a ``{layer: {depth: DataArray}}`` mapping plus a reference grid
         (the first coverage loaded). All other coverages are ``reproject_match``-ed
         onto that reference so pixels are perfectly aligned for masking.
+
+        The no-data sentinel is masked before reprojection (see
+        :meth:`mask_nodata`), so gap pixels cannot vote on the soil class or
+        enter an aggregate.
         """
         fine: dict[str, dict[str, xr.DataArray]] = {}
         reference: xr.DataArray | None = None
@@ -349,7 +387,7 @@ class SoilGridsHandler:
                 raw = self._open_coverage(layer, depth)
                 if raw is None:
                     continue
-                wgs84 = self.reproject(self.unscale(raw, layer))
+                wgs84 = self.reproject(self.mask_nodata(self.unscale(raw, layer), layer))
                 if reference is None:
                     reference = wgs84
                 else:
@@ -383,7 +421,6 @@ class SoilGridsHandler:
         from data4simplace.grid import _standardise_lonlat_names
         from data4simplace.soil.aggregate import (
             bin_reduce,
-            cell_mean,
             fill_missing_cells,
             reducer_for,
         )
@@ -415,11 +452,17 @@ class SoilGridsHandler:
             self._soil.dominant_mode,
         )
 
+        # --- Optional: statistics for the n most frequent classes ------------
+        # Computed before masking, since ranks 2..n need their own pixel sets.
+        if self._config.flags.write_soil_statistics:
+            self.class_statistics = self._primary_class_statistics(class_fine, fine)
+
         # --- Mask every fine coverage, aggregate per rule --------------------
+        statistic = self._soil.export_statistic
         per_layer: dict[str, xr.DataArray] = {}
         masked_fine: dict[str, dict[str, xr.DataArray]] = {}
         for layer, depths in fine.items():
-            reducer = reducer_for(layer)
+            reducer = reducer_for(layer, statistic)
             slices: list[xr.DataArray] = []
             loaded: list[str] = []
             masked_fine[layer] = {}
@@ -438,7 +481,9 @@ class SoilGridsHandler:
         # --- Optional PTFs: compute at 250 m, then aggregate the outputs -----
         hydraulic: xr.Dataset | None = None
         if self._config.flags.compute_ptf and {"sand", "clay"}.issubset(masked_fine):
-            hydraulic = self._ptf_dominant(masked_fine, saxton_rawls, bin_reduce, cell_mean)
+            hydraulic = self._ptf_dominant(
+                masked_fine, saxton_rawls, bin_reduce, reducer_for("theta", statistic)
+            )
 
         # --- Nearest-neighbour gap fill for empty coastal/island cells -------
         if self._soil.fill_missing:
@@ -447,6 +492,73 @@ class SoilGridsHandler:
                 hydraulic = fill_missing_cells(hydraulic)
 
         return soil, hydraulic
+
+    def _primary_class_statistics(
+        self,
+        class_fine: xr.DataArray,
+        fine: dict[str, dict[str, xr.DataArray]],
+    ) -> "PrimaryClassStatistics":
+        """Describe the ``soil.n_primary_classes`` most frequent classes per cell.
+
+        For each rank the 250 m pixels of that class are summarised per property
+        and depth (mean, median, std, excess kurtosis, pixel count), so the
+        exported single profile can be put in context: rank 1 is what the CSV
+        carries, ranks 2..n are the classes it leaves out.
+
+        Parameters
+        ----------
+        class_fine:
+            The 250 m class field, already cropland-filtered (``0`` elsewhere).
+        fine:
+            ``{layer: {depth: DataArray}}`` of un-scaled 250 m coverages.
+
+        Returns
+        -------
+        PrimaryClassStatistics
+            Ranked class codes/shares plus the per-class statistics.
+        """
+        from data4simplace.soil.aggregate import bin_describe
+        from data4simplace.soil.dominant import dominant_pixel_mask, rank_classes_per_cell
+        from data4simplace.soil.statistics import PrimaryClassStatistics
+
+        n_classes = self._soil.n_primary_classes
+        ranked = rank_classes_per_cell(class_fine, self._grid, n_classes)
+        logger.info(
+            "Describing the %d most frequent %s class(es) per cell "
+            "(mean/median/std/kurtosis)",
+            n_classes,
+            self._soil.dominant_mode,
+        )
+
+        # {variable: [per-rank DataArray]}, each per-rank array stacked over depth.
+        collected: dict[str, list[xr.DataArray]] = {}
+        for rank in ranked["rank"].values:
+            mask = dominant_pixel_mask(class_fine, ranked["class_code"].sel(rank=rank))
+            for layer, depths in fine.items():
+                per_stat: dict[str, list[xr.DataArray]] = {}
+                loaded: list[str] = []
+                for depth, da in depths.items():
+                    described = bin_describe(da.where(mask), self._grid)
+                    for stat, values in described.data_vars.items():
+                        per_stat.setdefault(stat, []).append(values)
+                    loaded.append(depth)
+                if not loaded:
+                    continue
+                for stat, slices in per_stat.items():
+                    stacked = xr.concat(slices, dim="depth").assign_coords(depth=loaded)
+                    collected.setdefault(f"{layer}_{stat}", []).append(stacked)
+
+        stats = xr.Dataset(
+            {
+                name: xr.concat(per_rank, dim="rank").assign_coords(
+                    rank=ranked["rank"].values
+                )
+                for name, per_rank in collected.items()
+            }
+        )
+        return PrimaryClassStatistics(
+            classes=ranked, stats=stats, mode=self._soil.dominant_mode
+        )
 
     def _class_field(
         self, fine: dict[str, dict[str, xr.DataArray]], reference: xr.DataArray

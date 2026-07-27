@@ -86,6 +86,7 @@ Every pipeline step is controlled by an explicit boolean flag:
 | `compute_ptf` | Optional Pedotransfer Functions (hydraulic parameters) |
 | `run_npk_processing` | NPK/fertilizer processing |
 | `apply_agricultural_mask` | Cropland mask filtering |
+| `write_soil_statistics` | Per-class NetCDF statistics + class-share table |
 | `export_simplace_weather` | SIMPLACE weather file export |
 | `export_simplace_soil` | SIMPLACE soil file export |
 | `export_simplace_management` | SIMPLACE management/fertilizer export |
@@ -113,6 +114,9 @@ Every pipeline step is controlled by an explicit boolean flag:
 - **Cropland masking & aggregation:** the soil pipeline masks to the dominant
   soil type per cell using cropland weights and aggregates at 250 m; see the
   dedicated workflow section below for the full procedure.
+- **Per-class statistics:** with `write_soil_statistics=true` the stage also
+  describes the `soil.n_primary_classes` most frequent classes per cell; see
+  [Primary-Class Statistics](#primary-class-statistics-intermediate-outputs).
 
 ### NPK Handler
 
@@ -146,7 +150,7 @@ PROBAV_LC100_global_v3.0.1_2019-nrt_Crops-CoverFraction-layer_EPSG-4326.tif
 2. Align and apply the PROBA-V 100 m cropland `Crops-CoverFraction` weights to
    the 250 m soil grid.
 3. Classify/select the **dominant soil type** per target cell according to the
-   `config.yaml` setting (`usda` or `wrb`; see §2).
+   `config.yaml` setting (`usda`, `usda_profile` or `wrb`; see §2).
 4. Mask 250 m pixels to keep **only** the selected dominant soil type within each
    target grid cell.
 5. Compute non-linear Pedotransfer Functions (PTFs) at **250 m first**, on the
@@ -157,17 +161,36 @@ PROBAV_LC100_global_v3.0.1_2019-nrt_Crops-CoverFraction-layer_EPSG-4326.tif
 
 ### 2. Dominant soil-type selection (`config.yaml`)
 
-Selected via a config setting, e.g. `soil.dominant_mode: usda | wrb`.
+Selected via a config setting, `soil.dominant_mode: usda | usda_profile | wrb`.
 
 **Mode A — `usda` (USDA texture-class dominance)**
 
 1. Derive the 250 m USDA soil texture class (12 classes) from unscaled sand,
-   silt and clay.
+   silt and clay **of the topsoil layer** (`soil.depths[0]`).
 2. Sum cropland weights per USDA class within each target grid cell.
 3. Select the USDA texture class with the highest total cropland weight as the
    dominant class.
 4. Mask 250 m pixels: keep **only** pixels matching the dominant USDA class in
    that cell.
+
+**Mode C — `usda_profile` (composite topsoil × rooting-zone dominance)**
+
+A surface class alone cannot separate a uniform sand from a sandy cover over
+loamy till — the layered profiles that are widespread in NE Germany and that
+decide plant-available water. This mode classifies on **two keys**:
+
+1. **Topsoil key** — the USDA class of `soil.depths[0]` (0–5 cm), as in Mode A.
+2. **Rooting-zone key** — the USDA class of the **thickness-weighted mean**
+   texture from the bottom of the topsoil layer (5 cm) down to
+   `soil.rootzone_bottom_cm` (default 100 cm). Layers that only partly overlap
+   the window contribute only their overlapping thickness.
+3. Pack the pair into one code, `(topsoil − 1) × 12 + rootzone` (1–144, `0` if
+   either key is unclassified), then run the **same majority vote and mask** as
+   Mode A on the composite code.
+
+The mask stays a *single* class, so every depth is still aggregated over the
+same pixel set (no chimera profiles assembled from different locations at
+different depths).
 
 **Mode B — `wrb` (WRB Reference Soil Group dominance)**
 
@@ -194,6 +217,34 @@ Run on the masked dominant pixels, weighted by cropland cover fraction `W`.
 - **Texture normalization:** `out_fraction = (fraction / (clay + silt + sand)) × 100`.
 - **Missing target cells** (coastal / islands): fill via nearest-neighbour
   distance search from the nearest valid land cell.
+
+### 5. Exported statistic (`soil.export_statistic`)
+
+The CSVs carry one value per property, depth and cell, taken from the **dominant
+class** (rank 1):
+
+| Setting | Behaviour |
+| --- | --- |
+| `mean` (default) | The variable-specific mean rules of §3 |
+| `median` | The plain per-cell median for every variable — the median commutes with the log/H⁺ transforms, so no per-variable rule is needed |
+
+## Primary-Class Statistics (intermediate outputs)
+
+Set `flags.write_soil_statistics: true` to also describe the
+`soil.n_primary_classes` (default 3) most frequent classes per target cell.
+Rank 1 is the dominant class the CSVs carry; the lower ranks quantify the
+inter-class spread a single exported profile leaves out. Files land in
+`<output_dir>/soil/`:
+
+| File | Contents |
+| --- | --- |
+| `soil_class_statistics.nc` | `<layer>_<statistic>` on `(rank, depth, lat, lon)` — `mean`, `median`, `std` (sample), `kurt` (excess kurtosis, normal = 0) and `count` for **every property, depth and class** |
+| `soil_class_shares.nc` | `class_code`, `pixels` and `share_percent` on `(rank, lat, lon)`; the code → name map is the `class_code_names` attribute |
+| `soil_class_shares.csv` | The same per cell and rank, with `SimplaceID`, lat/lon, **class code and class name** (`usda`: texture class; `usda_profile`: `topsoil/rooting-zone`) and the **percent of the cell's classified pixels** |
+
+Rank-1 `share_percent` is the weight of the exported profile; `1 − share` is the
+fraction of the cell's cropland the export does not represent, and the rank-2/3
+statistics say how different that remainder is.
 
 ## Code Standards
 

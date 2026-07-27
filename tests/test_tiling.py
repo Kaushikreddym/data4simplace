@@ -15,7 +15,10 @@ from data4simplace.tiling import (
     TileWindow,
     _global_cell_table,
     _tile_config,
+    count_tiles,
     iter_windows,
+    list_windows,
+    run_one_tile,
     run_tiled,
 )
 
@@ -71,6 +74,57 @@ def test_global_cell_table_identity():
     assert r["SimplaceID"] == 7 * 10 + 8 + 1
     # Local indices stay in range for tile-array indexing.
     assert ct["row"].max() < tgrid.shape[0] and ct["col"].max() < tgrid.shape[1]
+
+
+# --------------------------------------------------------------------------- #
+# Array-job helpers: tile enumeration and single-tile selection
+# --------------------------------------------------------------------------- #
+def test_count_tiles_and_list_windows_agree():
+    cfg = _cfg()  # 10x10 grid at 0.1 deg
+    assert count_tiles(cfg, tile_deg=0.5) == 4      # step 5 -> 2x2 tiles
+    assert count_tiles(cfg, tile_deg=0.3) == 16     # step 3 -> 4x4 (ragged)
+    wins = list_windows(cfg, tile_deg=0.5)
+    assert len(wins) == 4
+    assert wins[0] == TileWindow(0, 5, 0, 5)
+
+
+def test_list_windows_index_order_is_stable():
+    cfg = _cfg()
+    a = list_windows(cfg, tile_deg=0.3)
+    b = list_windows(cfg, tile_deg=0.3)
+    assert a == b  # a task id must map to the same tile on every node
+
+
+def _cfg_out(tmp_path) -> PipelineConfig:
+    # A 10x10 grid with no stages enabled: _run_tile exports nothing, so these
+    # tests exercise the index/marker logic without needing input data.
+    return PipelineConfig.model_validate({
+        "flags": {},
+        "grid": {"resolution_deg": 0.1, "min_lon": 0.0, "max_lon": 1.0,
+                 "min_lat": 0.0, "max_lat": 1.0},
+        "time": {"start": "1979-01-01", "end": "1979-01-03"},
+        "paths": {"mswx_root": "/tmp", "output_dir": str(tmp_path)},
+    })
+
+
+def test_run_one_tile_rejects_out_of_range_index(tmp_path):
+    cfg = _cfg_out(tmp_path)
+    n = count_tiles(cfg, tile_deg=0.5)
+    with pytest.raises(IndexError):
+        run_one_tile(cfg, tile_index=n, tile_deg=0.5)
+
+
+def test_run_one_tile_skips_when_marker_exists(tmp_path):
+    cfg = _cfg_out(tmp_path)
+    first = run_one_tile(cfg, tile_index=0, tile_deg=0.5)
+    assert first["skipped"] == 0
+    assert (tmp_path / ".tiles" / "tile_0_0.done").is_file()
+    second = run_one_tile(cfg, tile_index=0, tile_deg=0.5)
+    assert second["skipped"] == 1
+    # A different index is its own unit of work.
+    other = run_one_tile(cfg, tile_index=3, tile_deg=0.5)
+    assert other["skipped"] == 0
+    assert (tmp_path / ".tiles" / "tile_5_5.done").is_file()
 
 
 # --------------------------------------------------------------------------- #

@@ -28,6 +28,7 @@ import re
 from typing import Mapping
 
 import numpy as np
+import pandas as pd
 import xarray as xr
 
 from data4simplace.grid import TargetGrid
@@ -268,6 +269,86 @@ def dominant_class_per_cell(
 
     coarse = bin_reduce(class_da, grid, _mode_reducer, fill=0.0)
     return coarse.astype("int16").rename("dominant_class")
+
+def rank_classes_per_cell(
+    class_da: xr.DataArray, grid: TargetGrid, n_classes: int = 3
+) -> xr.Dataset:
+    """The ``n_classes`` most frequent classes in each target cell.
+
+    The single dominant class is rank 1, so this generalises
+    :func:`dominant_class_per_cell`: the extra ranks describe how much of a cell
+    the dominant class actually represents, which is what an inter-class
+    uncertainty estimate needs. Ties are broken by the lower class code, matching
+    the majority vote.
+
+    Parameters
+    ----------
+    class_da:
+        Integer class codes on the fine grid; ``0`` (unclassified) is ignored.
+    grid:
+        The target 10 km grid.
+    n_classes:
+        How many ranks to keep.
+
+    Returns
+    -------
+    xarray.Dataset
+        ``class_code`` (0 where a cell has fewer classes than ranks), ``pixels``
+        and ``share_percent`` (percent of the cell's classified pixels), all with
+        dims ``(rank, lat, lon)`` and a 1-based ``rank`` coordinate.
+    """
+    from data4simplace.soil.aggregate import cell_assignment
+
+    if n_classes < 1:
+        raise ValueError(f"n_classes must be >= 1, got {n_classes}")
+
+    n_lat, n_lon = grid.lat_centers.size, grid.lon_centers.size
+    cell, codes = cell_assignment(class_da, grid, finite_only=False)
+
+    code_arr = np.full((n_classes, n_lat * n_lon), 0, dtype="int64")
+    pixel_arr = np.zeros((n_classes, n_lat * n_lon), dtype="int64")
+    share_arr = np.full((n_classes, n_lat * n_lon), np.nan, dtype="float64")
+
+    valid = codes > 0
+    if valid.any():
+        counts = (
+            pd.DataFrame({"cell": cell[valid], "code": codes[valid].astype("int64")})
+            .groupby(["cell", "code"], sort=False)
+            .size()
+            .rename("pixels")
+            .reset_index()
+        )
+        counts["share"] = 100.0 * counts["pixels"] / counts.groupby("cell")[
+            "pixels"
+        ].transform("sum")
+        # Most pixels first; the lower code wins a tie (as the majority vote does).
+        counts = counts.sort_values(
+            ["cell", "pixels", "code"], ascending=[True, False, True]
+        )
+        counts["rank"] = counts.groupby("cell").cumcount()
+        counts = counts[counts["rank"] < n_classes]
+        rank_idx = counts["rank"].to_numpy()
+        cell_idx = counts["cell"].to_numpy()
+        code_arr[rank_idx, cell_idx] = counts["code"].to_numpy()
+        pixel_arr[rank_idx, cell_idx] = counts["pixels"].to_numpy()
+        share_arr[rank_idx, cell_idx] = counts["share"].to_numpy()
+
+    dims = ("rank", "lat", "lon")
+    coords = {
+        "rank": np.arange(1, n_classes + 1),
+        "lat": grid.lat_centers,
+        "lon": grid.lon_centers,
+    }
+    shape = (n_classes, n_lat, n_lon)
+    return xr.Dataset(
+        {
+            "class_code": (dims, code_arr.reshape(shape).astype("int16")),
+            "pixels": (dims, pixel_arr.reshape(shape).astype("int32")),
+            "share_percent": (dims, share_arr.reshape(shape).astype("float32")),
+        },
+        coords=coords,
+    )
+
 
 def dominant_pixel_mask(
     class_da: xr.DataArray, dominant: xr.DataArray

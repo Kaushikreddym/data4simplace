@@ -45,6 +45,21 @@ def _build_parser() -> argparse.ArgumentParser:
         "SoilGrids WCS requests within limits. Omit for a single in-memory run.",
     )
     parser.add_argument(
+        "--tile-index",
+        type=int,
+        default=None,
+        help="Process only this tile (0-based index into the tile list), then "
+        "exit. This is the unit of work for an HPC array job: launch one task "
+        "per tile, each with its own --tile-index. Requires --tile-deg. Combine "
+        "afterwards with --combine-only.",
+    )
+    parser.add_argument(
+        "--count-tiles",
+        action="store_true",
+        help="Print the number of tiles for the given --tile-deg and exit "
+        "(use it to size an array job, e.g. --array=0-$((N-1))).",
+    )
+    parser.add_argument(
         "--combine-only",
         action="store_true",
         help="Skip processing; just combine existing tile outputs into final "
@@ -98,6 +113,19 @@ def main(argv: list[str] | None = None) -> int:
         _report_plan(config)
         return 0
 
+    if args.count_tiles:
+        if args.tile_deg is None:
+            log.error("--count-tiles requires --tile-deg")
+            return 2
+        from data4simplace.tiling import count_tiles
+
+        print(count_tiles(config, args.tile_deg))
+        return 0
+
+    if args.tile_index is not None and args.tile_deg is None:
+        log.error("--tile-index requires --tile-deg")
+        return 2
+
     try:
         if args.combine_only:
             from data4simplace.tiling import combine_tiles
@@ -107,6 +135,16 @@ def main(argv: list[str] | None = None) -> int:
                 "Combined tiles: %d weather files, soil.csv %d rows (%d/%d tiles done) under %s",
                 stats["weather_files"], stats["soil_rows"],
                 stats["tiles_done"], stats["tiles_expected"], config.paths.output_dir,
+            )
+        elif args.tile_index is not None:
+            from data4simplace.tiling import run_one_tile
+
+            stats = run_one_tile(config, args.tile_index, tile_deg=args.tile_deg)
+            log.info(
+                "Done (tile %d). %d cells exported%s under %s",
+                stats["tile_index"], stats["cells"],
+                " (skipped: already done)" if stats["skipped"] else "",
+                config.paths.output_dir,
             )
         elif args.tile_deg is not None:
             from data4simplace.tiling import run_tiled

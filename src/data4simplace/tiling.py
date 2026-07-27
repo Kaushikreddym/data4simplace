@@ -61,6 +61,27 @@ def iter_windows(n_lat: int, n_lon: int, step: int) -> Iterator[TileWindow]:
             yield TileWindow(r0, min(r0 + step, n_lat), c0, min(c0 + step, n_lon))
 
 
+def _tile_step(config: PipelineConfig, tile_deg: float) -> int:
+    """Cells per tile side for ``tile_deg`` on the config's grid resolution."""
+    return max(1, round(tile_deg / config.grid.resolution_deg))
+
+
+def list_windows(config: PipelineConfig, tile_deg: float) -> list[TileWindow]:
+    """All tile windows for a tiled run, in the deterministic index order.
+
+    The order is stable, so a SLURM array task can select the tile it owns by
+    its task id: ``list_windows(config, tile_deg)[task_id]``.
+    """
+    grid = TargetGrid.from_config(config.grid)
+    n_lat, n_lon = grid.shape
+    return list(iter_windows(n_lat, n_lon, _tile_step(config, tile_deg)))
+
+
+def count_tiles(config: PipelineConfig, tile_deg: float) -> int:
+    """Number of tiles a tiled run would produce (the array size to request)."""
+    return len(list_windows(config, tile_deg))
+
+
 def _tile_config(config: PipelineConfig, grid: TargetGrid, w: TileWindow) -> PipelineConfig:
     """Config copy whose grid bounds cover exactly the tile's global cells."""
     res = config.grid.resolution_deg
@@ -222,6 +243,71 @@ def combine_tiles(
     }
 
 
+def _tile_dirs(config: PipelineConfig) -> tuple[Path, Path, Path]:
+    """Create and return ``(out_dir, markers_dir, shard_dir)`` for a tiled run."""
+    out_dir = Path(config.paths.output_dir)
+    markers = out_dir / ".tiles"
+    shard_dir = out_dir / "soil" / "_shards"
+    markers.mkdir(parents=True, exist_ok=True)
+    shard_dir.mkdir(parents=True, exist_ok=True)
+    return out_dir, markers, shard_dir
+
+
+def run_one_tile(
+    config: PipelineConfig,
+    tile_index: int,
+    tile_deg: float = 5.0,
+    resume: bool = True,
+) -> dict[str, int]:
+    """Process exactly one tile, selected by its index in :func:`list_windows`.
+
+    This is the unit of work for a SLURM (or any) array job: launch
+    ``count_tiles`` tasks, each calling this with its task id. Every task writes
+    its own weather files (globally named) and its own soil shard plus a
+    ``.done`` marker, so tasks never contend for the same file. Combine the
+    shards afterwards with :func:`combine_tiles` (one dependent job).
+
+    Parameters
+    ----------
+    config:
+        The **global** pipeline configuration.
+    tile_index:
+        0-based tile index; must be ``< count_tiles(config, tile_deg)``.
+    tile_deg:
+        Tile edge length in degrees; must match across all tasks and the combine.
+    resume:
+        Skip the tile if its completion marker already exists.
+
+    Returns
+    -------
+    dict
+        ``{"tile_index", "cells", "skipped"}`` (``skipped`` is 1 when resumed).
+    """
+    grid = TargetGrid.from_config(config.grid)
+    windows = list_windows(config, tile_deg)
+    if not 0 <= tile_index < len(windows):
+        raise IndexError(
+            f"tile_index {tile_index} out of range 0..{len(windows) - 1} "
+            f"for tile_deg={tile_deg}"
+        )
+
+    w = windows[tile_index]
+    out_dir, markers, shard_dir = _tile_dirs(config)
+    marker = markers / f"{w.name}.done"
+    if resume and marker.exists():
+        logger.info("Tile %s (index %d) already done; skipping", w.name, tile_index)
+        return {"tile_index": tile_index, "cells": 0, "skipped": 1}
+
+    logger.info(
+        "Tile %s (index %d/%d) rows[%d:%d] cols[%d:%d]",
+        w.name, tile_index, len(windows) - 1, w.r0, w.r1, w.c0, w.c1,
+    )
+    n = _run_tile(config, grid, w, out_dir, shard_dir)
+    marker.write_text("ok\n")
+    logger.info("Tile %s done: %d cells exported", w.name, n)
+    return {"tile_index": tile_index, "cells": n, "skipped": 0}
+
+
 def run_tiled(
     config: PipelineConfig, tile_deg: float = 5.0, resume: bool = True
 ) -> dict[str, int]:
@@ -244,13 +330,9 @@ def run_tiled(
     """
     grid = TargetGrid.from_config(config.grid)
     n_lat, n_lon = grid.shape
-    step = max(1, round(tile_deg / config.grid.resolution_deg))
+    step = _tile_step(config, tile_deg)
 
-    out_dir = Path(config.paths.output_dir)
-    markers = out_dir / ".tiles"
-    shard_dir = out_dir / "soil" / "_shards"
-    markers.mkdir(parents=True, exist_ok=True)
-    shard_dir.mkdir(parents=True, exist_ok=True)
+    out_dir, markers, shard_dir = _tile_dirs(config)
 
     windows = list(iter_windows(n_lat, n_lon, step))
     logger.info(

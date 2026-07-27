@@ -24,6 +24,9 @@ class ExecutionFlags(BaseModel):
     compute_ptf: bool = False
     run_npk_processing: bool = False
     apply_agricultural_mask: bool = False
+    # Intermediate NetCDF/CSV statistics for the n most frequent soil classes
+    # per cell (see soil.n_primary_classes); the SIMPLACE CSVs are unaffected.
+    write_soil_statistics: bool = False
     export_simplace_weather: bool = False
     export_simplace_soil: bool = False
     export_simplace_management: bool = False
@@ -127,6 +130,13 @@ class SoilConfig(BaseModel):
     rootzone_bottom_cm: float = Field(100.0, gt=0.0)
     # Minimum PROBA-V cropland cover fraction (0-1) for a 250 m pixel to be kept.
     cropland_min_fraction: float = Field(0.8, ge=0.0, le=1.0)
+    # How many classes per cell to describe when flags.write_soil_statistics is
+    # set: rank 1 is the dominant (exported) class, the rest quantify what the
+    # single-profile export leaves out.
+    n_primary_classes: int = Field(3, ge=1, le=12)
+    # Statistic the SIMPLACE CSVs carry: ``mean`` applies the variable-specific
+    # mean rules (arithmetic / geometric / pH H+), ``median`` the plain median.
+    export_statistic: Literal["mean", "median"] = "mean"
     # WRB Reference Soil Group coverage id (SoilGrids ``wrb`` map) for ``wrb`` mode.
     wrb_layer: str = "MostProbable"
     # Fill target cells left empty (coastal/islands) by nearest-neighbour search.

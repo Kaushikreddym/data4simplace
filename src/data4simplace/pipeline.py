@@ -22,6 +22,7 @@ from data4simplace.exporters import ManagementExporter, SoilExporter, WeatherExp
 from data4simplace.grid import TargetGrid
 from data4simplace.npk import NPKHandler
 from data4simplace.soil import SoilGridsHandler
+from data4simplace.soil.statistics import PrimaryClassStatistics
 from data4simplace.spatial import CroplandMask
 
 logger = logging.getLogger(__name__)
@@ -35,6 +36,7 @@ class PipelineResult:
     soil: Optional[xr.Dataset] = None
     hydraulic: Optional[xr.Dataset] = None
     npk: Optional[xr.Dataset] = None
+    soil_statistics: Optional["PrimaryClassStatistics"] = None
     cell_table: Optional[pd.DataFrame] = None
     written: list[Path] = field(default_factory=list)
 
@@ -64,10 +66,19 @@ class Pipeline:
 
         if flags.run_soil_processing:
             logger.info(
-                "Stage: soil processing (SoilGrids, mode=%s)",
+                "Stage: soil processing (SoilGrids, mode=%s, export=%s)",
                 self._config.soil.dominant_mode,
+                self._config.soil.export_statistic,
             )
-            result.soil, result.hydraulic = SoilGridsHandler(self._config).load_processed()
+            soil_handler = SoilGridsHandler(self._config)
+            result.soil, result.hydraulic = soil_handler.load_processed()
+            result.soil_statistics = soil_handler.class_statistics
+            if flags.write_soil_statistics and result.soil_statistics is None:
+                logger.warning(
+                    "write_soil_statistics set but dominant_mode=%s produces no "
+                    "class field; no statistics written",
+                    self._config.soil.dominant_mode,
+                )
 
         if flags.run_npk_processing:
             logger.info("Stage: NPK processing")
@@ -96,6 +107,11 @@ class Pipeline:
         # --- Export stages ----------------------------------------------------
         out_dir = self._config.paths.output_dir
         assert result.cell_table is not None  # set above
+
+        # Intermediate per-class statistics (NetCDF + share table). Written
+        # before the CSVs so they survive an exporter failure.
+        if flags.write_soil_statistics and result.soil_statistics is not None:
+            result.written.extend(result.soil_statistics.write(out_dir, self._grid))
 
         if flags.export_simplace_weather:
             if result.climate is None:

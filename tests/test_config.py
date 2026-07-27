@@ -44,3 +44,39 @@ def test_load_config_roundtrip(tmp_path, config_dict):
 def test_load_config_missing_file(tmp_path):
     with pytest.raises(FileNotFoundError):
         load_config(tmp_path / "nope.yaml")
+
+
+def test_statistics_defaults(config_dict):
+    cfg = PipelineConfig.model_validate(config_dict)
+    assert cfg.flags.write_soil_statistics is False
+    assert cfg.soil.n_primary_classes == 3
+    assert cfg.soil.export_statistic == "mean"
+    assert cfg.soil.rootzone_bottom_cm == 100.0
+
+
+@pytest.mark.parametrize(
+    "key,value",
+    [
+        ("export_statistic", "mode"),      # only mean | median
+        ("n_primary_classes", 0),          # at least the dominant class
+        ("n_primary_classes", 13),         # at most the 12 USDA classes
+        ("dominant_mode", "profile"),      # usda | usda_profile | wrb | none
+        ("rootzone_bottom_cm", 0),         # must be a positive depth
+    ],
+)
+def test_invalid_soil_settings_rejected(config_dict, key, value):
+    config_dict.setdefault("soil", {})[key] = value
+    with pytest.raises(ValueError):
+        PipelineConfig.model_validate(config_dict)
+
+
+def test_usda_profile_settings_accepted(config_dict):
+    config_dict.setdefault("soil", {}).update(
+        {"dominant_mode": "usda_profile", "export_statistic": "median",
+         "n_primary_classes": 5, "rootzone_bottom_cm": 60}
+    )
+    cfg = PipelineConfig.model_validate(config_dict)
+    assert cfg.soil.dominant_mode == "usda_profile"
+    assert cfg.soil.export_statistic == "median"
+    assert cfg.soil.n_primary_classes == 5
+    assert cfg.soil.rootzone_bottom_cm == 60
