@@ -10,12 +10,19 @@ flags:
   run_climate_processing: true      # MSWX climate processing
   run_soil_processing: true         # SoilGrids soil processing
   compute_ptf: false                # Optional pedotransfer functions (hydraulics)
-  run_npk_processing: true          # NPK / fertilizer processing
-  apply_agricultural_mask: true     # Cropland mask filtering
+  run_npk_processing: true          # NPK / fertilizer processing (NPKGRIDS)
+  # Classify each cell irrigated (1) / rainfed (0) from the crop's irrigated and
+  # rainfed harvested area, and add the vIRR column to the management CSV.
+  run_irrigation_classification: true
+  apply_agricultural_mask: true     # Export only PROBA-V cropland cells
   write_soil_statistics: true       # Per-class NetCDF stats + class-share table
   export_simplace_weather: true     # SIMPLACE weather file export
   export_simplace_soil: true        # SIMPLACE soil file export
   export_simplace_management: true  # SIMPLACE management / fertilizer export
+  # One SIMPLACE soil file per primary class (soil_1.csv .. soil_3.csv), each
+  # aggregated over its own 250 m pixels and carrying the class area and the
+  # cell's heterogeneity metrics. Needs soil.aggregation_method: top3.
+  export_top3_soil_csvs: true
 
 # --- Target 10 km grid (WGS84 degrees) ---------------------------------------
 # Europe: 17W..52E, 34N..72N (Mediterranean islands to North Cape). 10 km ~= 0.1 deg.
@@ -36,10 +43,19 @@ time:
 # --- Input data sources ------------------------------------------------------
 paths:
   mswx_root: "/data01/FDS/muduchuru/Atmos/MSWX"
-  soilgrids_root: "/data01/FDS/muduchuru/Land/SoilGrids"             # local SoilGrids tiles; null -> fetch via WCS
-  npk_root: null                    # local NPK rasters; null -> skip alignment
-  cropland_mask: null               # raster/vector cropland mask; null -> no mask
+  soilgrids_root: null             # local SoilGrids tiles; null -> fetch via WCS
+  # NPKGRIDS v1.08: one netCDF per crop with N / P2O5 / K2O application rates
+  # (kg/ha) at 0.05 deg. See the npk block below for the crop selection.
+  npk_root: "/data01/FDS/muduchuru/Land/NPKGRIDS/NC_FILES"
+  # PROBA-V LC100 Crops-CoverFraction: the single cropland definition. Filters
+  # the 250 m soil pixels and selects the exported 10 km cells; null -> no
+  # cropland filtering anywhere.
   cropland_weights_path: "/data01/FDS/muduchuru/Land/LULC/CopernicusLandCover/PROBAV_LC100_global_v3.0.1_2019-nrt_Crops-CoverFraction-layer_EPSG-4326.tif"
+  # MIRCA-OS Monthly Growing Area Grids: the parent of the per-year folders (or
+  # a year folder itself). Read by the irrigation stage.
+  mirca_root: "/data01/FDS/muduchuru/Land/MIRCA-OS/data/contents/Monthly Growing Area Grids/Monthly Growing Area Grids"
+  # ECIRA base directory: the parent of Crop_IR / Crop_A / Crop_RF.
+  ecira_root: "/data01/FDS/muduchuru/Land/ECIRA"
   output_dir: "./output"
 
 # --- SIMPLACE reference files (source of truth for output structure) ---------
@@ -57,14 +73,79 @@ climate:
     RSDS: rsds          # surface downwelling shortwave radiation [W m-2]
     PR: pr              # precipitation [mm day-1]
     HURS: hurs          # near-surface relative humidity [%]
+    SFCWIND: sfcwind    # near-surface wind speed [m s-1] at 10 m; the exporter
+                        # converts it to the 2 m equivalent SIMPLACE expects
   chunks:
-    time: 30
+    # A tile's window is small (~50x50 cells), so the time axis is the only one
+    # worth chunking. Keep the chunk large: dask graph size scales with the
+    # chunk *count*, and a 30-day chunk over the 46-year window is 561 chunks
+    # of 0.3 MB each - all overhead, no benefit.
+    time: 4096
     lat: 512
     lon: 512
 
+# --- NPK / fertilizer configuration ------------------------------------------
+# The SIMPLACE schedule keeps the reference file's structure (event count, DVS
+# timing, relative N split) and replaces its flat amounts with each cell's own
+# NPKGRIDS rates. Amounts are grams of *product* per m2, so a nutrient rate is
+# converted from the oxide form NPKGRIDS reports (P2O5/K2O) to the elemental
+# form, then divided by the carrier's content from fertilizer_composition.xml.
+npk:
+  # npkgrids -> one crop netCDF from paths.npk_root; rasters -> the generic
+  # per-nutrient GeoTIFF/netCDF discovery for other gridded products.
+  source: npkgrids
+  crop: wheat                # NPKGRIDS filename suffix (NPKGRIDSv1.08_wheat.nc)
+  simplace_crop: winter_wheat  # value of the schedule's `crop` column
+  # NPKGRIDS marks ocean -1 (always dropped) and land the crop is not grown on
+  # with 0. Averaging those zeros into a 10 km cell would dilute the rate of the
+  # pixels that do grow wheat, so they are excluded and a cell left without a
+  # positive pixel is dropped from the schedule rather than given a made-up rate.
+  include_zero_rate: false
+  min_quality: null          # minimum NPKGRIDS quality score (1 best .. 0 worst)
+  keep_quality: false        # carry the quality scores onto the target grid
+  # Carriers. The reference's compound PK cannot honour two independent rates
+  # (its P:K is fixed at 0.0792:0.083 g/g), so it is split into the straight
+  # P (= P2O5) and K (= K2O) types at the same DVS.
+  n_fertilizer: KAS
+  p_fertilizer: P
+  k_fertilizer: K
+  # null -> the N split is derived from the reference's own N events
+  # (32/16/16 g KAS = 50/25/25 % at DVS 0.25/0.4/0.9).
+  n_split: null
+  fertilizer_scenario: null  # null -> taken from the reference file
+  composition_file: null     # null -> fertilizer_composition.xml next to the reference
+  amount_decimals: 3
+
+# --- Irrigated / rainfed cell classification ---------------------------------
+# vIRR = 1 where the irrigated share of the crop's harvested area,
+# A_ir / (A_ir + A_rf), exceeds `threshold`; 0 for rainfed cells and for cells
+# holding less than `min_crop_area_ha` of the crop. Written as a column in the
+# management CSV (flags.run_irrigation_classification).
+irrigation:
+  # merged -> ECIRA where it classifies the cell, MIRCA-OS elsewhere. ECIRA
+  #           leads because MIRCA-OS inherits national statistics reporting zero
+  #           irrigated cereals for whole countries (Germany, Romania, the UK,
+  #           Sweden, Hungary, Poland) and zero irrigated maize for Portugal;
+  #           MIRCA-OS is the only source outside ECIRA's EU/EEA footprint.
+  # mirca  -> MIRCA-OS only (global, 5 arcmin)
+  # ecira  -> ECIRA only (1 km, EU/EEA only; cells outside stay unclassified)
+  source: merged
+  threshold: 0.5           # irrigated share above which a cell counts irrigated
+  min_crop_area_ha: 10.0   # below this a cell is unclassified, and so written 0
+  year: 2015               # MIRCA-OS: 2000/2005/2010/2015; ECIRA: 2010-2020
+  # maize | wheat | cereals. null -> derived from npk.simplace_crop, which maps
+  # winter_wheat to `cereals`: ECIRA publishes no wheat class, its CERE being
+  # cereals excluding maize and rice, so both products contribute that class.
+  crop_group: null
+  column: vIRR             # column name added to the management CSV
+  write_netcdf: true       # also write management/irrigation_class_<crop>.nc
+
 # --- SoilGrids configuration -------------------------------------------------
 soil:
-  layers: [clay, silt, sand, bdod, soc, phh2o, nitrogen]
+  # wv0010/wv0033/wv1500: volumetric water content at 10/33/1500 kPa. They fill
+  # soilwater_sat/_fc(_init)/_wp directly, so the Saxton-Rawls PTF (compute_ptf)
+  # is only a fallback for whichever of those columns they do not cover.
+  layers: [clay, silt, sand, bdod, soc, phh2o, nitrogen, wv0010, wv0033, wv1500]
   depths: ["0-5cm", "5-15cm", "15-30cm", "30-60cm", "60-100cm", "100-200cm"]
   homolosine_crs: "EPSG:152160"
   target_crs: "EPSG:4326"
@@ -78,16 +159,37 @@ soil:
   #   wrb          -> WRB Reference Soil Group (whole-profile classification)
   #   none         -> legacy plain-mean regrid
   dominant_mode: usda_profile
+  # How many classes per cell are aggregated:
+  #   dominant -> Method A: one profile per cell, from the dominant class
+  #   top3     -> Method B: the n_primary_classes most frequent classes, each
+  #               aggregated over its own pixels, plus per-class areas (km2) and
+  #               the cell's dominance ratio / normalised Shannon entropy.
+  # Rank 1 is identical either way, so soil.csv does not change.
+  aggregation_method: top3
   rootzone_bottom_cm: 100    # rooting zone = topsoil bottom (5 cm) .. this depth
   cropland_min_fraction: 0.8
+  # Qualifying native PROBA-V pixels a 10 km cell needs to be exported at all
+  # (flags.apply_agricultural_mask). ~10,000 pixels per cell at 100 m.
+  min_cropland_pixels: 1
   # Three-primary-class statistics (flags.write_soil_statistics). Rank 1 is the
   # dominant class the CSVs carry; ranks 2..n quantify the inter-class spread.
   n_primary_classes: 3
   # Statistic written to the SIMPLACE CSVs: mean (variable-specific mean rules:
   # arithmetic, geometric for soc/nitrogen, H+ mean for phh2o) | median.
   export_statistic: mean
+  # Initial mineral N for ammonium_*/nitrate_*. SoilGrids 'nitrogen' is total
+  # (largely organic) N: the exporter turns it into a per-layer stock (kg N/ha)
+  # with bulk density, takes this fraction as mineral and splits it by
+  # ammonium_share (the rest becomes nitrate). Set 0 to keep the reference
+  # constants instead.
+  mineral_n_fraction: 0.01
+  ammonium_share: 0.3
   wrb_layer: MostProbable    # WRB coverage id, used when dominant_mode: wrb
-  fill_missing: true         # nearest-neighbour fill for empty coastal/island cells
+  # Nearest-neighbour fill for empty coastal/island cells. Off: every exported
+  # profile is aggregated from that cell's own 250 m pixels, never borrowed from
+  # a neighbour. Turning it on also widens the exported cell set to the filled
+  # cells, since the export follows wherever soil values exist.
+  fill_missing: false
   # WCS fallback: when a coverage is not found under paths.soilgrids_root, fetch
   # it from the ISRIC SoilGrids service (subset to the grid bbox, disk-cached).
   use_wcs: true
@@ -95,16 +197,6 @@ soil:
   wcs_crs: "EPSG:4326"      # request CRS; 4326 fetches directly in lon/lat
   wcs_cache_dir: null       # null -> <soilgrids_root>/_wcs_cache or a temp dir
   wcs_timeout: 180
-
-# --- Agricultural mask -------------------------------------------------------
-mask:
-  # auto -> use paths.cropland_mask if set, else fetch CORINE Land Cover.
-  source: auto              # auto | file | corine | none
-  threshold: 0.5            # min agricultural fraction (0-1) to keep a cell
-  corine_year: 2018
-  resolution_m: 100.0       # CLC sampling resolution for the fraction estimate
-  max_pixels: 2048          # per-axis WMS request cap (coarsens if exceeded)
-  cache_dir: "/data01/FDS/muduchuru/Land/LULC/CopernicusLandCover"
 
 # --- Missing-value sentinel (overridden by reference inspection when present) -
 missing_value: -99

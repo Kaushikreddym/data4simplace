@@ -19,6 +19,7 @@ from pathlib import Path
 
 from typing import TYPE_CHECKING
 
+import numpy as np
 import requests
 import rioxarray  # noqa: F401  (registers the .rio accessor)
 import xarray as xr
@@ -28,7 +29,10 @@ from data4simplace.config import PipelineConfig
 from data4simplace.grid import TargetGrid
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
-    from data4simplace.soil.statistics import PrimaryClassStatistics
+    from data4simplace.soil.multiclass import (
+        PrimaryClassStatistics,
+        TopClassAggregation,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -52,14 +56,28 @@ SCALE_FACTORS: dict[str, float] = {
     "nitrogen": 100.0,  # cg/kg -> g/kg
     "cec": 10.0,       # mmol(c)/kg -> cmol(c)/kg
     "cfvo": 10.0,      # cm3/dm3 -> %
+    "wv0010": 10.0,    # 0.1 vol% -> vol% (water content at 10 kPa)
+    "wv0033": 10.0,    # 0.1 vol% -> vol% (water content at 33 kPa)
+    "wv1500": 10.0,    # 0.1 vol% -> vol% (water content at 1500 kPa)
 }
+
+# The SoilGrids volumetric water-content coverages, wettest suction first. They
+# are predicted independently of one another, so the physical ordering
+# ``theta(10 kPa) >= theta(33 kPa) >= theta(1500 kPa)`` is not guaranteed pixel
+# by pixel; :meth:`SoilGridsHandler.harmonise_water_retention` enforces it.
+WATER_RETENTION_LAYERS: tuple[str, ...] = ("wv0010", "wv0033", "wv1500")
 
 # Layers where a stored ``0`` means "no data" rather than a measurement. The
 # GeoTIFFs carry no nodata tag, so the sentinel has to be masked by value; see
 # :meth:`SoilGridsHandler.mask_nodata`. ``cfvo`` is deliberately absent: a soil
 # with no coarse fragments legitimately reads 0.
 ZERO_IS_NODATA: frozenset[str] = frozenset(
-    {"clay", "silt", "sand", "bdod", "soc", "phh2o", "nitrogen", "cec"}
+    {
+        "clay", "silt", "sand", "bdod", "soc", "phh2o", "nitrogen", "cec",
+        # No real soil holds zero water at any of the three suctions, so a 0
+        # here is the same water/ice/gap sentinel as for the other properties.
+        "wv0010", "wv0033", "wv1500",
+    }
 )
 
 # WCS base per property (SoilGrids v2 Web Coverage Service, Homolosine grid).
@@ -85,6 +103,10 @@ class SoilGridsHandler:
         # Populated by :meth:`load_dominant` when ``flags.write_soil_statistics``
         # is set; the pipeline writes it to the intermediate NetCDF/CSV files.
         self.class_statistics: "PrimaryClassStatistics | None" = None
+        # Populated by :meth:`load_dominant` under ``soil.aggregation_method:
+        # top3``: the per-class profiles, areas and heterogeneity metrics that
+        # feed the intermediate rasters and the per-rank SIMPLACE CSVs.
+        self.top_classes: "TopClassAggregation | None" = None
 
     def _resolve_cache_dir(self) -> Path:
         """Directory for cached WCS downloads (created lazily on first fetch)."""
@@ -411,6 +433,11 @@ class SoilGridsHandler:
         **at 250 m**, then aggregates each variable with its rule (mean /
         geometric mean / pH H+ mean). Empty cells are optionally nearest-filled.
 
+        With ``soil.aggregation_method: top3`` the same masking and aggregation
+        runs once per primary class (Method B): the result is stored on
+        :attr:`top_classes`, and rank 1 -- the dominant class -- is returned as
+        ``soil``, so both methods export the identical primary profile.
+
         Returns
         -------
         (soil, hydraulic):
@@ -419,20 +446,24 @@ class SoilGridsHandler:
             texture is available, else ``None``.
         """
         from data4simplace.grid import _standardise_lonlat_names
-        from data4simplace.soil.aggregate import (
+        from data4simplace.soil.classify import (
             bin_reduce,
+            class_composition,
+            dominant_class_per_cell,
+            dominant_pixel_mask,
             fill_missing_cells,
             reducer_for,
         )
-        from data4simplace.soil.dominant import dominant_class_per_cell, dominant_pixel_mask
         from data4simplace.soil.ptf import saxton_rawls
+        from data4simplace.spatial.area import pixel_area_km2
         from data4simplace.spatial.cropland_weights import CroplandWeights
 
         fine, reference = self._load_fine()
 
         # --- Cropland keep-mask at 250 m (None -> keep all pixels) ------------
         # Built while coverages still carry rioxarray x/y spatial dims.
-        cropland = CroplandWeights(self._config).keep_mask(reference)
+        weights = CroplandWeights(self._config)
+        cropland = weights.keep_mask(reference)
 
         # rioxarray stages are done; standardise to lat/lon for masking/aggregation.
         cropland = _standardise_lonlat_names(cropland) if cropland is not None else None
@@ -445,11 +476,27 @@ class SoilGridsHandler:
         class_fine = self._class_field(fine, reference)
         if cropland is not None:
             class_fine = class_fine.where(cropland, 0).astype("int16")
-        dominant = dominant_class_per_cell(class_fine, self._grid)
+
+        multiclass = self._soil.aggregation_method == "top3"
+        if multiclass:
+            # Method B: rank the classes once, with latitude-aware pixel areas,
+            # and derive the dominant mask from rank 1 rather than a second vote
+            # (both break ties on the lower code, so they agree by construction).
+            ranked, uncertainty = class_composition(
+                class_fine,
+                self._grid,
+                self._soil.n_primary_classes,
+                pixel_area=pixel_area_km2(class_fine),
+            )
+            dominant = ranked["class_code"].sel(rank=1, drop=True)
+        else:
+            ranked = uncertainty = None
+            dominant = dominant_class_per_cell(class_fine, self._grid)
         keep = dominant_pixel_mask(class_fine, dominant)
         logger.info(
-            "Dominant soil-type mask built (%s); aggregating masked pixels",
+            "Dominant soil-type mask built (%s, method=%s); aggregating masked pixels",
             self._soil.dominant_mode,
+            self._soil.aggregation_method,
         )
 
         # --- Optional: statistics for the n most frequent classes ------------
@@ -459,6 +506,66 @@ class SoilGridsHandler:
 
         # --- Mask every fine coverage, aggregate per rule --------------------
         statistic = self._soil.export_statistic
+        soil, masked_fine = self._aggregate_masked(fine, keep, statistic)
+
+        # --- Method B: the same aggregation for ranks 2..n -------------------
+        if multiclass:
+            assert ranked is not None and uncertainty is not None  # set above
+            self.top_classes = self._rank_aggregation(
+                class_fine, fine, soil, ranked, uncertainty
+            )
+
+        # --- Optional PTFs: compute at 250 m, then aggregate the outputs -----
+        hydraulic: xr.Dataset | None = None
+        if self._config.flags.compute_ptf and {"sand", "clay"}.issubset(masked_fine):
+            hydraulic = self._ptf_dominant(
+                masked_fine, saxton_rawls, bin_reduce, reducer_for("theta", statistic)
+            )
+
+        # --- Nearest-neighbour gap fill for empty coastal/island cells -------
+        # Bounded to the cropland cells: those are the cells that get exported,
+        # and an unbounded search would carry land profiles out over the sea.
+        if self._soil.fill_missing:
+            cropland_cells = weights.cell_mask(self._grid)
+            soil = fill_missing_cells(soil, within=cropland_cells)
+            if hydraulic is not None:
+                hydraulic = fill_missing_cells(hydraulic, within=cropland_cells)
+            if self.top_classes is not None:
+                # Fill the per-rank stack too, so soil_1.csv keeps matching
+                # soil.csv cell for cell. The class composition itself is left
+                # alone: a filled cell has no pixels of its own to attribute an
+                # area or a class share to.
+                self.top_classes.properties = fill_missing_cells(
+                    self.top_classes.properties, within=cropland_cells
+                )
+
+        return soil, hydraulic
+
+    def _aggregate_masked(
+        self,
+        fine: dict[str, dict[str, xr.DataArray]],
+        keep: xr.DataArray,
+        statistic: str,
+    ) -> tuple[xr.Dataset, dict[str, dict[str, xr.DataArray]]]:
+        """Aggregate every masked (layer, depth) coverage onto the target grid.
+
+        Parameters
+        ----------
+        fine:
+            ``{layer: {depth: DataArray}}`` of un-scaled 250 m coverages.
+        keep:
+            Boolean fine-grid mask (cropland pixels of one soil class).
+        statistic:
+            ``soil.export_statistic``, selecting the per-variable reducers.
+
+        Returns
+        -------
+        (soil, masked_fine):
+            The depth-stacked dataset on the target grid, and the masked 250 m
+            coverages the PTF needs to run before aggregation.
+        """
+        from data4simplace.soil.classify import bin_reduce, reducer_for
+
         per_layer: dict[str, xr.DataArray] = {}
         masked_fine: dict[str, dict[str, xr.DataArray]] = {}
         for layer, depths in fine.items():
@@ -473,25 +580,58 @@ class SoilGridsHandler:
                 loaded.append(depth)
             if not slices:
                 continue
-            stacked = xr.concat(slices, dim="depth").assign_coords(depth=loaded)
-            per_layer[layer] = stacked
+            per_layer[layer] = xr.concat(slices, dim="depth").assign_coords(depth=loaded)
+        return xr.Dataset(per_layer), masked_fine
 
-        soil = xr.Dataset(per_layer)
+    def _rank_aggregation(
+        self,
+        class_fine: xr.DataArray,
+        fine: dict[str, dict[str, xr.DataArray]],
+        dominant_soil: xr.Dataset,
+        ranked: xr.Dataset,
+        uncertainty: xr.Dataset,
+    ) -> "TopClassAggregation":
+        """Aggregate ranks 2..n the way rank 1 was, and bundle the result.
 
-        # --- Optional PTFs: compute at 250 m, then aggregate the outputs -----
-        hydraulic: xr.Dataset | None = None
-        if self._config.flags.compute_ptf and {"sand", "clay"}.issubset(masked_fine):
-            hydraulic = self._ptf_dominant(
-                masked_fine, saxton_rawls, bin_reduce, reducer_for("theta", statistic)
+        Each rank is masked to **its own** class before aggregation, so a rank-2
+        profile is built from rank-2 pixels only -- never a blend. Rank 1 is the
+        already-computed dominant dataset, which is what keeps Method A and
+        Method B in exact agreement about the exported profile.
+
+        Parameters
+        ----------
+        class_fine:
+            The cropland-filtered 250 m class field.
+        fine:
+            ``{layer: {depth: DataArray}}`` of un-scaled 250 m coverages.
+        dominant_soil:
+            The rank-1 aggregate, reused rather than recomputed.
+        ranked, uncertainty:
+            The composition and heterogeneity datasets from
+            :func:`~data4simplace.soil.classify.class_composition`.
+        """
+        from data4simplace.soil.classify import dominant_pixel_mask
+        from data4simplace.soil.multiclass import TopClassAggregation
+
+        ranks = np.asarray(ranked["rank"].values)
+        statistic = self._soil.export_statistic
+        logger.info("Aggregating %d additional soil class(es) per cell", ranks.size - 1)
+
+        per_rank: list[xr.Dataset] = [dominant_soil]
+        for rank in ranks[1:]:
+            mask = dominant_pixel_mask(
+                class_fine, ranked["class_code"].sel(rank=rank, drop=True)
             )
+            aggregated, _ = self._aggregate_masked(fine, mask, statistic)
+            per_rank.append(aggregated)
 
-        # --- Nearest-neighbour gap fill for empty coastal/island cells -------
-        if self._soil.fill_missing:
-            soil = fill_missing_cells(soil)
-            if hydraulic is not None:
-                hydraulic = fill_missing_cells(hydraulic)
-
-        return soil, hydraulic
+        properties = xr.concat(per_rank, dim="rank").assign_coords(rank=ranks)
+        return TopClassAggregation(
+            properties=properties,
+            classes=ranked,
+            uncertainty=uncertainty,
+            mode=self._soil.dominant_mode,
+        )
 
     def _primary_class_statistics(
         self,
@@ -517,9 +657,12 @@ class SoilGridsHandler:
         PrimaryClassStatistics
             Ranked class codes/shares plus the per-class statistics.
         """
-        from data4simplace.soil.aggregate import bin_describe
-        from data4simplace.soil.dominant import dominant_pixel_mask, rank_classes_per_cell
-        from data4simplace.soil.statistics import PrimaryClassStatistics
+        from data4simplace.soil.classify import (
+            bin_describe,
+            dominant_pixel_mask,
+            rank_classes_per_cell,
+        )
+        from data4simplace.soil.multiclass import PrimaryClassStatistics
 
         n_classes = self._soil.n_primary_classes
         ranked = rank_classes_per_cell(class_fine, self._grid, n_classes)
@@ -572,7 +715,7 @@ class SoilGridsHandler:
         integer class codes on the standardised lat/lon grid.
         """
         from data4simplace.grid import _standardise_lonlat_names
-        from data4simplace.soil.dominant import (
+        from data4simplace.soil.classify import (
             depth_bounds_cm,
             rootzone_mean,
             usda_profile_class,
@@ -673,7 +816,7 @@ class SoilGridsHandler:
         ``flags.compute_ptf`` is set and texture is available.
         """
         if self._soil.dominant_mode == "none":
-            soil = self.normalise_texture(self.load())
+            soil = self.harmonise_water_retention(self.normalise_texture(self.load()))
             hydraulic: xr.Dataset | None = None
             if self._config.flags.compute_ptf and {"sand", "clay"}.issubset(soil.data_vars):
                 from data4simplace.soil.ptf import saxton_rawls
@@ -683,7 +826,37 @@ class SoilGridsHandler:
             return soil, hydraulic
 
         soil, hydraulic = self.load_dominant()
-        return self.normalise_texture(soil), hydraulic
+        if self.top_classes is not None:
+            # Every rank must get the same post-processing as the exported
+            # profile, or a rank-2 CSV would carry un-normalised texture.
+            self.top_classes.properties = self.harmonise_water_retention(
+                self.normalise_texture(self.top_classes.properties)
+            )
+        return self.harmonise_water_retention(self.normalise_texture(soil)), hydraulic
+
+    @staticmethod
+    def harmonise_water_retention(ds: xr.Dataset) -> xr.Dataset:
+        """Force the water-retention layers into their physical order.
+
+        SoilGrids predicts ``wv0010``, ``wv0033`` and ``wv1500`` with separate
+        models, so a cell can come out with, say, more water at 1500 kPa than at
+        33 kPa — which would give SIMPLACE a negative plant-available water. The
+        drier suction is clipped to the wetter one
+        (``wv0010 >= wv0033 >= wv1500``), keeping the wettest layer authoritative.
+
+        Applied per target cell **after** aggregation: the per-layer reducers are
+        linear means, and clipping a mean is enough to guarantee the ordering the
+        exporter relies on.
+        """
+        present = [layer for layer in WATER_RETENTION_LAYERS if layer in ds.data_vars]
+        if len(present) < 2:
+            return ds
+        out = ds.copy()
+        for wetter, drier in zip(present, present[1:]):
+            # np.minimum propagates NaN, so a cell missing either layer stays
+            # missing rather than silently inheriting the other one's value.
+            out[drier] = np.minimum(out[drier], out[wetter]).astype("float32")
+        return out
 
     @staticmethod
     def normalise_texture(ds: xr.Dataset) -> xr.Dataset:

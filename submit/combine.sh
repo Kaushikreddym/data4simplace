@@ -19,8 +19,20 @@
 
 set -uo pipefail
 
+# SLURM runs a *copy* of this script from the node's spool dir
+# (/var/spool/slurmd/job<id>/slurm_script), so BASH_SOURCE points there and
+# cannot find env.sh next to it. Resolve the real submit dir instead.
+for _d in "${D4S_PROJECT_DIR:-}/submit" "${SLURM_SUBMIT_DIR:-}/submit" \
+          "$(dirname "${BASH_SOURCE[0]}")"; do
+    [ -f "${_d}/env.sh" ] && { D4S_SUBMIT_DIR="${_d}"; break; }
+done
+if [ -z "${D4S_SUBMIT_DIR:-}" ]; then
+    echo "ERROR: cannot locate submit/env.sh. Set D4S_PROJECT_DIR or sbatch" >&2
+    echo "       from the project root so SLURM_SUBMIT_DIR resolves it." >&2
+    exit 1
+fi
 # shellcheck disable=SC1091
-source "$(dirname "${BASH_SOURCE[0]}")/env.sh"
+source "${D4S_SUBMIT_DIR}/env.sh"
 d4s_activate
 
 d4s_banner "COMBINE TILES"

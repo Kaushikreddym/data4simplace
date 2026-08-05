@@ -15,6 +15,11 @@ import xarray as xr
 
 from data4simplace.config import GridConfig
 
+#: Relative slack on the source-vs-target spacing comparison in
+#: :meth:`TargetGrid.regrid`. Source axes stored as float32 (MSWX) measure a
+#: fraction of a part per million off their nominal resolution.
+_RES_TOL = 1e-3
+
 
 @dataclass(frozen=True)
 class TargetGrid:
@@ -95,9 +100,22 @@ class TargetGrid:
     def regrid(self, data: xr.DataArray | xr.Dataset, method: str = "mean") -> xr.DataArray | xr.Dataset:
         """Aggregate a finer field onto this grid by binned reduction.
 
-        Uses ``groupby_bins`` on both axes so that many fine cells are reduced
-        into each coarse target cell. Falls back to nearest-neighbour
-        interpolation when the source is coarser than the target.
+        Three cases, decided from the source spacing:
+
+        * **Same resolution** (within :data:`_RES_TOL`) - a pure nearest pick via
+          ``reindex``. There is nothing to aggregate: each target cell holds
+          exactly one source cell. Taking the binned path here would be both a
+          no-op numerically and ruinous computationally - ``groupby_bins`` emits
+          ``n_lat x n_lon`` tasks *per chunk*, so a 46-year MSWX tile chunked by
+          30 days builds ~8.5 million dask tasks per variable and exhausts the
+          node in ``dask.optimization.fuse`` before computing anything.
+        * **Coarser source** - nearest-neighbour interpolation.
+        * **Finer source** - ``groupby_bins`` on both axes, reducing many fine
+          cells into each target cell.
+
+        The same-resolution test needs a tolerance rather than ``>=``: MSWX
+        stores its axes as float32, so a nominal 0.1 degree grid measures
+        0.099999822676 and would otherwise be misjudged as "finer".
 
         Parameters
         ----------
@@ -109,6 +127,16 @@ class TargetGrid:
         """
         data = _standardise_lonlat_names(data)
         src_res = float(np.abs(np.diff(data["lon"].values)).mean()) if data["lon"].size > 1 else self.resolution_deg
+
+        if abs(src_res - self.resolution_deg) <= self.resolution_deg * _RES_TOL:
+            # Half a cell: the nearest source centre either is this cell's own
+            # or belongs to a neighbour, and float32 axis drift is ~1e-4 deg.
+            return data.reindex(
+                lat=self.lat_centers,
+                lon=self.lon_centers,
+                method="nearest",
+                tolerance=self.resolution_deg / 2.0,
+            )
 
         if src_res >= self.resolution_deg:
             return data.interp(lat=self.lat_centers, lon=self.lon_centers, method="nearest")

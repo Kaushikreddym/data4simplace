@@ -1,14 +1,46 @@
 """SIMPLACE management / fertilizer schedule exporter.
 
-Generates a fertilizer application schedule per grid cell from the regridded
-NPK dataset, conforming to the SIMPLACE management reference file. When a
-reference schedule is present, its columns, delimiter, application dates and
-missing sentinel are reused; the per-cell N/P/K amounts are filled from data.
+The reference schedule (``fertilizer_<crop>.csv``) is a long table — one row per
+location, event and fertilizer type — carrying *product* amounts in g/m^2 at a
+development stage (``DVS``) rather than nutrient rates::
+
+    location,FertilizerScenario,crop,Event,vType,DVS,Amount
+    49612,2,winter_wheat,1,PK,0.001,40
+    49612,2,winter_wheat,2,KAS,0.25,32
+
+Every location in that file carries the same flat scenario. This exporter keeps
+the reference's *structure* — its event count, DVS timing and the relative split
+of N across the top dressings — and replaces the flat amounts with each cell's
+own NPKGRIDS rates. Two conversions are involved:
+
+1. **Oxide to element.** NPKGRIDS reports P and K as P2O5 / K2O, while
+   ``fertilizer_composition.xml`` declares elemental contents.
+2. **Nutrient to product.** ``Amount`` is grams of *product*, so a nutrient
+   demand is divided by the carrier's content — 1 g N is 3.70 g of KAS (27 %
+   mineral N) but 2.17 g of Urea (46 %).
+
+The reference's compound ``PK`` carrier cannot honour two independent rates: its
+P:K ratio is fixed at 0.0792:0.083 g/g, so scaling it to a cell's P2O5 rate
+fixes K at whatever that ratio delivers. The compound event is therefore split
+into the two straight carriers ``npk.p_fertilizer`` / ``npk.k_fertilizer``
+(``P`` = P2O5, ``K`` = K2O in the reference composition file), applied at the
+same DVS, so both nutrients land exactly on their NPKGRIDS rate.
+
+Cells NPKGRIDS has no rate for are dropped rather than filled with the reference
+constants, so no exported location carries a fabricated application.
+
+When ``flags.run_irrigation_classification`` is set the schedule also carries a
+``vIRR`` column (name configurable via ``irrigation.column``): 1 where the
+irrigated share of the crop's harvested area exceeds ``irrigation.threshold``,
+0 for rainfed *and* for cells with too little of the crop to classify. It is a
+per-location attribute, so every event row of a cell repeats it. See
+:mod:`data4simplace.management.irrigation`.
 """
 
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -18,78 +50,517 @@ import xarray as xr
 
 from data4simplace.config import PipelineConfig
 from data4simplace.exporters.base_exporter import BaseExporter, ReferenceSpec, parse_reference_csv
+from data4simplace.management.irrigation import IrrigationClassification
+from data4simplace.npk.composition import (
+    K2O_TO_K,
+    P2O5_TO_P,
+    FertilizerComposition,
+    default_composition_path,
+    parse_fertilizer_composition,
+)
 
 logger = logging.getLogger(__name__)
 
-# Recognised nutrient -> SIMPLACE management column names.
-_NUTRIENT_TO_SIMPLACE = {"N": "N_AMOUNT", "P": "P_AMOUNT", "K": "K_AMOUNT"}
+#: Schedule columns, in the reference's order. Used only as the offline
+#: fallback; a real run takes the order from the reference file.
+_SCHEDULE_COLUMNS = [
+    "location",
+    "FertilizerScenario",
+    "crop",
+    "Event",
+    "vType",
+    "DVS",
+    "Amount",
+]
+#: Column holding the cell identifier in the reference schedule.
+_LOCATION_COLUMN = "location"
+
+#: kg/ha -> g/m^2. 1 kg/ha = 1000 g / 10,000 m^2.
+_KG_HA_TO_G_M2 = 0.1
+
+#: Offline fallback: the Brandenburg winter-wheat scenario and the contents of
+#: the three carriers it needs, so a run without the SIMPLACE reference files
+#: still produces a structurally valid schedule.
+_FALLBACK_EVENTS: list[tuple[str, float, float]] = [
+    # (vType, DVS, reference Amount)
+    ("PK", 0.001, 40.0),
+    ("KAS", 0.25, 32.0),
+    ("KAS", 0.4, 16.0),
+    ("KAS", 0.9, 16.0),
+]
+_FALLBACK_COMPOSITIONS: dict[str, FertilizerComposition] = {
+    "PK": FertilizerComposition(name="PK", phosphorus=0.0792, potassium=0.083),
+    "KAS": FertilizerComposition(
+        name="KAS", mineral_n=0.27, nitrate=0.135, ammonium=0.135
+    ),
+    "P": FertilizerComposition(name="P", phosphorus=P2O5_TO_P),
+    "K": FertilizerComposition(name="K", potassium=K2O_TO_K),
+}
+
+
+@dataclass(frozen=True)
+class ScheduleEvent:
+    """One application in the per-cell schedule.
+
+    Attributes
+    ----------
+    vtype:
+        The ``vType`` written to the CSV.
+    dvs:
+        Development stage the application is triggered at.
+    nutrient:
+        Which cell rate drives the amount: ``"N"``, ``"P"`` or ``"K"``.
+    share:
+        Fraction of the cell's rate for that nutrient applied here. The N
+        dressings split the rate; the single P and K events always take 1.
+    content:
+        The carrier's content of the nutrient, g element / g product.
+    """
+
+    vtype: str
+    dvs: float
+    nutrient: str
+    share: float
+    content: float
+
+    def amounts(self, nutrient_g_m2: np.ndarray) -> np.ndarray:
+        """Product amounts (g/m^2) delivering ``share`` of an elemental rate."""
+        return nutrient_g_m2 * self.share / self.content
+
+
+@dataclass(frozen=True)
+class ScheduleTemplate:
+    """The per-cell schedule shape recovered from the reference file.
+
+    Attributes
+    ----------
+    events:
+        Applications in write order (ascending ``DVS``, reference order within
+        a stage).
+    scenario:
+        The ``FertilizerScenario`` column value.
+    """
+
+    events: list[ScheduleEvent]
+    scenario: int
+
+    @property
+    def nutrients(self) -> set[str]:
+        """The nutrient rates this schedule consumes."""
+        return {event.nutrient for event in self.events}
 
 
 class ManagementExporter(BaseExporter):
-    """Export a SIMPLACE fertilizer schedule from NPK data."""
+    """Export a SIMPLACE fertilizer schedule from gridded NPK rates."""
 
     kind = "management"
 
     def __init__(self, config: PipelineConfig, reference_path: str | Path | None) -> None:
         super().__init__(config, reference_path)
-        self._template: Optional[pd.DataFrame] = None
+        self._npk_config = config.npk
+        self._template: Optional[ScheduleTemplate] = None
 
     def fallback_spec(self) -> ReferenceSpec:
-        """Documented default matching common SIMPLACE fertilizer layouts."""
+        """Documented default matching the SIMPLACE fertilizer schedule layout."""
         return ReferenceSpec(
             delimiter=",",
-            columns=["SimplaceID", "DATE", "N_AMOUNT", "P_AMOUNT", "K_AMOUNT"],
+            columns=list(_SCHEDULE_COLUMNS),
             missing_value=str(self._config.missing_value),
         )
 
-    def _reference_template(self) -> Optional[pd.DataFrame]:
-        """Load the reference fertilizer schedule rows, if a file exists."""
-        if self._template is not None:
-            return self._template
+    # ------------------------------------------------------------------ #
+    # Fertilizer compositions
+    # ------------------------------------------------------------------ #
+    def _compositions(self) -> dict[str, FertilizerComposition]:
+        """Load ``fertilizer_composition.xml``, or the offline fallback."""
+        path = self._npk_config.composition_file or default_composition_path(
+            self._reference_path
+        )
+        if path is None:
+            logger.warning(
+                "No fertilizer_composition.xml found (npk.composition_file unset "
+                "and none next to the management reference); using the built-in "
+                "contents for %s", ", ".join(sorted(_FALLBACK_COMPOSITIONS))
+            )
+            return dict(_FALLBACK_COMPOSITIONS)
+        compositions = parse_fertilizer_composition(path)
+        # The straight P/K carriers must exist even when the reference schedule
+        # itself only uses the compound; fall back to the pure oxides.
+        for name in (self._npk_config.p_fertilizer, self._npk_config.k_fertilizer):
+            if name not in compositions and name in _FALLBACK_COMPOSITIONS:
+                compositions[name] = _FALLBACK_COMPOSITIONS[name]
+        return compositions
+
+    # ------------------------------------------------------------------ #
+    # Reference schedule -> template
+    # ------------------------------------------------------------------ #
+    def _reference_events(self) -> list[tuple[str, float, float]]:
+        """``(vType, DVS, Amount)`` of one location's reference schedule.
+
+        Every location in the reference carries the same flat scenario, so the
+        first location's rows define the pattern for all cells.
+        """
         ref_file = self._resolve_reference_file()
         if ref_file is None:
-            return None
+            logger.warning(
+                "No management reference; using the built-in winter-wheat "
+                "scenario (%d events)", len(_FALLBACK_EVENTS)
+            )
+            return list(_FALLBACK_EVENTS)
+
         spec = parse_reference_csv(ref_file, default_missing=str(self._config.missing_value))
-        self._template = pd.read_csv(ref_file, sep=spec.delimiter)
+        frame = pd.read_csv(ref_file, sep=spec.delimiter)
+        for column in ("vType", "DVS", "Amount"):
+            if column not in frame.columns:
+                raise ValueError(
+                    f"Management reference {ref_file} has no {column!r} column; "
+                    f"found {list(frame.columns)}"
+                )
+        if _LOCATION_COLUMN in frame.columns:
+            first = frame[_LOCATION_COLUMN].iloc[0]
+            frame = frame[frame[_LOCATION_COLUMN] == first]
+        if "Event" in frame.columns:
+            frame = frame.sort_values("Event", kind="stable")
+
+        return [
+            (str(row.vType), float(row.DVS), float(row.Amount))
+            for row in frame.itertuples(index=False)
+        ]
+
+    def _reference_scenario(self) -> int:
+        """The ``FertilizerScenario`` value: config override, else reference."""
+        if self._npk_config.fertilizer_scenario is not None:
+            return int(self._npk_config.fertilizer_scenario)
+        ref_file = self._resolve_reference_file()
+        if ref_file is not None:
+            spec = parse_reference_csv(
+                ref_file, default_missing=str(self._config.missing_value)
+            )
+            head = pd.read_csv(ref_file, sep=spec.delimiter, nrows=1)
+            if "FertilizerScenario" in head.columns:
+                return int(head["FertilizerScenario"].iloc[0])
+        return 2
+
+    def template(self) -> ScheduleTemplate:
+        """Build (and cache) the per-cell schedule template.
+
+        Raises
+        ------
+        ValueError
+            If a reference ``vType`` is absent from the composition file, if the
+            configured N/P/K carriers are unknown or carry no such nutrient, or
+            if ``npk.n_split`` does not match the reference's N-event count.
+        """
+        if self._template is not None:
+            return self._template
+
+        compositions = self._compositions()
+        reference = self._reference_events()
+        unknown = {vtype for vtype, _, _ in reference if vtype not in compositions}
+        if unknown:
+            raise ValueError(
+                f"Fertilizer type(s) {sorted(unknown)} used by the management "
+                f"reference are not declared in the composition file "
+                f"(known: {sorted(compositions)})"
+            )
+
+        events: list[ScheduleEvent] = []
+        events.extend(self._nutrient_events(reference, compositions))
+        events.extend(self._n_events(reference, compositions))
+        # Ascending DVS, reference order within a stage (a stable sort).
+        events.sort(key=lambda event: event.dvs)
+
+        if not events:
+            raise ValueError(
+                "The management reference yields no applications; check that "
+                "its vType values carry N, P or K in the composition file"
+            )
+
+        self._template = ScheduleTemplate(events=events, scenario=self._reference_scenario())
+        logger.info(
+            "Fertilizer template: %d events (%s)",
+            len(events),
+            ", ".join(f"{e.vtype}@DVS{e.dvs:g}" for e in events),
+        )
         return self._template
 
-    def build_frame(self, npk: xr.Dataset, cell_table: pd.DataFrame) -> pd.DataFrame:
-        """Build the fertilizer schedule table.
+    def _nutrient_events(
+        self,
+        reference: list[tuple[str, float, float]],
+        compositions: dict[str, FertilizerComposition],
+    ) -> list[ScheduleEvent]:
+        """The single straight-P and straight-K applications.
 
-        If a reference schedule exists, its application-date rows are replicated
-        per cell and the nutrient amounts overwritten with cell values. Without
-        a reference, a single application row per cell is emitted.
+        Their timing is the first reference event that supplies the nutrient
+        (whether as a compound or a straight carrier); with none, the earliest
+        stage in the schedule.
         """
-        template = self._reference_template()
-        rows: list[dict[str, object]] = []
+        earliest = min((dvs for _, dvs, _ in reference), default=0.001)
+        built: list[ScheduleEvent] = []
 
-        for _, cell in cell_table.iterrows():
-            amounts: dict[str, float] = {}
-            if npk.data_vars:
-                point = npk.sel(lat=cell["lat"], lon=cell["lon"], method="nearest")
-                for nutrient, column in _NUTRIENT_TO_SIMPLACE.items():
-                    if nutrient in point.data_vars:
-                        val = point[nutrient].compute().item()
-                        if not np.isnan(val):
-                            amounts[column] = round(float(val), 3)
-            if not amounts:
+        for nutrient, carrier_name, carries in (
+            ("P", self._npk_config.p_fertilizer, lambda c: c.carries_p),
+            ("K", self._npk_config.k_fertilizer, lambda c: c.carries_k),
+        ):
+            dvs = next(
+                (d for vtype, d, _ in reference if carries(compositions[vtype])), None
+            )
+            if dvs is None:
+                logger.info(
+                    "Management reference applies no %s; scheduling the NPKGRIDS "
+                    "%s rate at the schedule's first stage (DVS %g)",
+                    nutrient, nutrient, earliest,
+                )
+                dvs = earliest
+
+            carrier = compositions.get(carrier_name)
+            if carrier is None:
+                raise ValueError(
+                    f"npk.{nutrient.lower()}_fertilizer {carrier_name!r} is not "
+                    f"declared in the composition file (known: {sorted(compositions)})"
+                )
+            content = carrier.phosphorus if nutrient == "P" else carrier.potassium
+            if content <= 0.0:
+                raise ValueError(
+                    f"npk.{nutrient.lower()}_fertilizer {carrier_name!r} carries "
+                    f"no {nutrient} in the composition file"
+                )
+            built.append(
+                ScheduleEvent(
+                    vtype=carrier_name,
+                    dvs=dvs,
+                    nutrient=nutrient,
+                    share=1.0,
+                    content=content,
+                )
+            )
+        return built
+
+    def _n_events(
+        self,
+        reference: list[tuple[str, float, float]],
+        compositions: dict[str, FertilizerComposition],
+    ) -> list[ScheduleEvent]:
+        """The N dressings, keeping the reference's timing and relative split.
+
+        The split weights are the reference *nutrient* deliveries
+        (``Amount x mineral N content``), not the raw amounts, so a schedule
+        that mixes carriers of different strengths still splits the cell's N
+        rate the way the reference does.
+        """
+        n_rows = [
+            (vtype, dvs, amount)
+            for vtype, dvs, amount in reference
+            if compositions[vtype].mineral_n > 0.0
+        ]
+        if not n_rows:
+            logger.warning(
+                "Management reference applies no mineral N; the NPKGRIDS N rate "
+                "will not be written"
+            )
+            return []
+
+        carrier_name = self._npk_config.n_fertilizer
+        carrier = compositions.get(carrier_name)
+        if carrier is None:
+            raise ValueError(
+                f"npk.n_fertilizer {carrier_name!r} is not declared in the "
+                f"composition file (known: {sorted(compositions)})"
+            )
+        if carrier.mineral_n <= 0.0:
+            raise ValueError(
+                f"npk.n_fertilizer {carrier_name!r} carries no mineral N in the "
+                f"composition file"
+            )
+
+        configured = self._npk_config.n_split
+        if configured is not None:
+            if len(configured) != len(n_rows):
+                raise ValueError(
+                    f"npk.n_split has {len(configured)} entries but the "
+                    f"management reference has {len(n_rows)} N events"
+                )
+            weights = np.asarray(configured, dtype="float64")
+        else:
+            weights = np.array(
+                [amount * compositions[vtype].mineral_n for vtype, _, amount in n_rows],
+                dtype="float64",
+            )
+        total = float(weights.sum())
+        if total <= 0.0:
+            raise ValueError("The management reference's N events deliver no N")
+        shares = weights / total
+
+        return [
+            ScheduleEvent(
+                vtype=carrier_name,
+                dvs=dvs,
+                nutrient="N",
+                share=float(share),
+                content=carrier.mineral_n,
+            )
+            for (_, dvs, _), share in zip(n_rows, shares)
+        ]
+
+    # ------------------------------------------------------------------ #
+    # Frame construction
+    # ------------------------------------------------------------------ #
+    def _cell_rates(self, npk: xr.Dataset, cell_table: pd.DataFrame) -> dict[str, np.ndarray]:
+        """Elemental nutrient rates (g element / m^2) for every table row.
+
+        The NPK dataset is already on the target grid, so the cell table's
+        ``row``/``col`` index it directly — one vectorised gather instead of a
+        per-cell ``sel``, which matters at Europe's ~10^5 cells.
+        """
+        rows = cell_table["row"].to_numpy()
+        cols = cell_table["col"].to_numpy()
+
+        # Source variable -> (canonical nutrient, oxide->element factor).
+        sources = {
+            "N": ("N", 1.0),
+            "P2O5": ("P", P2O5_TO_P),
+            "K2O": ("K", K2O_TO_K),
+            # A generic-raster NPK source already reports elemental P and K.
+            "P": ("P", 1.0),
+            "K": ("K", 1.0),
+        }
+        rates: dict[str, np.ndarray] = {}
+        for variable, (nutrient, factor) in sources.items():
+            if variable not in npk.data_vars or nutrient in rates:
                 continue
+            grid = np.asarray(npk[variable].values, dtype="float64")
+            values = grid[rows, cols]
+            # A negative rate is not physical; treat it as absent rather than
+            # writing a negative application.
+            values = np.where(values < 0.0, np.nan, values)
+            rates[nutrient] = values * factor * _KG_HA_TO_G_M2
+        return rates
 
-            if template is not None:
-                for _, tmpl_row in template.iterrows():
-                    record = tmpl_row.to_dict()
-                    record["SimplaceID"] = int(cell["SimplaceID"])
-                    record.update(amounts)
-                    rows.append(record)
-            else:
-                record = {"SimplaceID": int(cell["SimplaceID"]), "DATE": self._config.time.start}
-                record.update(amounts)
-                rows.append(record)
+    def _columns(self, irrigation: Optional[IrrigationClassification]) -> list[str]:
+        """Output columns: the reference schedule, plus ``vIRR`` when classified."""
+        columns = list(_SCHEDULE_COLUMNS)
+        if irrigation is not None:
+            columns.append(self._config.irrigation.column)
+        return columns
 
-        return pd.DataFrame(rows)
+    def conform(self, frame: pd.DataFrame) -> pd.DataFrame:
+        """Reference column order, with the irrigation column kept on the end.
 
-    def export(self, npk: xr.Dataset, cell_table: pd.DataFrame, output_dir: str | Path) -> Path:
-        """Write the fertilizer schedule file; return its path."""
-        frame = self.build_frame(npk, cell_table)
-        out_path = Path(output_dir) / "management" / "fertilizer.csv"
+        The base class drops every column the reference does not declare, which
+        is what the reference-driven schema demands. ``vIRR`` is a deliberate
+        extension rather than drift, so it is re-appended *after* the reference
+        block — leaving the reference's own columns in their exact order.
+        """
+        column = self._config.irrigation.column
+        if column not in frame.columns:
+            return super().conform(frame)
+        conformed = super().conform(frame.drop(columns=[column]))
+        conformed[column] = frame[column].to_numpy()
+        return conformed
+
+    def build_frame(
+        self,
+        npk: xr.Dataset,
+        cell_table: pd.DataFrame,
+        irrigation: Optional[IrrigationClassification] = None,
+    ) -> pd.DataFrame:
+        """Build the long fertilizer schedule, one row per cell and event.
+
+        Parameters
+        ----------
+        npk:
+            The regridded NPK rates (``N`` / ``P2O5`` / ``K2O`` in kg/ha).
+        cell_table:
+            The exported cells, carrying ``SimplaceID``, ``row`` and ``col``.
+        irrigation:
+            Optional irrigated/rainfed classification. When given, its per-cell
+            label is repeated onto every event row of that cell as the
+            ``irrigation.column`` column.
+
+        Returns
+        -------
+        pandas.DataFrame
+            Columns ``location``, ``FertilizerScenario``, ``crop``, ``Event``,
+            ``vType``, ``DVS``, ``Amount`` and, with a classification, ``vIRR``.
+            Empty when no cell has a rate.
+        """
+        template = self.template()
+        columns = self._columns(irrigation)
+        if not npk.data_vars or cell_table.empty:
+            logger.warning("No NPK layers or no exported cells; empty schedule")
+            return pd.DataFrame(columns=columns)
+
+        rates = self._cell_rates(npk, cell_table)
+        missing = template.nutrients - set(rates)
+        if missing:
+            logger.warning(
+                "NPK dataset carries no %s rate; those events are dropped from "
+                "the schedule", ", ".join(sorted(missing))
+            )
+        events = [event for event in template.events if event.nutrient in rates]
+        if not events:
+            logger.warning("None of the schedule's nutrients are present in the NPK data")
+            return pd.DataFrame(columns=columns)
+
+        n_cells = len(cell_table)
+        # (n_cells, n_events) so a ravel lines up with the repeated ids below.
+        amounts = np.column_stack([event.amounts(rates[event.nutrient]) for event in events])
+
+        frame = pd.DataFrame(
+            {
+                _LOCATION_COLUMN: np.repeat(
+                    cell_table["SimplaceID"].to_numpy(dtype="int64"), len(events)
+                ),
+                "FertilizerScenario": template.scenario,
+                "crop": self._npk_config.simplace_crop,
+                "vType": np.tile([event.vtype for event in events], n_cells),
+                "DVS": np.tile([event.dvs for event in events], n_cells),
+                "Amount": amounts.ravel(),
+            }
+        )
+        if irrigation is not None:
+            # A per-location attribute, so it repeats across the cell's events.
+            frame[self._config.irrigation.column] = np.repeat(
+                irrigation.column(cell_table), len(events)
+            )
+
+        # A cell with no NPKGRIDS rate is dropped, not filled with the reference
+        # constants: an exported location must carry its own application.
+        frame = frame[np.isfinite(frame["Amount"].to_numpy())]
+        if frame.empty:
+            logger.warning("No exported cell has an NPKGRIDS rate; empty schedule")
+            return pd.DataFrame(columns=columns)
+
+        frame["Amount"] = frame["Amount"].round(self._npk_config.amount_decimals)
+        # Renumber per location so a cell missing one nutrient still has a
+        # gap-free 1..n event sequence. The rows are already in per-cell blocks
+        # ordered by DVS, so a plain cumulative count is the event index.
+        frame["Event"] = frame.groupby(_LOCATION_COLUMN, sort=False).cumcount() + 1
+
+        kept = int(frame[_LOCATION_COLUMN].nunique())
+        logger.info(
+            "Fertilizer schedule: %d of %d exported cells have NPKGRIDS rates "
+            "(%d rows)", kept, n_cells, len(frame)
+        )
+        if irrigation is not None:
+            column = self._config.irrigation.column
+            irrigated = int(frame.groupby(_LOCATION_COLUMN, sort=False)[column].first().sum())
+            logger.info(
+                "%s: %d of %d scheduled cells irrigated (%s, share > %g)",
+                column, irrigated, kept, irrigation.source, irrigation.threshold,
+            )
+        return frame[columns]
+
+    def export(
+        self,
+        npk: xr.Dataset,
+        cell_table: pd.DataFrame,
+        output_dir: str | Path,
+        irrigation: Optional[IrrigationClassification] = None,
+    ) -> Path:
+        """Write ``fertilizer_<crop>.csv``; return its path."""
+        frame = self.build_frame(npk, cell_table, irrigation=irrigation)
+        out_path = (
+            Path(output_dir) / "management" / f"fertilizer_{self._npk_config.simplace_crop}.csv"
+        )
         return self.write_csv(frame, out_path)

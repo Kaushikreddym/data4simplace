@@ -4,6 +4,11 @@ Aligns global nutrient application datasets (nitrogen, phosphorus, potassium
 application rates) onto the unified 10 km target grid. Sources are typically
 coarse global rasters (e.g. gridded fertilizer application products), so
 alignment is a resample/regrid operation onto the target cells.
+
+:class:`NPKHandler` dispatches on ``npk.source``: ``npkgrids`` reads one
+crop-specific NPKGRIDS v1.08 netCDF (see
+:mod:`data4simplace.npk.npkgrids`), ``rasters`` keeps the generic per-nutrient
+GeoTIFF/netCDF discovery implemented here for other gridded products.
 """
 
 from __future__ import annotations
@@ -16,6 +21,7 @@ import xarray as xr
 
 from data4simplace.config import PipelineConfig
 from data4simplace.grid import TargetGrid
+from data4simplace.npk.npkgrids import NPKGridsHandler
 
 logger = logging.getLogger(__name__)
 
@@ -73,14 +79,22 @@ class NPKHandler:
         return da  # type: ignore[return-value]
 
     def load(self) -> xr.Dataset:
-        """Load and regrid all discovered nutrient layers.
+        """Load and regrid the configured fertilizer source.
 
         Returns
         -------
         xarray.Dataset
-            Variables ``N``, ``P``, ``K`` (whichever are found) on the 10 km
-            grid. Empty dataset if no NPK root / rasters are configured.
+            For ``npk.source: npkgrids``, the crop's ``N`` / ``P2O5`` / ``K2O``
+            rates in kg/ha on the 10 km grid. For ``rasters``, the ``N`` / ``P``
+            / ``K`` layers discovered under ``paths.npk_root``. Empty dataset if
+            nothing usable is configured.
         """
+        if self._config.npk.source == "npkgrids":
+            return NPKGridsHandler(self._config).load()
+        return self._load_rasters()
+
+    def _load_rasters(self) -> xr.Dataset:
+        """Discover and regrid one raster per nutrient (the generic source)."""
         discovered = self._discover()
         if not discovered:
             logger.warning("No NPK rasters discovered; returning empty dataset")

@@ -6,46 +6,61 @@
 #   D4S_TILE_DEG=2.5 D4S_MAX_CONCURRENT=6 ./submit/submit_europe.sh
 # =============================================================================
 
+# Every D4S_* setting is exported, not just assigned: submit_europe.sh passes
+# them to the jobs with `sbatch --export=...`, which reads the *environment* of
+# the submitting shell. A plain shell variable is invisible there, so a bare
+# `: "${VAR:=default}"` would silently propagate nothing.
+
 # --- Project & environment ---------------------------------------------------
-: "${D4S_PROJECT_DIR:=/data01/FDS/muduchuru/codes/GITHUB/data4simplace}"
-: "${D4S_CONDA_ENV:=sdba}"                     # env holding the editable install
-: "${D4S_CONFIG:=${D4S_PROJECT_DIR}/config.yaml}"
+export D4S_PROJECT_DIR="${D4S_PROJECT_DIR:-/data01/FDS/muduchuru/codes/GITHUB/data4simplace}"
+export D4S_CONDA_ENV="${D4S_CONDA_ENV:-sdba}"  # env holding the editable install
+export D4S_CONFIG="${D4S_CONFIG:-${D4S_PROJECT_DIR}/config.yaml}"
 
 # --- Run layout --------------------------------------------------------------
 # Outputs go to /beegfs: the weather export writes one gzipped CSV per cropland
 # cell (O(10^5) files for Europe), which is far more inodes than /data01 wants.
-: "${D4S_RUN_NAME:=europe}"
-: "${D4S_OUT_DIR:=/beegfs/muduchuru/data4simplace/${D4S_RUN_NAME}}"
-: "${D4S_WORK_DIR:=${D4S_OUT_DIR}/_work}"      # generated per-task configs
-: "${D4S_LOG_DIR:=${D4S_PROJECT_DIR}/submit/logs}"
+export D4S_RUN_NAME="${D4S_RUN_NAME:-europe_torchcrop}"
+export D4S_OUT_DIR="${D4S_OUT_DIR:-/data01/FDS/muduchuru/Data/SIMPLACE/${D4S_RUN_NAME}}"
+export D4S_WORK_DIR="${D4S_WORK_DIR:-${D4S_OUT_DIR}/_work}"   # per-task configs
+export D4S_LOG_DIR="${D4S_LOG_DIR:-${D4S_PROJECT_DIR}/submit/logs}"
 
 # The SoilGrids WCS cache is keyed by coverage id only (no bbox), so tiles must
 # NOT share one cache directory - see submit/tile_config.py for the details.
-: "${D4S_WCS_CACHE_ROOT:=${D4S_WORK_DIR}/wcs_cache}"
+export D4S_WCS_CACHE_ROOT="${D4S_WCS_CACHE_ROOT:-${D4S_WORK_DIR}/wcs_cache}"
 
 # The run config: a copy of D4S_CONFIG with paths.output_dir pointed at the run
 # directory. Written by submit_europe.sh, read by every job of the run.
-: "${D4S_RUN_CONFIG:=${D4S_WORK_DIR}/config_run.yaml}"
+export D4S_RUN_CONFIG="${D4S_RUN_CONFIG:-${D4S_WORK_DIR}/config_run.yaml}"
 
 # --- Tiling ------------------------------------------------------------------
 # 5.0 deg over the 690x380 Europe grid => 112 tiles of 50x50 cells.
 # Halve it to 2.5 deg (448 tiles) if a tile OOMs or overruns its walltime.
-: "${D4S_TILE_DEG:=5.0}"
+export D4S_TILE_DEG="${D4S_TILE_DEG:-5.0}"
 
 # --- SLURM -------------------------------------------------------------------
-: "${D4S_PARTITION:=compute}"
-: "${D4S_CPUS:=40}"
-: "${D4S_MEM:=80G}"
-: "${D4S_TIME:=2-00:00:00}"
+export D4S_PARTITION="${D4S_PARTITION:-compute}"
+# Sized to the MSWX read pool (climate.read_workers, capped at 16): that pool is
+# the only real parallelism in a tile. Measured peak RSS of a running tile was
+# 4.7 GB, so the previous 40 cpus / 80 GB reserved a whole 80-core, 95 GB node
+# per tile to run one ~33%-busy core - which is what capped the run at 8
+# concurrent tiles regardless of how many nodes were idle. At 16/24G three tiles
+# share a node.
+export D4S_CPUS="${D4S_CPUS:-16}"
+export D4S_MEM="${D4S_MEM:-24G}"
+export D4S_TIME="${D4S_TIME:-2-00:00:00}"
 # Concurrency cap. Each task pulls its own SoilGrids subsets from the ISRIC WCS
 # and its own CORINE tiles from the CLC WMS; keep this modest so the run stays
-# within what those public services will serve without throttling us.
-: "${D4S_MAX_CONCURRENT:=8}"
+# within what those public services will serve without throttling us. This is a
+# politeness limit on *external services*, not a compute limit - raise it only
+# as far as ISRIC/CLC tolerate, even though the cluster could run all 112 at once.
+export D4S_MAX_CONCURRENT="${D4S_MAX_CONCURRENT:-24}"
 
 # --- Runtime tuning ----------------------------------------------------------
 # One task per tile is already the parallelism; stop the BLAS/OpenMP layers from
-# oversubscribing the cores SLURM allocated.
-export OMP_NUM_THREADS="${D4S_CPUS}"
+# oversubscribing the cores SLURM allocated. OMP is deliberately *not* D4S_CPUS:
+# the MSWX reader forks up to 16 processes, and giving each one 16 OpenMP threads
+# would oversubscribe the allocation 16-fold.
+export OMP_NUM_THREADS=2
 export OPENBLAS_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 export GDAL_CACHEMAX=512

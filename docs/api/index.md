@@ -8,8 +8,8 @@ The reference below is generated directly from the source docstrings with
 | [Configuration](config.md) | `load_config`, `PipelineConfig` and the section models. |
 | [Target grid](grid.md) | `TargetGrid` and `SimplaceID` assignment. |
 | [Pipeline](pipeline.md) | `Pipeline` orchestration and `PipelineResult`. |
-| [Handlers](handlers.md) | MSWX, SoilGrids (+ PTF), NPK and cropland masking. |
-| [Exporters](exporters.md) | Reference parser and weather/soil/management writers. |
+| [Handlers](handlers.md) | MSWX, SoilGrids (+ PTF), NPK, multi-class aggregation, cropland and area helpers. |
+| [Exporters](exporters.md) | Reference parser and weather/soil/per-class/management writers. |
 
 ## Top-level package
 

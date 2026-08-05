@@ -19,6 +19,13 @@ Design
 * Weather files are written directly (one per cell, globally named). Soil is
   written as one CSV **shard** per tile, concatenated into ``soil/soil.csv`` at
   the end. A per-tile marker under ``output/.tiles`` makes the run restartable.
+* The multi-class stage (``soil.aggregation_method: top3``) shards the same way:
+  one shard per (tile, rank), mosaicked into ``soil/soil_<rank>.csv``. Its
+  intermediate rasters stay **per tile** under ``soil/netcdf_tiles/``, named with
+  the tile suffix -- concatenating them is a job for xarray, not this module.
+* The fertilizer schedule shards the same way, into
+  ``management/fertilizer_<crop>.csv``. Its rows are per (cell, event), so the
+  mosaic sorts stably to keep each cell's events in DVS order.
 """
 
 from __future__ import annotations
@@ -32,10 +39,17 @@ import pandas as pd
 
 from data4simplace.climate import MSWXHandler
 from data4simplace.config import PipelineConfig
-from data4simplace.exporters import SoilExporter, WeatherExporter
+from data4simplace.exporters import (
+    ManagementExporter,
+    SoilExporter,
+    TopSoilExporter,
+    WeatherExporter,
+)
 from data4simplace.grid import TargetGrid
+from data4simplace.management import IrrigationClassifier
+from data4simplace.npk import NPKHandler
 from data4simplace.soil import SoilGridsHandler
-from data4simplace.spatial import CroplandMask
+from data4simplace.spatial import apply_cell_mask, export_cell_mask, keep_cells
 
 logger = logging.getLogger(__name__)
 
@@ -130,25 +144,50 @@ def _run_tile(
 
     climate = MSWXHandler(tcfg).load() if flags.run_climate_processing else None
     soil = hydraulic = None
+    top_classes = None
     if flags.run_soil_processing:
-        soil, hydraulic = SoilGridsHandler(tcfg).load_processed()
+        handler = SoilGridsHandler(tcfg)
+        soil, hydraulic = handler.load_processed()
+        top_classes = handler.top_classes
+
+    npk = None
+    if flags.run_npk_processing:
+        loaded = NPKHandler(tcfg).load()
+        npk = loaded if len(loaded.data_vars) else None
+
+    # Classified on the tile's own grid, so `row`/`col` below index it directly.
+    irrigation = None
+    if flags.run_irrigation_classification:
+        irrigation = IrrigationClassifier(tcfg).classify()
 
     ct = _global_cell_table(tgrid, w, n_lon)
 
-    if flags.apply_agricultural_mask:
-        masker = CroplandMask(tcfg)
-        mask = masker.build()
-        if climate is not None:
-            climate = masker.apply(climate, mask)
-        if soil is not None:
-            soil = masker.apply(soil, mask)
-        if hydraulic is not None:
-            hydraulic = masker.apply(hydraulic, mask)
-        ct = masker.keep_cells(ct, mask)
+    mask = export_cell_mask(tcfg, tgrid, soil)
+    climate = apply_cell_mask(climate, mask) if climate is not None else None
+    soil = apply_cell_mask(soil, mask) if soil is not None else None
+    hydraulic = apply_cell_mask(hydraulic, mask) if hydraulic is not None else None
+    npk = apply_cell_mask(npk, mask) if npk is not None else None
+    if top_classes is not None:
+        top_classes.mask_cells(mask)
+    ct = keep_cells(ct, mask)
 
     if ct.empty:
-        logger.info("Tile %s: no cells after masking; skipping export", w.name)
+        logger.info("Tile %s: no exportable cells; skipping export", w.name)
         return 0
+
+    # Gridded intermediates first, so they survive an exporter failure. One set
+    # per tile: mosaicking rasters is left to the user (xr.open_mfdataset).
+    if flags.write_soil_statistics and top_classes is not None:
+        top_classes.write(out_dir, soil=soil, hydraulic=hydraulic, suffix=f"_{w.name}")
+
+    if irrigation is not None and tcfg.irrigation.write_netcdf:
+        # One raster per tile, as for the soil intermediates; mosaicking is left
+        # to the user (xr.open_mfdataset).
+        nc_dir = out_dir / "management" / "netcdf_tiles"
+        nc_dir.mkdir(parents=True, exist_ok=True)
+        irrigation.to_dataset(tgrid).to_netcdf(
+            nc_dir / f"irrigation_class_{irrigation.crop_group}_{w.name}.nc"
+        )
 
     if flags.export_simplace_weather and climate is not None:
         WeatherExporter(tcfg, tcfg.reference.weather_dir).export(climate, ct, out_dir)
@@ -160,21 +199,58 @@ def _run_tile(
         if not frame.empty:
             frame.to_csv(shard_dir / f"{w.name}.csv", index=False)
 
+    if flags.export_top3_soil_csvs and top_classes is not None:
+        exporter = TopSoilExporter(tcfg, tcfg.reference.soil_dir)
+        for rank in top_classes.ranks:
+            rank = int(rank)
+            frame = exporter.build_rank_frame(
+                top_classes, rank, ct, hydraulic if rank == 1 else None
+            )
+            if frame.empty:
+                continue
+            rank_dir = _rank_shard_dir(shard_dir.parent, rank)
+            rank_dir.mkdir(parents=True, exist_ok=True)
+            # Conform here, not at concat time: the shard then already has the
+            # SIMPLACE column order plus the metadata block.
+            exporter.conform(frame).to_csv(rank_dir / f"{w.name}.csv", index=False)
+
+    if flags.export_simplace_management and npk is not None:
+        exporter = ManagementExporter(tcfg, tcfg.reference.management_file)
+        frame = exporter.build_frame(npk, ct, irrigation=irrigation)
+        if not frame.empty:
+            mgmt_dir = _management_shard_dir(out_dir)
+            mgmt_dir.mkdir(parents=True, exist_ok=True)
+            exporter.conform(frame).to_csv(mgmt_dir / f"{w.name}.csv", index=False)
+
     return len(ct)
 
 
-def _concat_soil_shards(shard_dir: Path, out_path: Path) -> None:
-    """Mosaic per-tile soil shards into a single ``soil.csv`` (global rows)."""
+def _rank_shard_dir(soil_dir: Path, rank: int) -> Path:
+    """Shard directory for one primary-class rank."""
+    return soil_dir / f"_shards_rank{rank}"
+
+
+def _management_shard_dir(out_dir: Path) -> Path:
+    """Shard directory for the per-tile fertilizer schedules."""
+    return out_dir / "management" / "_shards"
+
+
+def _concat_shards(shard_dir: Path, out_path: Path, label: str = "soil") -> None:
+    """Mosaic per-tile CSV shards into a single file (global rows).
+
+    The sort is **stable**, so a product with several rows per cell (the
+    fertilizer schedule, one row per event) keeps its within-cell ordering.
+    """
     shards = sorted(shard_dir.glob("tile_*.csv"))
     if not shards:
-        logger.warning("No soil shards to concatenate under %s", shard_dir)
+        logger.warning("No %s shards to concatenate under %s", label, shard_dir)
         return
     frames = [pd.read_csv(p) for p in shards]
     combined = pd.concat(frames, ignore_index=True)
-    combined = combined.sort_values("location").reset_index(drop=True)
+    combined = combined.sort_values("location", kind="stable").reset_index(drop=True)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     combined.to_csv(out_path, index=False)
-    logger.info("Wrote mosaicked soil (%d rows) -> %s", len(combined), out_path)
+    logger.info("Wrote mosaicked %s (%d rows) -> %s", label, len(combined), out_path)
 
 
 def combine_tiles(
@@ -184,8 +260,9 @@ def combine_tiles(
 
     Use this after tiles were produced by separate jobs, or to re-mosaic soil
     after an interrupted run. Weather files are already per-cell and globally
-    named, so they need no merging; this concatenates the soil shards into
-    ``soil/soil.csv`` and reports coverage.
+    named, so they need no merging; this concatenates the soil and fertilizer
+    shards into ``soil/soil.csv`` / ``management/fertilizer_<crop>.csv`` and
+    reports coverage.
 
     Parameters
     ----------
@@ -198,7 +275,8 @@ def combine_tiles(
     Returns
     -------
     dict
-        ``{"weather_files", "soil_rows", "tiles_expected", "tiles_done", "tiles_missing"}``.
+        ``{"weather_files", "soil_rows", "top3_rows", "management_rows",
+        "tiles_expected", "tiles_done", "tiles_missing"}``.
     """
     out_dir = Path(config.paths.output_dir)
     shard_dir = out_dir / "soil" / "_shards"
@@ -224,19 +302,40 @@ def combine_tiles(
     soil_rows = 0
     if config.flags.export_simplace_soil:
         out_path = out_dir / "soil" / "soil.csv"
-        _concat_soil_shards(shard_dir, out_path)
+        _concat_shards(shard_dir, out_path, label="soil")
         if out_path.is_file():
             soil_rows = sum(1 for _ in out_path.open()) - 1  # minus header
+
+    top3_rows = 0
+    if config.flags.export_top3_soil_csvs:
+        for rank in range(1, config.soil.n_primary_classes + 1):
+            rank_dir = _rank_shard_dir(out_dir / "soil", rank)
+            if not rank_dir.is_dir():
+                continue
+            rank_path = out_dir / "soil" / f"soil_{rank}.csv"
+            _concat_shards(rank_dir, rank_path, label=f"soil rank {rank}")
+            if rank_path.is_file():
+                top3_rows += sum(1 for _ in rank_path.open()) - 1
+
+    management_rows = 0
+    if config.flags.export_simplace_management:
+        mgmt_dir = _management_shard_dir(out_dir)
+        mgmt_path = out_dir / "management" / f"fertilizer_{config.npk.simplace_crop}.csv"
+        _concat_shards(mgmt_dir, mgmt_path, label="management")
+        if mgmt_path.is_file():
+            management_rows = sum(1 for _ in mgmt_path.open()) - 1
 
     weather_files = len(list((out_dir / "weather").glob("*.csv.gz")))
     logger.info(
         "Combined: %d weather files (already global), soil.csv %d rows, "
-        "%d tile markers present",
-        weather_files, soil_rows, len(done),
+        "per-class CSVs %d rows, fertilizer %d rows, %d tile markers present",
+        weather_files, soil_rows, top3_rows, management_rows, len(done),
     )
     return {
         "weather_files": weather_files,
         "soil_rows": soil_rows,
+        "top3_rows": top3_rows,
+        "management_rows": management_rows,
         "tiles_expected": expected,
         "tiles_done": len(done),
         "tiles_missing": missing,
@@ -358,7 +457,13 @@ def run_tiled(
         marker.write_text("ok\n")
 
     if config.flags.export_simplace_soil:
-        _concat_soil_shards(shard_dir, out_dir / "soil" / "soil.csv")
+        _concat_shards(shard_dir, out_dir / "soil" / "soil.csv", label="soil")
+    if config.flags.export_simplace_management:
+        _concat_shards(
+            _management_shard_dir(out_dir),
+            out_dir / "management" / f"fertilizer_{config.npk.simplace_crop}.csv",
+            label="management",
+        )
 
     logger.info("Tiled run complete: %d/%d tiles, %d cells exported",
                 processed, len(windows), cells)

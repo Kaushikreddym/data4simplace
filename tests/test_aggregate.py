@@ -7,7 +7,7 @@ import pytest
 import xarray as xr
 
 from data4simplace.grid import TargetGrid
-from data4simplace.soil.aggregate import (
+from data4simplace.soil.classify import (
     bin_reduce,
     cell_geomean,
     cell_mean,

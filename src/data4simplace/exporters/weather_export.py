@@ -6,6 +6,10 @@ tab-delimited, gzipped (``daily_mean_RES1_C{col}R{row}.csv.gz``) and carry the
 columns ``Date, Precipitation, TempMin, TempMean, TempMax, Radiation,
 Windspeed, RefET, Gridcell, RelHumCalc`` with a ``-99.9`` sentinel. Column
 order, delimiter and sentinel are taken from the reference when available.
+
+``Windspeed`` needs ``SFCWIND: sfcwind`` in ``climate.variables`` and is written
+as the **2 m** equivalent of the 10 m MSWX product (see `_wind_10m_to_2m`).
+``RefET`` has no MSWX source and stays at the sentinel.
 """
 
 from __future__ import annotations
@@ -22,7 +26,9 @@ from data4simplace.exporters.base_exporter import BaseExporter, ReferenceSpec
 
 logger = logging.getLogger(__name__)
 
-# Map canonical MSWX names -> SIMPLACE weather column names.
+# Map canonical MSWX names -> SIMPLACE weather column names. A variable absent
+# from this dict never reaches a column, whatever ``climate.variables`` loads —
+# both export paths below iterate this dict, not the dataset.
 _CANONICAL_TO_SIMPLACE = {
     "pr": "Precipitation",
     "tasmin": "TempMin",
@@ -30,9 +36,41 @@ _CANONICAL_TO_SIMPLACE = {
     "tasmax": "TempMax",
     "rsds": "Radiation",
     "hurs": "RelHumCalc",
+    "sfcwind": "Windspeed",
 }
-# Reference columns MSWX cannot provide (Windspeed, RefET) are left for
-# conform() to fill with the reference sentinel.
+# ``RefET`` is the only reference column MSWX cannot provide; conform() fills
+# it with the reference sentinel.
+
+#: Measurement height of the MSWX ``SFCWIND`` product [m].
+_MSWX_WIND_HEIGHT_M = 10.0
+
+
+def _wind_10m_to_2m(values: np.ndarray, height_m: float = _MSWX_WIND_HEIGHT_M) -> np.ndarray:
+    """Convert wind speed at ``height_m`` to the 2 m equivalent [m s-1].
+
+    FAO-56 eq. 47 — a logarithmic wind profile over a short grass reference::
+
+        u2 = uz * 4.87 / ln(67.8 * z - 5.42)
+
+    MSWX publishes near-surface wind at 10 m, while the SIMPLACE Penman routine
+    (and LINTUL-5 downstream of it) expects 2 m. At 10 m the factor is 0.748, so
+    writing the raw product would overstate the aerodynamic term of ET0 by a
+    third everywhere. The SIMPLACE reference weather files average 2.6 m s-1,
+    which is a 2 m magnitude, not a 10 m one.
+    """
+    return values * (4.87 / np.log(67.8 * height_m - 5.42))
+
+
+#: Per-variable unit/height corrections applied on the way to a SIMPLACE column.
+_CANONICAL_TRANSFORMS = {
+    "sfcwind": _wind_10m_to_2m,
+}
+
+
+def _to_simplace(canonical: str, values: np.ndarray) -> np.ndarray:
+    """Apply the SIMPLACE-side correction for a canonical variable, if any."""
+    transform = _CANONICAL_TRANSFORMS.get(canonical)
+    return values if transform is None else transform(values)
 
 
 class WeatherExporter(BaseExporter):
@@ -98,7 +136,7 @@ class WeatherExporter(BaseExporter):
 
         for canonical, column in _CANONICAL_TO_SIMPLACE.items():
             if canonical in point.data_vars:
-                values = np.asarray(point[canonical].values)
+                values = _to_simplace(canonical, np.asarray(point[canonical].values))
                 frame[column] = np.round(values, 2)
 
         frame["Gridcell"] = self._gridcell_id(cell)
@@ -126,7 +164,7 @@ class WeatherExporter(BaseExporter):
         # Precompute the shared date column and the per-variable value cubes.
         dates = pd.to_datetime(climate["time"].values).strftime("%Y-%m-%d")
         present = {c: v for c, v in _CANONICAL_TO_SIMPLACE.items() if c in climate.data_vars}
-        cubes = {col: np.round(np.asarray(climate[canon].values), 2)
+        cubes = {col: np.round(_to_simplace(canon, np.asarray(climate[canon].values)), 2)
                  for canon, col in present.items()}  # each shaped (time, lat, lon)
         written: list[Path] = []
 

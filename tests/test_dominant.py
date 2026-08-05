@@ -7,7 +7,7 @@ import pytest
 import xarray as xr
 
 from data4simplace.grid import TargetGrid
-from data4simplace.soil.dominant import (
+from data4simplace.soil.classify import (
     depth_bounds_cm,
     dominant_class_per_cell,
     dominant_pixel_mask,
@@ -187,3 +187,98 @@ def test_dominant_vote_separates_equal_topsoils(two_cell_grid):
     assert split_profile_class(int(dom.values[0, 0])) == (11, 4)
     mask = dominant_pixel_mask(composite, dom)
     np.testing.assert_array_equal(mask.values.astype(int), [[1, 1, 1, 0, 0]])
+
+
+# --------------------------------------------------------------------------- #
+# class_composition: per-class areas and cell heterogeneity (Method B)
+# --------------------------------------------------------------------------- #
+def test_class_composition_ranks_and_shares(two_cell_grid):
+    from data4simplace.soil.classify import class_composition
+
+    # Cell 0: 3x class 7, 1x class 10.  Cell 1: 2x class 3.
+    classes = _classes(
+        [7, 7, 7, 10, 3, 3], lon=[0.01, 0.03, 0.05, 0.07, 0.12, 0.15]
+    )
+    ranked, uncertainty = class_composition(classes, two_cell_grid, n_classes=3)
+
+    np.testing.assert_array_equal(ranked["class_code"].values[:, 0, 0], [7, 10, 0])
+    np.testing.assert_array_equal(ranked["pixels"].values[:, 0, 0], [3, 1, 0])
+    np.testing.assert_allclose(ranked["share_percent"].values[0, 0, 0], 75.0)
+    # Rank 3 does not exist in either cell.
+    assert np.isnan(ranked["share_percent"].values[2, 0, 0])
+    # Without pixel areas the area columns are simply absent.
+    assert "area_km2" not in ranked.data_vars
+
+    np.testing.assert_array_equal(uncertainty["n_classes"].values[0], [2, 1])
+    np.testing.assert_allclose(uncertainty["dominance_ratio"].values[0, 0], 0.25)
+    # A single-class cell is perfectly homogeneous.
+    assert uncertainty["dominance_ratio"].values[0, 1] == 0.0
+    assert uncertainty["shannon_entropy"].values[0, 1] == 0.0
+
+
+def test_class_composition_entropy_is_normalised(two_cell_grid):
+    from data4simplace.soil.classify import class_composition
+
+    # Cell 0: two classes, equally frequent -> maximal entropy for 2 classes.
+    _, even = class_composition(
+        _classes([1, 1, 2, 2], lon=[0.01, 0.03, 0.05, 0.07]), two_cell_grid
+    )
+    assert even["shannon_entropy"].values[0, 0] == pytest.approx(1.0)
+
+    # Four equally frequent classes are also maximal: the normalisation makes
+    # cells with different class counts comparable.
+    _, four = class_composition(
+        _classes([1, 2, 3, 4], lon=[0.01, 0.03, 0.05, 0.07]), two_cell_grid
+    )
+    assert four["shannon_entropy"].values[0, 0] == pytest.approx(1.0)
+
+    # A lopsided split scores below both.
+    _, skewed = class_composition(
+        _classes([1, 1, 1, 2], lon=[0.01, 0.03, 0.05, 0.07]), two_cell_grid
+    )
+    assert 0.0 < skewed["shannon_entropy"].values[0, 0] < 1.0
+
+
+def test_class_composition_empty_cell_has_no_metrics(two_cell_grid):
+    from data4simplace.soil.classify import class_composition
+
+    _, uncertainty = class_composition(
+        _classes([0, 0], lon=[0.02, 0.05]), two_cell_grid
+    )
+    assert int(uncertainty["n_classes"].values[0, 0]) == 0
+    assert np.isnan(uncertainty["dominance_ratio"].values[0, 0])
+    assert np.isnan(uncertainty["shannon_entropy"].values[0, 0])
+
+
+def test_class_composition_areas_are_latitude_weighted(two_cell_grid):
+    from data4simplace.soil.classify import class_composition
+    from data4simplace.spatial.area import pixel_area_km2
+
+    classes = _classes([7, 7, 7, 10, 3, 3], lon=[0.01, 0.03, 0.05, 0.07, 0.12, 0.15])
+    area = pixel_area_km2(classes, dlat_deg=0.02, dlon_deg=0.02)
+    ranked, uncertainty = class_composition(
+        classes, two_cell_grid, n_classes=3, pixel_area=area
+    )
+
+    per_pixel = float(area.values[0, 0])
+    assert ranked["area_km2"].values[0, 0, 0] == pytest.approx(3 * per_pixel, rel=1e-5)
+    assert ranked["area_fraction"].values[0, 0, 0] == pytest.approx(0.75)
+    assert uncertainty["total_area_km2"].values[0, 0] == pytest.approx(
+        4 * per_pixel, rel=1e-5
+    )
+    # A cell with no classified pixels has no area, not a zero one.
+    assert np.isnan(uncertainty["total_area_km2"].values[0, 1]) or (
+        uncertainty["n_classes"].values[0, 1] > 0
+    )
+
+
+def test_rank_one_matches_the_dominant_vote(two_cell_grid):
+    from data4simplace.soil.classify import class_composition
+
+    # A tie: both the majority vote and the ranking must pick the lower code.
+    classes = _classes([7, 7, 4, 4], lon=[0.01, 0.03, 0.05, 0.07])
+    ranked, _ = class_composition(classes, two_cell_grid)
+    dominant = dominant_class_per_cell(classes, two_cell_grid)
+    np.testing.assert_array_equal(
+        ranked["class_code"].sel(rank=1).values, dominant.values
+    )

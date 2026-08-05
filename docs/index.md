@@ -18,8 +18,9 @@ bounding box and aggregates to 10 km.
 <div class="d4s-card" markdown>
 ### 🪨 Soil (SoilGrids)
 Loads native 250 m layers, applies official scale factors, reprojects from
-Homolosine (`EPSG:152160`) to `EPSG:4326`, aggregates to 10 km. Optional
-Saxton–Rawls pedotransfer functions.
+Homolosine (`EPSG:152160`) to `EPSG:4326`, aggregates to 10 km. Water
+retention comes from the SoilGrids `wv0010`/`wv0033`/`wv1500` layers, with
+Saxton–Rawls pedotransfer functions as a fallback.
 </div>
 
 <div class="d4s-card" markdown>
@@ -28,8 +29,9 @@ Aligns global fertilizer / nutrient rasters onto the target grid.
 </div>
 
 <div class="d4s-card" markdown>
-### 🌱 Cropland masking
-Restricts outputs to agricultural cells using a raster or vector mask.
+### 🌱 Cropland filtering
+One PROBA-V `Crops-CoverFraction` source filters the 250 m soil pixels and
+selects the 10 km cells that are exported.
 </div>
 
 <div class="d4s-card" markdown>

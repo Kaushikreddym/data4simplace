@@ -60,6 +60,76 @@ def soil_dataset() -> xr.Dataset:
 
     return xr.Dataset(
         {"clay": layer(20.0), "silt": layer(40.0), "sand": layer(40.0),
-         "bdod": layer(1.4), "soc": layer(15.0), "phh2o": layer(6.5), "nitrogen": layer(1.2)},
+         "bdod": layer(1.4), "soc": layer(15.0), "phh2o": layer(6.5), "nitrogen": layer(1.2),
+         # Volumetric water contents in vol%, as un-scaled by SoilGridsHandler.
+         "wv0010": layer(42.0), "wv0033": layer(31.0), "wv1500": layer(14.0)},
         coords={"depth": depth, "lat": lat, "lon": lon},
+    )
+
+
+@pytest.fixture()
+def top_classes(soil_dataset):
+    """A three-rank :class:`TopClassAggregation` over the 2x2 soil fixture.
+
+    Cell (0, 0) holds three classes (60/30/10 % of its area); cell (1, 1) is
+    uniform, so it has nothing at ranks 2 and 3.
+    """
+    from data4simplace.soil.multiclass import TopClassAggregation
+
+    ranks = np.array([1, 2, 3])
+    # Each rank carries a different texture, so a test can tell them apart.
+    properties = xr.concat(
+        [soil_dataset + offset for offset in (0.0, 15.0, 30.0)], dim="rank"
+    ).assign_coords(rank=ranks)
+
+    def grid(values):
+        return (("rank", "lat", "lon"), np.asarray(values, dtype="float64"))
+
+    classes = xr.Dataset(
+        {
+            "class_code": (
+                ("rank", "lat", "lon"),
+                np.array(
+                    [[[7, 7], [7, 10]], [[10, 0], [0, 0]], [[12, 0], [0, 0]]],
+                    dtype="int16",
+                ),
+            ),
+            "pixels": (
+                ("rank", "lat", "lon"),
+                np.array(
+                    [[[6, 6], [6, 10]], [[3, 0], [0, 0]], [[1, 0], [0, 0]]],
+                    dtype="int32",
+                ),
+            ),
+            "share_percent": grid(
+                [[[60, 60], [60, 100]], [[30, np.nan], [np.nan, np.nan]],
+                 [[10, np.nan], [np.nan, np.nan]]]
+            ),
+            "area_km2": grid(
+                [[[60, 60], [60, 100]], [[30, np.nan], [np.nan, np.nan]],
+                 [[10, np.nan], [np.nan, np.nan]]]
+            ),
+            "area_fraction": grid(
+                [[[0.6, 0.6], [0.6, 1.0]], [[0.3, np.nan], [np.nan, np.nan]],
+                 [[0.1, np.nan], [np.nan, np.nan]]]
+            ),
+        },
+        coords={"rank": ranks, "lat": soil_dataset["lat"], "lon": soil_dataset["lon"]},
+    )
+
+    uncertainty = xr.Dataset(
+        {
+            "n_classes": (("lat", "lon"), np.array([[3, 1], [1, 1]], dtype="int16")),
+            "cropland_pixels": (
+                ("lat", "lon"), np.array([[10, 6], [6, 10]], dtype="int32")
+            ),
+            "total_area_km2": (("lat", "lon"), np.array([[100.0, 60.0], [60.0, 100.0]])),
+            "dominance_ratio": (("lat", "lon"), np.array([[0.4, 0.0], [0.0, 0.0]])),
+            "shannon_entropy": (("lat", "lon"), np.array([[0.83, 0.0], [0.0, 0.0]])),
+        },
+        coords={"lat": soil_dataset["lat"], "lon": soil_dataset["lon"]},
+    )
+
+    return TopClassAggregation(
+        properties=properties, classes=classes, uncertainty=uncertainty, mode="usda"
     )

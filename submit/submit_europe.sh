@@ -9,7 +9,7 @@
 #
 # Tunables live in submit/env.sh and can be overridden per invocation:
 #   D4S_TILE_DEG=2.5 D4S_MAX_CONCURRENT=6 ./submit/submit_europe.sh
-#
+#   D4S_RUN_NAME=test D4S_MAX_CONCURRENT=6 ./submit/submit_europe.sh
 # Submits
 #   1. tile_array.sh  - array job, one task per tile (throttled)
 #   2. combine.sh     - dependent (afterany) mosaic of the finished tiles

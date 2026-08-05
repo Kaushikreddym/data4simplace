@@ -188,3 +188,114 @@ def test_tiled_weather_matches_single_run(tmp_path):
             s[name].sort_values("Date").reset_index(drop=True),
             t[name].sort_values("Date").reset_index(drop=True),
         )
+
+
+# --------------------------------------------------------------------------- #
+# Integration: the tiled fertilizer schedule must equal a single run's
+# --------------------------------------------------------------------------- #
+NPKGRIDS_ROOT = Path("/data01/FDS/muduchuru/Land/NPKGRIDS/NC_FILES")
+MGMT_REFERENCE = Path(
+    "/data01/FDS/muduchuru/codes/SIMPLACE/Brandenburg_1KM_winter_wheat/data/management"
+    "/fertilizer_winter_wheat.csv"
+)
+
+
+@pytest.mark.skipif(
+    not NPKGRIDS_ROOT.is_dir() or not MGMT_REFERENCE.is_file(),
+    reason="NPKGRIDS or the SIMPLACE management reference is not available",
+)
+def test_tiled_management_matches_single_run(tmp_path):
+    common = {
+        "flags": {"run_npk_processing": True, "export_simplace_management": True},
+        "grid": {"resolution_deg": 0.1, "min_lon": 12.0, "max_lon": 13.0,
+                 "min_lat": 52.0, "max_lat": 53.0},
+        "time": {"start": "1979-01-01", "end": "1979-01-03"},
+        "paths": {"mswx_root": "/tmp", "npk_root": str(NPKGRIDS_ROOT), "output_dir": ""},
+        "reference": {"management_file": str(MGMT_REFERENCE)},
+        "npk": {"crop": "wheat", "simplace_crop": "winter_wheat"},
+    }
+    from data4simplace.pipeline import Pipeline
+
+    single_dir, tiled_dir = tmp_path / "single", tmp_path / "tiled"
+    Pipeline(PipelineConfig.model_validate(
+        {**common, "paths": {**common["paths"], "output_dir": str(single_dir)}})).run()
+    run_tiled(PipelineConfig.model_validate(
+        {**common, "paths": {**common["paths"], "output_dir": str(tiled_dir)}}),
+        tile_deg=0.5)
+
+    name = "management/fertilizer_winter_wheat.csv"
+    single = pd.read_csv(single_dir / name)
+    tiled = pd.read_csv(tiled_dir / name)
+    assert len(single) > 0
+    # The mosaic reorders cells but must reproduce the same rows, and each cell's
+    # events must stay in DVS order through the stable concat sort.
+    key = ["location", "Event"]
+    pd.testing.assert_frame_equal(
+        single.sort_values(key).reset_index(drop=True),
+        tiled.sort_values(key).reset_index(drop=True),
+    )
+    assert tiled.equals(tiled.sort_values(key, kind="stable").reset_index(drop=True))
+
+
+MIRCA_ROOT = Path(
+    "/data01/FDS/muduchuru/Land/MIRCA-OS/data/contents/"
+    "Monthly Growing Area Grids/Monthly Growing Area Grids"
+)
+ECIRA_ROOT = Path("/data01/FDS/muduchuru/Land/ECIRA")
+
+
+@pytest.mark.skipif(
+    not NPKGRIDS_ROOT.is_dir()
+    or not MGMT_REFERENCE.is_file()
+    or not MIRCA_ROOT.is_dir()
+    or not ECIRA_ROOT.is_dir(),
+    reason="NPKGRIDS / MIRCA-OS / ECIRA data not available",
+)
+def test_tiled_management_carries_the_virr_column(tmp_path):
+    """The tiled path must classify irrigation too, not just Pipeline.run().
+
+    A tile is exported by ``_run_tile``, which is a separate code path from the
+    pipeline; without this the schedule silently loses the column on every
+    tiled (i.e. every continental) run.
+    """
+    common = {
+        "flags": {
+            "run_npk_processing": True,
+            "run_irrigation_classification": True,
+            "export_simplace_management": True,
+        },
+        "grid": {"resolution_deg": 0.1, "min_lon": 12.0, "max_lon": 13.0,
+                 "min_lat": 52.0, "max_lat": 53.0},
+        "time": {"start": "1979-01-01", "end": "1979-01-03"},
+        "paths": {
+            "mswx_root": "/tmp",
+            "npk_root": str(NPKGRIDS_ROOT),
+            "mirca_root": str(MIRCA_ROOT),
+            "ecira_root": str(ECIRA_ROOT),
+            "output_dir": "",
+        },
+        "reference": {"management_file": str(MGMT_REFERENCE)},
+        "npk": {"crop": "wheat", "simplace_crop": "winter_wheat"},
+        "irrigation": {"write_netcdf": False},
+    }
+    from data4simplace.pipeline import Pipeline
+
+    single_dir, tiled_dir = tmp_path / "single", tmp_path / "tiled"
+    Pipeline(PipelineConfig.model_validate(
+        {**common, "paths": {**common["paths"], "output_dir": str(single_dir)}})).run()
+    run_tiled(PipelineConfig.model_validate(
+        {**common, "paths": {**common["paths"], "output_dir": str(tiled_dir)}}),
+        tile_deg=0.5)
+
+    name = "management/fertilizer_winter_wheat.csv"
+    single = pd.read_csv(single_dir / name)
+    tiled = pd.read_csv(tiled_dir / name)
+    assert "vIRR" in tiled.columns
+    assert set(tiled["vIRR"].unique()) <= {0, 1}
+    # Tiling must not change a single cell's label: the classification runs on
+    # each tile's own grid, so a row/col mix-up would show up here.
+    key = ["location", "Event"]
+    pd.testing.assert_frame_equal(
+        single.sort_values(key).reset_index(drop=True),
+        tiled.sort_values(key).reset_index(drop=True),
+    )

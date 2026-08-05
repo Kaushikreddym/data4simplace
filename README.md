@@ -11,10 +11,17 @@ export point-based CSV files that conform to the
   subsets to the target bounding box, and aggregates to 10 km.
 - **Soil (SoilGrids)** — loads native 250 m layers, applies the official scale
   factors, reprojects from Homolosine (`EPSG:152160`) to `EPSG:4326`, and
-  aggregates to 10 km. Optional Saxton–Rawls pedotransfer functions.
-- **NPK** — aligns global fertilizer/nutrient rasters to the target grid.
-- **Cropland masking** — restricts outputs to agricultural cells (raster or
-  vector mask).
+  aggregates to 10 km. Water retention from the SoilGrids `wv*` layers, with
+  Saxton–Rawls pedotransfer functions as a fallback.
+- **NPK (NPKGRIDS)** — reads the crop's NPKGRIDS v1.08 netCDF (N, P2O5 and K2O
+  application rates at 0.05°), aligns it to the target grid, and rescales the
+  SIMPLACE fertilizer schedule's product amounts to each cell's own rates.
+- **Cropland filtering** — one PROBA-V LC100 `Crops-CoverFraction` source
+  drives both filters: the 250 m soil pixels feeding the aggregation, and the
+  10 km cells that get exported at all.
+- **Unified cell set** — weather, soil and management cover exactly the same
+  cells: cropland cells that also have a soil profile aggregated from their own
+  250 m pixels.
 - **SIMPLACE export engine** — inspects the reference files *dynamically* to
   recover delimiter, column order, missing sentinel (`-99`) and depth horizons,
   and assigns a uniform `SimplaceID` across weather, soil and management outputs.
@@ -41,12 +48,13 @@ Every stage is toggled by an explicit flag in `config.yaml`:
 | --- | --- |
 | `run_climate_processing` | MSWX climate processing |
 | `run_soil_processing` | SoilGrids soil processing |
-| `compute_ptf` | Optional pedotransfer functions |
+| `compute_ptf` | Pedotransfer functions (fallback for the SoilGrids `wv*` water contents) |
 | `run_npk_processing` | NPK/fertilizer processing |
-| `apply_agricultural_mask` | Cropland mask filtering |
+| `apply_agricultural_mask` | Restrict outputs to PROBA-V cropland cells |
 | `export_simplace_weather` | SIMPLACE weather export |
 | `export_simplace_soil` | SIMPLACE soil export |
 | `export_simplace_management` | SIMPLACE management/fertilizer export |
+| `export_top3_soil_csvs` | One SIMPLACE soil file per primary class (`soil_1..n.csv`) |
 
 ## Package layout
 
@@ -58,8 +66,8 @@ src/data4simplace/
 ├── pipeline.py       # Stage orchestration
 ├── climate/          # MSWX handler
 ├── soil/             # SoilGrids handler + PTF
-├── npk/              # NPK aligner
-├── spatial/          # Cropland masking
+├── npk/              # NPKGRIDS reader + fertilizer compositions
+├── spatial/          # PROBA-V cropland masks (250 m pixels, 10 km cells)
 └── exporters/        # Reference parser + weather/soil/management writers
 ```
 

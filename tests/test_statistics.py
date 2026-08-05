@@ -10,19 +10,19 @@ import pytest
 import xarray as xr
 
 from data4simplace.grid import TargetGrid
-from data4simplace.soil.aggregate import (
+from data4simplace.soil.classify import (
     CELL_STATISTICS,
     bin_describe,
     cell_geomean,
     cell_median,
     reducer_for,
 )
-from data4simplace.soil.dominant import (
+from data4simplace.soil.classify import (
     dominant_class_per_cell,
     rank_classes_per_cell,
     usda_profile_class,
 )
-from data4simplace.soil.statistics import PrimaryClassStatistics
+from data4simplace.soil.multiclass import PrimaryClassStatistics
 
 
 @pytest.fixture()
