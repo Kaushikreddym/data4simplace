@@ -27,3 +27,4 @@ outputs_demo/
 
 # Notebook-generated figures, tables and NetCDF
 notebooks/outputs/
+evaluation/outputs/
