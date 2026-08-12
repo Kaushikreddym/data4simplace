@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE projectdata PUBLIC "-//SIMPLACE/DTD PRJ 1.0//EN" "http://simplace.net/dtd/SimProject_4_2.dtd">
+
+<projectdata>
+	<interfaces>
+		<interface id="projectdata" type="CSV">
+			<poolsize>200</poolsize>
+			<divider>,</divider>
+			<filename>${_WORKDIR_}/project/project_winter_wheat.csv</filename>
+		</interface>
+		<interface id="weatherfile" type="CSV">
+			<!-- <divider /> -->
+            <!-- <divider>,</divider> -->
+            <poolsize>2</poolsize>
+			<divider />
+			<filename>${_DATADIR_}/${vRow}/daily_mean_RES1_C${vColumn}R${vRow}.csv.gz</filename>
+		</interface>
+
+	</interfaces>
+	<projects>
+		<resource id="proj" interface="projectdata">
+			<header>
+				<var id="projectid" datatype="CHAR" key="projectid" />
+				<var id="simulationid" datatype="CHAR" key="simulationid" />
+				<var id="vColumn" datatype="INT" />
+				<var id="vRow" datatype="INT" />
+				<var id="vLocationID" datatype="INT" />
+				<var id="vlat" datatype="DOUBLE" />
+				<var id="vlon" datatype="DOUBLE" />
+				<!-- The planting window, per cell, from the export's site.csv.
+				     Without these two columns the solution falls back to its own
+				     vSowWindowStartDOY default and every cell sows in the same
+				     window, which is what the constant-vIDPL version did. -->
+				<var id="vSowWindowStartDOY" datatype="INT" />
+				<var id="vSowWindowLengthDays" datatype="INT" />
+				<var id="vNUTSID" datatype="CHAR" />
+				<var id="vSTATE_ID" datatype="CHAR" />
+				<var id="vSTATE_NAME" datatype="CHAR" />
+			</header>
+		</resource>
+	  </projects>
+</projectdata>

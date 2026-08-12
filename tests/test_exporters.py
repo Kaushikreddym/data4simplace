@@ -181,7 +181,7 @@ def _weather_cells(config) -> pd.DataFrame:
 
 
 def test_weather_exporter_writes_wind_from_sfcwind(tmp_path, config):
-    """``sfcwind`` must reach the ``Windspeed`` column, converted to 2 m.
+    """``sfcWind`` must reach the ``Windspeed`` column, converted to 2 m.
 
     Regression test: ``SFCWIND`` was present in ``climate.variables`` and loaded
     by the handler, but absent from the exporter's canonical->SIMPLACE map, so
@@ -189,7 +189,7 @@ def test_weather_exporter_writes_wind_from_sfcwind(tmp_path, config):
     """
     from data4simplace.exporters.weather_export import WeatherExporter
 
-    climate = _climate_dataset(config, tas=8.0, sfcwind=10.0)
+    climate = _climate_dataset(config, tas=8.0, sfcWind=10.0)
     exporter = WeatherExporter(config, reference_path=None)
     written = exporter.export(climate, _weather_cells(config), tmp_path)
     assert len(written) == 1
@@ -213,7 +213,7 @@ def test_weather_exporter_sentinels_columns_without_a_source(tmp_path, config):
     written = exporter.export(climate, _weather_cells(config), tmp_path)
 
     frame = pd.read_csv(written[0], sep="\t")
-    # No sfcwind in the dataset, and RefET has no MSWX source at all.
+    # No sfcWind in the dataset, and RefET has no MSWX source at all.
     assert set(frame["Windspeed"]) == {-99.9}
     assert set(frame["RefET"]) == {-99.9}
 
@@ -222,9 +222,9 @@ def test_weather_exporter_drops_unmapped_variables(tmp_path, config):
     """A loaded variable with no entry in the map must not invent a column."""
     from data4simplace.exporters.weather_export import WeatherExporter
 
-    climate = _climate_dataset(config, tas=8.0, sfcwindmax=30.0)
+    climate = _climate_dataset(config, tas=8.0, sfcWindmax=30.0)
     exporter = WeatherExporter(config, reference_path=None)
     written = exporter.export(climate, _weather_cells(config), tmp_path)
 
     frame = pd.read_csv(written[0], sep="\t")
-    assert "sfcwindmax" not in frame.columns
+    assert "sfcWindmax" not in frame.columns

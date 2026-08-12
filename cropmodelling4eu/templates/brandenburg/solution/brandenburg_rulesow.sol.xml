@@ -1,0 +1,1819 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE solution PUBLIC "-//SIMPLACE/DTD SOL 1.0//EN" "http://simplace.net/dtd/SimSolution_4_2.dtd">
+
+<solution check="LAZY" version="4.2">
+	<description title="USL, rule-based sowing" author="Sabine, Andi E." qualitylevel="I">WIKI_START
+		=== Purpose ===
+		The Brandenburg 1 km winter-wheat solution with the EU SUSTAg v2 sowing rules
+		in place of its fixed planting day. Everything else -- crop, soil, water,
+		C/N, phenology, outputs -- is byte-identical to
+		codes/SIMPLACE/Brandenburg_1KM_winter_wheat/solution/solution.sol.xml, so a
+		run against this file differs from a run against that one by the sowing
+		date and nothing else.
+
+		=== What changed ===
+		* The three rule thresholds are new variables. The planting window comes
+		  per cell from the SAGE start/end pair the data4simplace management
+		  exporter writes onto every event row of the fertilizer schedule, read
+		  through the `sowwindow` resource. Where the schedule carries none, the
+		  project file's vSowWindowStartDOY / vSowWindowLengthDays are the
+		  fallback -- which also covers the cells NPKGRIDS has no rate for, as
+		  those are absent from the schedule entirely.
+		* SowingWindowClimate / SowingRule / SowingDate are ported verbatim from
+		  templates/sustag/solution/EU_SUSTAg_data4simplace.sol.xml, with only the
+		  input names remapped to this solution's (weather.AirTemperatureMin,
+		  weather.Rain, DefaultManagement.WithCrop).
+		* DefaultManagement sows on ${SowingRule.DoSow} instead of
+		  ${CURRENT.DOY}==${vIDPL}.
+		* Phenology's cIDPL and the yearly PlantingDOY output read the realized
+		  SowingDate.SowingDOY. A new ForcedSow column flags a season sown by the
+		  window deadline rather than by a rule.
+		* vIDPL survives as a variable but drives nothing.
+
+		=== Usage ===
+		  simplace.template_dir:  /data01/FDS/muduchuru/codes/SIMPLACE/Brandenburg_1KM_winter_wheat
+		  simplace.solution_file: cropmodelling4eu/templates/brandenburg/solution/brandenburg_rulesow.sol.xml
+		  simplace.project_file:  cropmodelling4eu/templates/brandenburg/project/brandenburg_rulesow.proj.xml
+		  simplace.weather_contract: brandenburg
+		WIKI_END
+	</description>
+	<variables>
+		<var id="spinupdays" datatype="INT">0</var>   <!-- warm up -->
+		<var id="vIOPT" datatype="INT">4</var> 		<!-- IOPT=1 potential production, IOPT=2 water limited production, IOPT=3 nutrient limited, IOPT= 4 water & nutrient limitations -->
+		<var id="vTRANRF" datatype="DOUBLE">1.0</var>
+		<var id="vCultivarGroup" datatype="CHAR" unit="">winter_wheat</var> 
+		<var id="vAverageGroundTemperature" datatype="DOUBLE">9.51</var>
+		<var id="vAverageBulkDensity" datatype="DOUBLE">1.5</var>
+		<var id="vFirstDayMeanTemp" datatype="DOUBLE">2.28</var>
+		<var id="vCarbonContent" datatype="DOUBLE">0.77</var>
+		<var id="vTopSoilDepth" datatype="DOUBLE">0.3</var>
+		<var id="vRunNr" datatype="INT">1</var>
+		<var id="vreldem" datatype="INT">0</var>
+		<var id="vKcMin" datatype="DOUBLE">0.15</var>
+		<var id="vK_r" datatype="DOUBLE">1</var>
+		<var id="vK_s" datatype="DOUBLE">1</var>
+		<var id="vWettedSoilFraction" datatype="DOUBLE">1</var>
+		<var id="vCO2" datatype="DOUBLE">380</var>
+		<var id="vRWRTI" datatype="DOUBLE">0.3</var>
+		<!-- for SlimPhosphorus -->
+		<var id="vInitialPNRatio" datatype="DOUBLE">0.09</var> <!-- default: 0.09090909090909090909 -->
+		<var id="vSoilID" datatype="CHAR">slightly_weathered</var>     <!--Type of soil (P): 0=calcareous, as well as 1:slightly_weathered, 2: moderately_weathered, 4: highly_weathered noncalcareous soils -->
+		<var id="vAltitude" datatype="DOUBLE">62</var>
+		<var id="vRHminCharacteristic" datatype="DOUBLE">45.0</var>
+		<var id="vu2Characteristic" datatype="DOUBLE">2.0</var>
+		<var id="startdate" datatype="DATE">01.01.2044</var> <!-- 01.04.2010 -->
+		<var id="enddate" datatype="DATE">30.12.2050</var>   <!-- 30.09.2016 ; 30.12.2019 -->
+		 <var id="vIDPL" datatype="INT" unit="-">250</var>   <!-- legacy; no longer drives sowing, kept so nothing that reads it breaks -->
+		<!-- ___ Rule-based sowing: planting window and trigger thresholds ___
+		     Ported verbatim from templates/sustag/solution/EU_SUSTAg_data4simplace.sol.xml
+		     so the two solutions sow by the same rules. The window is
+		     [vSowWindowStartDOY .. vSowWindowStartDOY + vSowWindowLengthDays];
+		     keep the sum <= 365 (the test cannot wrap the year end).
+		     Both are set per grid cell from the project file; the values here are
+		     only the fallback for a project CSV that does not carry them. -->
+		<var id="vSowWindowStartDOY" datatype="INT" unit="d" description="first day of year on which the sowing rules are evaluated; set per grid cell from the project file">240</var>
+		<var id="vSowWindowLengthDays" datatype="INT" unit="d" description="length of the sowing window in days after vSowWindowStartDOY">60</var>
+		<var id="vSowForceAtWindowEnd" datatype="INT" unit="-" description="1 = force sowing on the last window day if no rule fired (guarantees a crop every season); 0 = allow a no-sow season">1</var>
+		<var id="vSowTmin7Max" datatype="DOUBLE" unit="degC" description="rule 1: sow if the 7-day mean minimum temperature is at or below this value">12.0</var>
+		<var id="vSowRain3Sum" datatype="DOUBLE" unit="mm" description="rule 2: sow if the accumulated rainfall of the last 3 days is at or above this value">20.0</var>
+		<var id="vSowMoistFracAW" datatype="DOUBLE" unit="-" description="rule 3: sow if top-5cm volumetric soil moisture is at or above wilting point plus this fraction of plant-available water (FC-WP)">0.5</var>
+		<var id="vFertilizerScenario" datatype="INT">2</var>  <!-- Lu2Y (AP 61 and 90): 1 (lower N application), Chi2Y (AP62 and 88) and Fes1Y (AP5 and 27): 2 -->
+		<var id="vSoiltype" datatype="CHAR">AP5</var>  <!-- soil characteristics per plot or treatment -->
+		<var id="vLocationID" datatype="INT">2</var>
+		<var id="vColumn" datatype="INT"></var>
+		<var id="vRow" datatype="INT"></var>
+
+
+		<var id="vlon" datatype="DOUBLE"></var>
+		<var id="vlat" datatype="DOUBLE"></var>
+		<var id="vNUTSID" datatype="CHAR"></var>
+		<var id="vSTATE_ID" datatype="CHAR"></var>
+		<var id="vSTATE_NAME" datatype="CHAR"></var>
+		
+		
+	</variables>
+	<interfaces default="simpool">
+		<interface id="managementfile1" type="XML">
+			<poolsize>1</poolsize>
+			<filename>${_WORKDIR_}/data/management/management.xml</filename>
+		</interface>
+		<interface id="managementfile2" type="CSV">
+			<poolsize>1</poolsize>
+			<divider>,</divider>
+			<filename>${_WORKDIR_}/data/management/fertilizer_winter_wheat.csv</filename>
+		</interface>
+		<!-- The same file, read a second way. `managementfile2` is keyed on
+		     (location, EventNr) and only refreshed while a crop is in the
+		     ground, which is exactly when the sowing rule is not running; this
+		     one is keyed on the location alone and read daily, so the planting
+		     window is available on the days the rule needs it. The window
+		     columns repeat across a location's event rows, so which row is
+		     matched does not matter. A separate interface rather than a second
+		     resource on the one above, so the two readers cannot share a pool
+		     entry and evict each other. -->
+		<interface id="sowwindowfile" type="CSV">
+			<poolsize>1</poolsize>
+			<divider>,</divider>
+			<filename>${_WORKDIR_}/data/management/fertilizer_winter_wheat.csv</filename>
+		</interface>
+		<interface id="fertilizercomposition" type="XML">
+			<poolsize>100</poolsize>
+			<filename>${_WORKDIR_}/data/management/fertilizer_composition.xml</filename>
+		</interface>
+		<interface id="weatherfile" type="CSV">
+            <poolsize>2</poolsize>
+			<divider />
+			<filename>${_DATADIR_}/${vRow}/daily_mean_RES1_C${vColumn}R${vRow}.csv.gz</filename>
+		</interface>
+		<interface id="cropfile" type="XML">
+			<poolsize>1</poolsize>
+			<filename>${_WORKDIR_}/data/crop/crop.xml</filename>
+		</interface>
+		<interface id="seedsfile" type="XML">
+			<poolsize>1</poolsize>
+			<filename>${_WORKDIR_}/data/crop/seeds.xml</filename>
+		</interface>
+		<interface id="soilfile" type="CSV">
+			<poolsize>1</poolsize>
+			<divider>,</divider>
+			<filename>${_WORKDIR_}/data/soil/soil.csv</filename>
+		</interface>
+		<interface id="slimfile" type="XML">
+			<poolsize>1</poolsize>
+			<filename>${_WORKDIR_}/data/slim/SLIMPropertiesSpringWheatTG_SS125_Changed.xml</filename>
+		</interface>
+		<interface id="carbonfile" type="XML">
+			<poolsize>10</poolsize>
+			<filename>${_WORKDIR_}/data/soilcnp/Carbon_Changed.xml</filename>
+		</interface>
+		<interface id="nitrogenfile" type="XML">
+			<poolsize>10</poolsize>
+			<filename>${_WORKDIR_}/data/soilcnp/Nitrogen_Changed.xml</filename>
+		</interface>
+		<interface id="phosphorusfile" type="XML">
+			<poolsize>10</poolsize>
+			<divider/>
+			<filename>${_WORKDIR_}/data/soilcnp/Phosphorus_Changed.xml</filename>     <!-- P in org matter -->
+		</interface>
+		<interface id="soilcropfile" type="XML">
+			<poolsize>10</poolsize>
+			<filename>${_WORKDIR_}/data/soilcnp/Crop_Changed.xml</filename>
+		</interface>
+		<interface id="initfile" type="XML">
+			<poolsize>10</poolsize>
+			<filename>${_WORKDIR_}/data/soilcnp/Init2010_Changed.xml</filename>
+		</interface>
+		<interface id="initpfile" type="XML">
+			<poolsize>10</poolsize>
+			<divider/>
+			<filename>${_WORKDIR_}/data/soilcnp/InitP_Changed.xml</filename>     <!-- initial P conditions -->
+		</interface>
+		<interface id="auxfile" type="XML">
+			<poolsize>10</poolsize>
+			<filename>${_WORKDIR_}/data/soilcnp/Auxiliary_Changed.xml</filename>
+		</interface>
+		<interface id="locationfile" type="CSV">
+			<poolsize>1</poolsize>
+			<divider>,</divider>
+			<filename>${_WORKDIR_}/data/management/location.csv</filename>
+		</interface>
+
+
+		<!-- ############################################### output ##################################################### -->
+
+		<interface id="crop_growth" type="CSV">
+			<poolsize>5000</poolsize>
+			<divider>;</divider>
+			<filename>${_OUTPUTDIR_}/daily/${vLocationID}_daily.csv</filename>
+		</interface>
+		<interface id="lintul5yearly" type="CSV">
+			<poolsize>100</poolsize>
+			<divider>;</divider>
+			<filename>${_OUTPUTDIR_}/yearly/${vLocationID}_yearly.csv</filename>
+		</interface>
+
+	</interfaces>
+
+
+	<!-- #################################################################################################### -->
+	<!-- #################################################################################################### -->
+	<!-- #################################################################################################### -->
+
+	<resources>
+
+		<resource id="weather" interface="weatherfile" frequence="DAILY">
+			<header>
+				<res id="CURRENTDATE" datatype="DATE" unit="-" key="CURRENT.DATE"/>
+				<res id="Rain" datatype="DOUBLE" unit="http://www.wurvoc.org/vocabularies/om-1.8/millimetre"/>
+				<res id="AirTemperatureMin" datatype="DOUBLE" unit="http://www.wurvoc.org/vocabularies/om-1.8/degree_Celsius"/>
+				<res id="AirTemperatureMean" datatype="DOUBLE" unit="http://www.wurvoc.org/vocabularies/om-1.8/degree_Celsius"/>
+				<res id="AirTemperatureMax" datatype="DOUBLE" unit="http://www.wurvoc.org/vocabularies/om-1.8/degree_Celsius"/>
+				<res id="Irradiation" datatype="DOUBLE" unit="http://www.wurvoc.org/vocabularies/om-1.8/kilojoule_per_square_metre_day"/>
+			</header>
+		</resource>
+
+		<resource id="seeds" interface="seedsfile" frequence="BOOLEAN" rule="DefaultManagement.DayAfterHarvest" dbcache="FALSE">
+			<header>
+				<res id="CropName" datatype="CHAR" key="vCultivarGroup"/>
+				<res id="SeedWeight" datatype="DOUBLE" unit="" description=""/>
+				<res id="DailyFractionRoots" datatype="DOUBLE" unit="http://www.wurvoc.org/vocabularies/om-1.8/reciprocal_day" description="Daily fraction of seed weight that is distributed to roots"/>
+				<res id="TotalFractionRoots" datatype="DOUBLE" unit="http://www.wurvoc.org/vocabularies/om-1.8/one" description="Total fraction of seed weight that is distributed to roots"/>
+				<res id="DailyFractionLeaves" datatype="DOUBLE" unit="http://www.wurvoc.org/vocabularies/om-1.8/reciprocal_day" description="Daily fraction of seed weight that is distributed to leaves"/>
+				<res id="TotalFractionLeaves" datatype="DOUBLE" unit="http://www.wurvoc.org/vocabularies/om-1.8/one" description="Total fraction of seed weight that is distributed to leaves"/>
+			</header>
+		</resource>
+		<resource id="management1" frequence="ONCE" interface="managementfile1" dbcache="FALSE">
+			<header>
+				<res id="location" datatype="CHAR" key="vSoiltype"/>
+				<res datatype="DOUBLE" description="" id="NMINS" unit=""/>
+				<res datatype="DOUBLE" description="" id="RTNMINS" unit=""/>
+				<res datatype="DOUBLE" description="" id="PMINS" unit=""/>
+				<res datatype="DOUBLE" description="" id="RTPMINS" unit=""/>
+				<res datatype="DOUBLE" description="" id="KMINS" unit=""/>
+				<res datatype="DOUBLE" description="" id="RTKMINS" unit=""/>
+				<res datatype="DOUBLE" description="" id="KRF" unit=""/>
+				<res datatype="DOUBLE" description="" id="NRF" unit=""/>
+				<res datatype="DOUBLE" description="" id="PRF" unit=""/>
+			</header>
+		</resource>
+		<resource id="management2" interface="managementfile2" frequence="BOOLEAN" rule="DefaultManagement.DoUpdateFertilizerSettings" dbcache="FALSE">
+			<header>
+				<res id="location" datatype="INT" key="vLocationID"/>
+				<res id="FertilizerScenario" datatype="INT" key="vFertilizerScenario"/>
+				<res id="crop" datatype="CHAR"/>
+				<res id="Event" datatype="INT" key="DefaultManagement.EventNr"/>
+				<res id="Type" datatype="CHAR"/>
+				<res id="DVS" datatype="DOUBLE" />
+				<res id="Amount" datatype="DOUBLE"/>   	<!-- amount of fertilizer (not nutrient!) in g/^2 -->
+			</header>
+		</resource>
+		<!-- The planting window SAGE published for this cell, carried on every
+		     event row of the schedule by data4simplace's management exporter.
+		     SIMPLACE binds CSV columns by POSITION, so every column of the file
+		     up to the pair has to be declared, in the file's order, including
+		     `vIRR`, which this solution does not otherwise read. An export
+		     written before the window existed simply ends at `vIRR`; the two
+		     window columns then read as null and SowingWindowDates falls back
+		     to the project file. -->
+		<resource id="sowwindow" interface="sowwindowfile" frequence="DAILY" dbcache="FALSE">
+			<header>
+				<res id="location" datatype="INT" key="vLocationID"/>
+				<res id="FertilizerScenario" datatype="INT"/>
+				<res id="crop" datatype="CHAR"/>
+				<res id="Event" datatype="INT"/>
+				<res id="vType" datatype="CHAR"/>
+				<res id="DVS" datatype="DOUBLE"/>
+				<res id="Amount" datatype="DOUBLE"/>
+				<res id="vIRR" datatype="INT"/>
+				<res id="vSowWindowStartDOY" datatype="INT"/>
+				<res id="vSowWindowEndDOY" datatype="INT"/>
+			</header>
+		</resource>
+		<resource id="location" frequence="DAILY" interface="locationfile">
+			<header>
+				<res datatype="INT" id="location" key="vLocationID"/>
+				<res datatype="DOUBLE" id="Latitude"/>
+				<res datatype="DOUBLE" id="SunInclination"/>
+				<res datatype="DOUBLE" id="Altitude"/>
+			</header>
+		</resource>
+		<resource id="fertilizerparameters" interface="fertilizercomposition" frequence="BOOLEAN" rule="DefaultManagement.DoUpdateFertilizerSettings" dbcache="FALSE">
+			<header>
+				<res id="Fertilizertype" datatype="CHAR" key="management2.Type"/>
+				<res id="Nitrate" datatype="DOUBLE"/>
+				<res id="Ammonium" datatype="DOUBLE"/>
+				<res id="Potassium" datatype="DOUBLE"/>
+				<res id="Phosphorus" datatype="DOUBLE"/>
+				<res id="NitrateAndAmmonium" datatype="DOUBLE"/>
+				<res id="OrganicC" datatype="DOUBLE"/>
+				<res id="OrganicN" datatype="DOUBLE"/>
+				<res id="OrganicP" datatype="DOUBLE"/>
+			</header>
+		</resource>
+
+		<resource id="soil" interface="soilfile" frequence="ONCE">
+			<header>
+				<res id="location" datatype="INT" key="vLocationID"/>
+				<res id="soiltype" datatype="CHAR"/>
+				<res id="dampingdepth" unit="m" datatype="DOUBLE"/>
+				<res id="soilwater_fc_global" unit="cm3*cm-3" datatype="DOUBLE"/>
+				<res id="soilwater_sat_global" unit="cm3*cm-3" datatype="DOUBLE"/>
+				<res id="drainage_rate" unit="mm" datatype="DOUBLE"/>
+				<res id="deltatheta" unit="-" datatype="DOUBLE"/>
+				<res id="DZF" unit="m" datatype="DOUBLE"/>
+				<res id="depth" datatype="DOUBLEARRAY"/>
+				<res id="soilwater_fc" unit="cm3*cm-3" datatype="DOUBLEARRAY"/>
+				<res id="soilwater_red" unit="cm3*cm-3" datatype="DOUBLEARRAY"/>
+				<res id="soilwater_wp" unit="cm3*cm-3" datatype="DOUBLEARRAY"/>
+				<res id="soilwater_sat" unit="cm3*cm-3" datatype="DOUBLEARRAY"/>
+				<res id="soilwater_init" unit="cm3*cm-3" datatype="DOUBLEARRAY"/>
+				<res id="bulkdensity" unit="g*cm-3" datatype="DOUBLEARRAY"/>
+				<res id="clay" unit="g/100g" datatype="DOUBLEARRAY"/>
+				<res id="carbon" unit="g/100g" datatype="DOUBLEARRAY"/>
+				<res id="ammonium" unit="mg/kg" datatype="DOUBLEARRAY"/>
+				<res id="nitrate" unit="mg/kg" datatype="DOUBLEARRAY"/>
+				<res id="sand" unit="g/100g" datatype="DOUBLEARRAY"/>
+				<res id="soilwater_res" unit="cm3*cm-3" datatype="DOUBLEARRAY"/>
+				<res id="macroporevolume" unit="-" datatype="DOUBLEARRAY"/>
+				<!-- for SlimP: -->
+
+				<res id="SoilLayerDepth" datatype="DOUBLEARRAY" unit="http://www.wurvoc.org/vocabularies/om-1.8/metre" description="Clay content per layer"/>
+				<res id="CaCO3" datatype="DOUBLEARRAY" unit="http://www.wurvoc.org/vocabularies/om-1.8/percent" description="CaCO3 concentration per layer"/>
+				<res id="PH" datatype="DOUBLEARRAY" unit="http://www.wurvoc.org/vocabularies/om-1.8/one" description="pH value of soil per layer"/>
+				<res id="BSA" datatype="DOUBLEARRAY" unit="http://www.wurvoc.org/vocabularies/om-1.8/percent" description="Base saturation by the ammonium acetate method"/>
+				<res id="LowerBoundaryPConcentration" datatype="DOUBLE" unit="http://www.wurvoc.org/vocabularies/om-1.8/gram_per_litre" description="P concentration in the lower boundary of the soil profile"/>
+				<res id="RootMaxPUptakeRate" datatype="DOUBLE" unit="http://www.wurvoc.org/vocabularies/om-1.8/gram_per_metre" description="Maximum uptake rate per one metre root"/>
+				<res id="InitialDissolvedPConcentration" datatype="DOUBLEARRAY" unit="http://www.wurvoc.org/vocabularies/om-1.8/parts_per_million" description="Initial dissolved P per layer"/>
+				<res id="InitialAdsorbedPConcentration" datatype="DOUBLEARRAY" unit="http://www.wurvoc.org/vocabularies/om-1.8/parts_per_million" description="Initial adsorbed P per layer"/>
+				<res id="InitialFixedPConcentration" datatype="DOUBLEARRAY" unit="http://www.wurvoc.org/vocabularies/om-1.8/parts_per_million" description="Initial fixed P per layer"/>
+				<res id="slimalfa" unit="-" datatype="DOUBLEARRAY"/>
+			</header>
+		</resource>
+
+		<resource id="slim" interface="slimfile" frequence="ONCE" dbcache="FALSE">
+			<header>
+				<res id="soiltype" datatype="CHAR" key="vSoiltype"/>
+				<res id="THICKL" unit="m" datatype="DOUBLE"/>
+				<res id="SEEDD" unit="m" datatype="DOUBLE"/>
+				<res id="MaxSoilEvaporationDepth" datatype="DOUBLE"/>
+				<res id="MT" unit="-" datatype="INT"/>
+				<res id="MY" unit="-" datatype="INT"/>
+				<res id="MD" unit="-" datatype="INT"/>
+				<res id="WMGENT" unit="mm" datatype="DOUBLE"/>
+				<res id="WRGENT" unit="mm" datatype="DOUBLE"/>
+				<res id="WMGENS" unit="mm" datatype="DOUBLE"/>
+				<res id="WRGENS" unit="mm" datatype="DOUBLE"/>
+				<res id="IFWGEN" unit="mm" datatype="BOOLEAN"/>
+				<res id="ALFA" unit="" datatype="DOUBLE"/>
+				<res id="DP" datatype="DOUBLE"/>
+				<res id="WALIQ" unit="mm" datatype="DOUBLE"/>
+				<res id="WM1S" datatype="DOUBLE"/>
+				<res id="WRST" datatype="DOUBLE"/>
+				<res id="WRSS" datatype="DOUBLE"/>
+				<res id="SMD" datatype="DOUBLE"/>
+				<res id="AREA" unit="m**2" datatype="DOUBLE"/>
+				<res id="BGEN" datatype="DOUBLE"/>
+				<res id="ELIM" datatype="DOUBLE"/>
+				<res id="SCMIN" unit="m" datatype="DOUBLE"/>
+				<res id="SCONC" unit="-" datatype="DOUBLE"/>
+				<res id="HBS" unit="m" datatype="DOUBLE"/>
+				<res id="HBT" unit="m" datatype="DOUBLE"/>
+				<res id="FLOWNR" unit="m" datatype="DOUBLE"/>
+				<res id="AMR1" unit="m" datatype="DOUBLE"/>
+				<res id="AMR2" unit="m" datatype="DOUBLE"/>
+				<res id="TEMCO1" unit="m" datatype="DOUBLE"/>
+				<res id="TEMCO2" unit="m" datatype="DOUBLE"/>
+				<res id="AX" unit="m" datatype="DOUBLE"/>
+				<res id="AMEQ" unit="m" datatype="DOUBLE"/>
+				<res id="CalculateRunoffWater" datatype="BOOLEAN" unit="-"/>
+				<res id="BulkDensityThresholdLower" datatype="DOUBLE"/>
+				<res id="BulkDensityThresholdMiddle" datatype="DOUBLE"/>
+				<res id="BulkDensityThresholdUpper" datatype="DOUBLE"/>
+				<res id="MinimalBDSeminalRootReductionFactor" datatype="DOUBLE"/>
+				<res id="SoilStrengthParameter" datatype="DOUBLE"/>
+				<!-- res id="MaximalSeminalRootLengthPerDay" datatype="DOUBLE" / -->
+				<res id="DeadRootsDevStage" datatype="DOUBLE"/>
+				<res id="DailyDeadRootsRate" datatype="DOUBLE"/>
+				<res id="MacroporeRootGrowthFactor" datatype="DOUBLE"/>
+				<res id="BiomassLossRateAtPartitioning" datatype="DOUBLE"/>
+
+			</header>
+		</resource>
+		<resource id="crop" interface="cropfile" frequence="BOOLEAN" rule="DefaultManagement.DayAfterHarvest" dbcache="FALSE">
+			<header>
+<!-- 				<res id="CropName" datatype="CHAR" key="phenology.crop"/> -->
+				<res id="CropName" datatype="CHAR" key="vCultivarGroup"/>
+				<res id="TBASEM" description="lower threshold temp. for emergence" datatype="DOUBLE" unit="http://www.wurvoc.org/vocabularies/om-1.8/degree_Celsius"/>
+				<res id="TEFFMX" description="max. eff. temp. for emergence" datatype="DOUBLE" unit="http://www.wurvoc.org/vocabularies/om-1.8/degree_Celsius"/>
+				<res id="TSUMEM" description="temperature sum from sowing to emergence" datatype="DOUBLE" unit="http://www.wurvoc.org/vocabularies/om-1.8/degree_Celsius"/>
+				<res id="IDSL" description="indicates wheather pre-anthesis development depends on temp. (=0) or both temperature and daylengt (=1)" datatype="INT" unit="http://www.wurvoc.org/vocabularies/om-1.8/one"/>			
+				<res id="PhotoperiodTableHour" description="correction factor of development rate in dependence of day length" datatype="DOUBLEARRAY" unit="http://www.wurvoc.org/vocabularies/om-1.8/one"/>
+				<res id="PhotoperiodTableFactor" description="correction factor of development rate in dependence of day length" datatype="DOUBLEARRAY" unit="http://www.wurvoc.org/vocabularies/om-1.8/one"/>
+				<res id="TSUM1" description="temperature sum from emergence to anthesis" datatype="DOUBLE" unit=""/>
+				<res id="TSUM2" description="temperature sum from anthesis to maturity" datatype="DOUBLE" unit=""/>				
+				<res id="TsumIncrementTableMeanTemp" description="Daily increase in temperature sum" datatype="DOUBLEARRAY" unit="http://www.wurvoc.org/vocabularies/om-1.8/degree_Celsius"/>
+				<res id="TsumIncrementTableRate" description="Daily increase in temperature sum" datatype="DOUBLEARRAY" unit="http://www.wurvoc.org/vocabularies/om-1.8/degree_Celsius"/>
+			
+				<!-- related to development -->
+				<res id="DVSI" description="Initial DVS" datatype="DOUBLE" unit="http://www.wurvoc.org/vocabularies/om-1.8/one"/>
+				<res id="DVSEND" description="Development stage at harvest (=2.0 at maturity[-])" datatype="DOUBLE" unit="http://www.wurvoc.org/vocabularies/om-1.8/one"/>
+				<res id="TDWI" description="Initial total crop dry weight" datatype="DOUBLE" unit="http://www.wurvoc.org/vocabularies/om-1.8/gram_per_square_metre "/>
+				
+				<!-- related to LAI -->
+				<res id="RGRLAI" description="Maximum Relative increase in LAI" datatype="DOUBLE" unit="http://www.wurvoc.org/vocabularies/om-1.8/reciprocal_day"/>
+				<res id="SLATableDVS" description="specific leaf area" datatype="DOUBLEARRAY" unit="http://www.wurvoc.org/vocabularies/om-1.8/square_metre_per_gram"/>
+			    <res id="SLATableSLA" description="specific leaf area" datatype="DOUBLEARRAY" unit="http://www.wurvoc.org/vocabularies/om-1.8/square_metre_per_gram"/>
+				<res id="SPA" description="specific pod area" datatype="DOUBLE" unit="http://www.wurvoc.org/vocabularies/om-1.8/square_metre_per_gram"/>
+				<res id="SSATableDVS" datatype="DOUBLEARRAY" unit="http://www.wurvoc.org/vocabularies/om-1.8/square_metre_per_gram"/>
+				<res id="SSATableSSA" datatype="DOUBLEARRAY" unit="http://www.wurvoc.org/vocabularies/om-1.8/square_metre_per_gram"/>		
+				<res id="LAICR" description="Critical leaf area index for overshadowing" datatype="DOUBLE" unit="http://www.wurvoc.org/vocabularies/om-1.8/square_metre_per_square_metre"/>
+				<res id="TBASE" description="lower theshold temp. for increase in LAI" datatype="DOUBLE" unit="http://www.wurvoc.org/vocabularies/om-1.8/degree_Celsius"/>
+				
+				<!-- related to PS -->
+				<res id="KDIFTableDVS" description="Extinction cofficient for diffuse visible light" datatype="DOUBLEARRAY" unit="http://www.wurvoc.org/vocabularies/om-1.8/one"/>
+				<res id="KDIFTableK" description="Extinction cofficient for diffuse visible light" datatype="DOUBLEARRAY" unit="http://www.wurvoc.org/vocabularies/om-1.8/one"/>
+				<res id="RUETableDVS" description="Radiation use efficiency for biomass production" datatype="DOUBLEARRAY" unit="http://www.wurvoc.org/vocabularies/om-1.8/gram_per_megajoule"/>
+				<res id="RUETableRUE" description="Radiation use efficiency for biomass production" datatype="DOUBLEARRAY" unit="http://www.wurvoc.org/vocabularies/om-1.8/gram_per_megajoule"/>
+				<res id="TMPFTableMeanTemperature" description="" datatype="DOUBLEARRAY" unit="http://www.wurvoc.org/vocabularies/om-1.8/one"/>
+				<res id="TMPFTableFactor" description="" datatype="DOUBLEARRAY" unit="http://www.wurvoc.org/vocabularies/om-1.8/one"/>
+				<res id="TMNFTableMinTemperature" description="" datatype="DOUBLEARRAY" unit="http://www.wurvoc.org/vocabularies/om-1.8/one"/>
+				<res id="TMNFTableFactor" description="" datatype="DOUBLEARRAY" unit="http://www.wurvoc.org/vocabularies/om-1.8/one"/>
+				<res id="COTableCo2" description="" datatype="DOUBLEARRAY" unit="http://www.wurvoc.org/vocabularies/om-1.8/one"/>
+				<res id="COTableFactor" description="" datatype="DOUBLEARRAY" unit="http://www.wurvoc.org/vocabularies/om-1.8/one"/>
+				
+				<!-- related to partitioning -->		
+				<res id="RootsPartitioningTableDVS" description="fraction table of total biomass to roots as function of DVS" datatype="DOUBLEARRAY" unit="http://www.wurvoc.org/vocabularies/om-1.8/one"/>
+				<res id="RootsPartitioningTableFraction" description="fraction table of total biomass to roots as function of DVS" datatype="DOUBLEARRAY" unit="http://www.wurvoc.org/vocabularies/om-1.8/one"/>
+				<res id="LeavesPartitioningTableDVS" description="fraction table of abovre-gr. biomass to leaves as function of DVS" datatype="DOUBLEARRAY" unit="http://www.wurvoc.org/vocabularies/om-1.8/one"/>
+				<res id="LeavesPartitioningTableFraction" description="fraction table of abovre-gr. biomass to leaves as function of DVS" datatype="DOUBLEARRAY" unit="http://www.wurvoc.org/vocabularies/om-1.8/one"/>
+				<res id="StemsPartitioningTableDVS" description="fraction table of abovre-gr. biomass to stems as function of DVS" datatype="DOUBLEARRAY" unit="http://www.wurvoc.org/vocabularies/om-1.8/one"/>
+				<res id="StemsPartitioningTableFraction" description="fraction table of abovre-gr. biomass to stems as function of DVS" datatype="DOUBLEARRAY" unit="http://www.wurvoc.org/vocabularies/om-1.8/one"/>
+				<res id="StorageOrgansPartitioningTableDVS" description="fraction table of abovre-gr. biomass to storage organs as function of DVS" datatype="DOUBLEARRAY" unit="http://www.wurvoc.org/vocabularies/om-1.8/one"/>
+				<res id="StorageOrgansPartitioningTableFraction" description="fraction table of abovre-gr. biomass to storage organs as function of DVS" datatype="DOUBLEARRAY" unit="http://www.wurvoc.org/vocabularies/om-1.8/one"/>
+				
+				<!-- related to senescence -->
+				<res id="RDRL" description="max. rel. death rate of leaves due to water stress" datatype="DOUBLE" unit="http://www.wurvoc.org/vocabularies/om-1.8/reciprocal_day"/>
+				<res id="RDRLeavesTableMeanTemp" description="relative death rate of leaves as a function of daily mean temperature" datatype="DOUBLEARRAY" unit="http://www.wurvoc.org/vocabularies/om-1.8/reciprocal_day"/>
+				<res id="RDRLeavesTableRelativeRate" description="relative death rate of leaves as a function of daily mean temperature" datatype="DOUBLEARRAY" unit="http://www.wurvoc.org/vocabularies/om-1.8/reciprocal_day"/>
+				<res id="RDRSHM" description="rel. death rate of leaves due to shading (above LAICR)" datatype="DOUBLE" unit="http://www.wurvoc.org/vocabularies/om-1.8/one"/>
+				<res id="RDRRootsTableDVS" datatype="DOUBLEARRAY" unit="http://www.wurvoc.org/vocabularies/om-1.8/reciprocal_day"/>
+				<res id="RDRRootsTableRelativeRate" datatype="DOUBLEARRAY" unit="http://www.wurvoc.org/vocabularies/om-1.8/reciprocal_day"/>
+				<res id="RDRStemsTableDVS" datatype="DOUBLEARRAY" unit="http://www.wurvoc.org/vocabularies/om-1.8/reciprocal_day"/>
+				<res id="RDRStemsTableRelativeRate" datatype="DOUBLEARRAY" unit="http://www.wurvoc.org/vocabularies/om-1.8/reciprocal_day"/>
+				
+				<!-- related to transpiration and drought tolerance -->
+				<res id="CFET" description="Correction factor transpiration rate" datatype="DOUBLE" unit="http://www.wurvoc.org/vocabularies/om-1.8/one"/>
+				<res id="DEPNR" description="Crop group number for soil water depletion" datatype="DOUBLE" unit="http://www.wurvoc.org/vocabularies/om-1.8/one"/>
+				<res id="IAIRDU" description="air ducts in roots present(=1) or not (=0)" datatype="BOOLEAN" unit=""/>
+				
+				<!-- related to crop height -->
+				<!-- related to roots -->
+				<res id="RDI" description="Initial rooting depth" datatype="DOUBLE" unit="http://www.wurvoc.org/vocabularies/om-1.8/metre"/>
+				<res id="RRI" description="Maximum daily increase in rooting depth" datatype="DOUBLE" unit="http://www.wurvoc.org/vocabularies/om-1.8/metre_per_day"/>
+				<res id="MaximalSeminalRootLengthPerDay" datatype="DOUBLE"/>
+				<res id="RDMCR" description="Maximum rooting depth" datatype="DOUBLE" unit="http://www.wurvoc.org/vocabularies/om-1.8/metre"/>
+				<res id="DVSDR" description="development stage above which death of roots and stems starts" datatype="DOUBLE" unit="http://www.wurvoc.org/vocabularies/om-1.8/one"/>
+				<res id="DVSDLT" description="development stage above which death of leaves starts in dependence of mean daily temperature" datatype="DOUBLE"
+					unit="http://www.wurvoc.org/vocabularies/om-1.8/one"/>
+				<res id="RDRNS" description="max. relative death rate of leaves due to nutrient (N-P-K) stress" datatype="DOUBLE" unit="http://www.wurvoc.org/vocabularies/om-1.8/one"/>
+				<res id="DVSNLT" description=" development stage above which no crop N-P-K uptake does occur" datatype="DOUBLE" unit="http://www.wurvoc.org/vocabularies/om-1.8/one"/>
+				<res id="DVSNT" description=" development stage above which N-P-K translocation to storage organs does occur " datatype="DOUBLE" unit="http://www.wurvoc.org/vocabularies/om-1.8/one"/>
+				<res id="FNTRT" description=" N-P-K translocations from roots as a fraction of resp. total N-P-K amounts translocated from leaves and stems" datatype="DOUBLE"
+					unit="http://www.wurvoc.org/vocabularies/om-1.8/one"/>
+				<res id="FRNX" description=" optimal N concentration as fraction of maximum N concentration" datatype="DOUBLE" unit="http://www.wurvoc.org/vocabularies/om-1.8/one"/>
+				<res id="FRPX" description=" optimal P concentration as fraction of maximum P concentration" datatype="DOUBLE" unit="http://www.wurvoc.org/vocabularies/om-1.8/one"/>
+				<res id="FRKX" description=" optimal K concentration as fraction of maximum K concentration" datatype="DOUBLE" unit="http://www.wurvoc.org/vocabularies/om-1.8/one"/>
+				<res id="LRNR" description=" maximum N concentration in roots as fraction of maximum N concentration in leaves" datatype="DOUBLE" unit="http://www.wurvoc.org/vocabularies/om-1.8/one"/>
+				<res id="LSNR" description=" maximum N concentration in stems as fraction of maximum N concentration in leaves" datatype="DOUBLE" unit="http://www.wurvoc.org/vocabularies/om-1.8/one"/>
+				<res id="LRPR" description=" maximum P concentration in roots as fraction of maximum P concentration in leaves" datatype="DOUBLE" unit="http://www.wurvoc.org/vocabularies/om-1.8/one"/>
+				<res id="LSPR" description=" maximum P concentration in stems as fraction of maximum P concentration in leaves" datatype="DOUBLE" unit="http://www.wurvoc.org/vocabularies/om-1.8/one"/>
+				<res id="LRKR" description=" maximum K concentration in roots as fraction of maximum K concentration in leaves" datatype="DOUBLE" unit="http://www.wurvoc.org/vocabularies/om-1.8/one"/>
+				<res id="LSKR" description=" maximum K concentration in stems as fraction of maximum K concentration in leaves" datatype="DOUBLE" unit="http://www.wurvoc.org/vocabularies/om-1.8/one"/>
+				<res id="NLAI" description=" coefficient for the reduction due to nutrient (N-P-K) stress of the LAI increase (during juvenile phase)" datatype="DOUBLE"
+					unit="http://www.wurvoc.org/vocabularies/om-1.8/one"/>
+				<res id="NLUE" description=" coefficient for the reduction of RUE due to nutrient (N-P-K) stress" datatype="DOUBLE" unit="http://www.wurvoc.org/vocabularies/om-1.8/one"/>
+				<res id="NMAXSO" description=" maximum N concentration (= 1.6*min. N conc.) in storage organs " datatype="DOUBLE" unit="http://www.wurvoc.org/vocabularies/om-1.8/gram_per_gram"/>
+				<res id="PMAXSO" description=" maximum P concentration (= 1.6*min. P conc.) in storage organs " datatype="DOUBLE" unit="http://www.wurvoc.org/vocabularies/om-1.8/gram_per_gram"/>
+				<res id="KMAXSO" description=" maximum K concentration (= 1.6*min. K conc.) in storage organs " datatype="DOUBLE" unit="http://www.wurvoc.org/vocabularies/om-1.8/gram_per_gram"/>
+				<res id="NPART" description=" coefficient for the effect of N stress on leaf allocation " datatype="DOUBLE" unit="http://www.wurvoc.org/vocabularies/om-1.8/one"/>
+				<res id="NSLA" description=" coefficient for the effect of nutrient (N-P-K) stress on SLA reduction" datatype="DOUBLE" unit="http://www.wurvoc.org/vocabularies/om-1.8/one"/>
+				<res id="RNFLV" description=" residual N fraction in leaves " datatype="DOUBLE" unit="http://www.wurvoc.org/vocabularies/om-1.8/gram_per_gram"/>
+				<res id="RNFST" description=" residual N fraction in stems " datatype="DOUBLE" unit="http://www.wurvoc.org/vocabularies/om-1.8/gram_per_gram"/>
+				<res id="RNFRT" description=" residual N fraction in roots " datatype="DOUBLE" unit="http://www.wurvoc.org/vocabularies/om-1.8/gram_per_gram"/>
+				<res id="RPFLV" description=" residual P fraction in leaves " datatype="DOUBLE" unit="http://www.wurvoc.org/vocabularies/om-1.8/gram_per_gram"/>
+				<res id="RPFST" description=" residual P fraction in stems " datatype="DOUBLE" unit="http://www.wurvoc.org/vocabularies/om-1.8/gram_per_gram"/>
+				<res id="RPFRT" description=" residual P fraction in roots " datatype="DOUBLE" unit="http://www.wurvoc.org/vocabularies/om-1.8/gram_per_gram"/>
+				<res id="RKFLV" description=" residual K fraction in leaves " datatype="DOUBLE" unit="http://www.wurvoc.org/vocabularies/om-1.8/gram_per_gram"/>
+				<res id="RKFST" description=" residual K fraction in stems " datatype="DOUBLE" unit="http://www.wurvoc.org/vocabularies/om-1.8/gram_per_gram"/>
+				<res id="RKFRT" description=" residual K fraction in roots " datatype="DOUBLE" unit="http://www.wurvoc.org/vocabularies/om-1.8/gram_per_gram"/>
+				<res id="TCNT" description=" time coefficient for N translocation to storage organs" datatype="DOUBLE" unit="http://www.wurvoc.org/vocabularies/om-1.8/day"/>
+				<res id="TCPT" description=" time coefficient for P translocation to storage organs" datatype="DOUBLE" unit="http://www.wurvoc.org/vocabularies/om-1.8/day"/>
+				<res id="TCKT" description=" time coefficient for K translocation to storage organs" datatype="DOUBLE" unit="http://www.wurvoc.org/vocabularies/om-1.8/day"/>
+				<res id="NFIXF" description=" fraction of crop nitrogen uptake by biological fixation" datatype="DOUBLE" unit="http://www.wurvoc.org/vocabularies/om-1.8/one"/>
+				<res id="NMaxTableDVS" description="maximum N concentration in leaves as function of development stage" datatype="DOUBLEARRAY" unit="http://www.wurvoc.org/vocabularies/om-1.8/gram_per_gram"/>
+				<res id="NMaxTableConcentration" description="maximum N concentration in leaves as function of development stage" datatype="DOUBLEARRAY" unit="http://www.wurvoc.org/vocabularies/om-1.8/gram_per_gram"/>
+				<res id="PMaxTableDVS" description="maximum P concentration in leaves as function of development stage" datatype="DOUBLEARRAY" unit="http://www.wurvoc.org/vocabularies/om-1.8/gram_per_gram"/>
+				<res id="PMaxTableConcentration" description="maximum P concentration in leaves as function of development stage" datatype="DOUBLEARRAY" unit="http://www.wurvoc.org/vocabularies/om-1.8/gram_per_gram"/>
+				<res id="KMaxTableDVS" description="maximum K concentration in leaves as function of development stage" datatype="DOUBLEARRAY" unit="http://www.wurvoc.org/vocabularies/om-1.8/gram_per_gram"/>
+				<res id="KMaxTableConcentration" description="maximum K concentration in leaves as function of development stage" datatype="DOUBLEARRAY" unit="http://www.wurvoc.org/vocabularies/om-1.8/gram_per_gram"/>
+				<res id="KcbIni" description="nominal Kcb value during initial growth stage" unit="" datatype="DOUBLE"/>
+				<res id="KcbMid" description="nominal peak Kcb value obtained during mid season growth stage" unit="" datatype="DOUBLE"/>
+				<res id="KcbEnd" description="nominal Kcb value obtained at end of crop growth" unit="" datatype="DOUBLE"/>
+				<res id="CropHt" description="average crop height during mid/late season" unit="m" datatype="DOUBLE"/>
+				<res id="FRTDM" description="Fraction of above ground biomass that is available for translocation" unit="m" datatype="DOUBLE"/>
+				<res id="RemoveRatioStorageOrgan" description="reference N remove ratio for storage organs" unit="m" datatype="DOUBLE"/>
+				<res id="RemoveRatioStraw" description="reference N remove ratio for straw" unit="m" datatype="DOUBLE"/>
+				<res id="FreshratioStorageOrgan" description="ratio between fresh and dry matter" unit="" datatype="DOUBLE"/>
+				<res id="FreshratioStraw" description="ratio between fresh and dry matter" unit="" datatype="DOUBLE"/>
+				<res id="YieldAdjustRatio" description="ratio used to identify CCM, SM, KM" unit="" datatype="DOUBLE"/>
+				<res id="HarvestLeaves" description="if leaves have to be added to the yield (for SM)" unit="" datatype="BOOLEAN"/>
+				<res id="HarvestStems" description="if stems have to be added to the yield (for SM)" unit="" datatype="BOOLEAN"/>
+			</header>
+		</resource>
+		<resource id="carbon" interface="carbonfile" frequence="ONCE" dbcache="FALSE">
+			<header>
+				<res id="soiltype" datatype="CHAR" key="vSoiltype"/>
+				<res id="depth" datatype="DOUBLEARRAY"/>
+				<res id="Lignfct" unit="" datatype="DOUBLE"/>
+				<res id="Brabove" unit="" datatype="DOUBLE"/>
+				<res id="Fmicrolab" unit="" datatype="DOUBLE"/>
+				<res id="Li" unit="" datatype="DOUBLE"/>
+				<res id="Ymin" datatype="DOUBLEARRAY"/>
+				<res id="Kdecomp1" unit="" datatype="DOUBLEARRAY"/>
+				<res id="Kdecomp2" unit="" datatype="DOUBLEARRAY"/>
+				<res id="Kdecomp3" unit="" datatype="DOUBLEARRAY"/>
+				<res id="Kdecomp4" unit="" datatype="DOUBLEARRAY"/>
+				<res id="Kdecomp5" unit="" datatype="DOUBLEARRAY"/>
+				<res id="Kdecomp6" unit="" datatype="DOUBLEARRAY"/>
+				<res id="Kdecomp10" unit="" datatype="DOUBLEARRAY"/>
+				<res id="Kdecomp11" unit="" datatype="DOUBLEARRAY"/>
+				<res id="Kdecomp12" unit="" datatype="DOUBLEARRAY"/>
+				<res id="Kdecomp13" unit="" datatype="DOUBLEARRAY"/>
+				<res id="Kdecomp14" unit="" datatype="DOUBLEARRAY"/>
+				<res id="Kdecomp15" unit="" datatype="DOUBLEARRAY"/>
+				<res id="MineralisationDepth" unit="" datatype="DOUBLE"/>
+			</header>
+		</resource>
+		<resource id="nitrogen" interface="nitrogenfile" frequence="ONCE" dbcache="FALSE">
+			<header>
+				<res id="soiltype" datatype="CHAR" key="vSoiltype"/>
+				<res id="depth" datatype="DOUBLEARRAY"/>
+				<res id="FracNH4Volat" unit="" datatype="DOUBLE"/>
+				<res id="Bactnc" unit="" datatype="DOUBLE"/>
+				<res id="Critinflow" unit="" datatype="DOUBLE"/>
+				<res id="Fungnc" unit="" datatype="DOUBLE"/>
+				<res id="Ligncmax" unit="" datatype="DOUBLE"/>
+				<res id="Ligncmin" unit="" datatype="DOUBLE"/>
+				<res id="Minncact" unit="" datatype="DOUBLE"/>
+				<res id="Ncsommicro" unit="" datatype="DOUBLE"/>
+				<res id="Ninorgcrit" unit="" datatype="DOUBLE"/>
+				<res id="Ratemicrobup" unit="" datatype="DOUBLEARRAY"/>
+				<res id="SOMStabilisationByTexture" unit="" datatype="DOUBLE"/>
+			</header>
+		</resource>
+
+
+		<resource id="soilcrop" interface="soilcropfile" frequence="ONCE" dbcache="FALSE">
+			<header>
+				<res id="depth" datatype="DOUBLEARRAY"/>
+				<res id="soiltype" datatype="CHAR" key="vSoiltype"/>
+				<res id="Celroot" unit="" datatype="DOUBLE"/>
+				<res id="Celshoot" unit="" datatype="DOUBLE"/>
+				<res id="Ligbranch" unit="" datatype="DOUBLE"/>
+				<res id="Ligroot" unit="" datatype="DOUBLE"/>
+				<res id="Ligshoot" unit="" datatype="DOUBLE"/>
+				<res id="Ligstem" unit="" datatype="DOUBLE"/>
+			</header>
+		</resource>
+
+		<resource id="aux" interface="auxfile" frequence="ONCE" dbcache="FALSE">
+			<header>
+				<res id="soiltype" datatype="CHAR" key="vSoiltype"/>
+				<res id="WaterEffectSwitch" datatype="CHAR"/>
+				<res id="TimeDiv" unit="" datatype="DOUBLE"/>
+			</header>
+		</resource>
+
+		<resource id="init" interface="initfile" frequence="ONCE" dbcache="FALSE">
+			<header>
+				<res id="soiltype" datatype="CHAR" key="vSoiltype"/>
+				<res id="depth" datatype="DOUBLEARRAY"/>
+				<res id="CellosesoilC" unit="" datatype="DOUBLEARRAY"/>
+				<res id="CellosesoilN" unit="" datatype="DOUBLEARRAY"/>
+				<res id="LigncellosesoilC" unit="" datatype="DOUBLEARRAY"/>
+				<res id="LigncellosesoilN" unit="" datatype="DOUBLEARRAY"/>
+				<res id="RootsoilC" unit="" datatype="DOUBLEARRAY"/>
+				<res id="RootsoilN" unit="" datatype="DOUBLEARRAY"/>
+				<res id="MetabsoilC" unit="" datatype="DOUBLEARRAY"/>
+				<res id="MetabsoilN" unit="" datatype="DOUBLEARRAY"/>
+				<res id="CelloseSurfC" unit="" datatype="DOUBLE"/>
+				<res id="CellosesurfN" unit="" datatype="DOUBLE"/>
+				<res id="LigncellosesurfC" unit="" datatype="DOUBLE"/>
+				<res id="LigncellosesurfN" unit="" datatype="DOUBLE"/>
+				<res id="BranchsurfC" unit="" datatype="DOUBLE"/>
+				<res id="BranchsurfN" unit="" datatype="DOUBLE"/>
+				<res id="StemsurfC" unit="" datatype="DOUBLE"/>
+				<res id="StemsurfN" unit="" datatype="DOUBLE"/>
+				<res id="MetabsurfC" unit="" datatype="DOUBLE"/>
+				<res id="MetabsurfN" unit="" datatype="DOUBLE"/>
+				<res id="microLabCN" unit="" datatype="DOUBLE"/>
+				<res id="microLabFrac" unit="" datatype="DOUBLE"/>
+				<res id="microRstCN" unit="" datatype="DOUBLE"/>
+				<res id="microRstFrac" unit="" datatype="DOUBLE"/>
+				<res id="OldSOMCN" unit="" datatype="DOUBLE"/>
+				<res id="YoungSOMCN" unit="" datatype="DOUBLE"/>
+			</header>
+		</resource>
+
+		<resource id="initp" interface="initpfile" frequence="ONCE">
+			<header>
+				<res id="soiltype" datatype="CHAR" key="vSoiltype"/>
+				<res id="depth" unit="http://www.wurvoc.org/vocabularies/om-1.8/metre" datatype="DOUBLEARRAY"/>
+				<res id="CellosesurfP" unit="http://www.wurvoc.org/vocabularies/om-1.8/kilogram_per_hectare" datatype="DOUBLE"/>
+				<res id="LigncellosesurfP" unit="http://www.wurvoc.org/vocabularies/om-1.8/kilogram_per_hectare" datatype="DOUBLE"/>
+				<res id="BranchsurfP" unit="http://www.wurvoc.org/vocabularies/om-1.8/kilogram_per_hectare" datatype="DOUBLE"/>
+				<res id="StemsurfP" unit="http://www.wurvoc.org/vocabularies/om-1.8/kilogram_per_hectare" datatype="DOUBLE"/>
+				<res id="MetabsurfP" unit="http://www.wurvoc.org/vocabularies/om-1.8/kilogram_per_hectare" datatype="DOUBLE"/>
+				<res id="CellosesoilP" unit="http://www.wurvoc.org/vocabularies/om-1.8/kilogram_per_hectare" datatype="DOUBLEARRAY"/>
+				<res id="LigncellosesoilP" unit="http://www.wurvoc.org/vocabularies/om-1.8/kilogram_per_hectare" datatype="DOUBLEARRAY"/>
+				<res id="RootsoilP" unit="http://www.wurvoc.org/vocabularies/om-1.8/kilogram_per_hectare" datatype="DOUBLEARRAY"/>
+				<res id="MetabsoilP" unit="" datatype="DOUBLEARRAY"/>
+				<res id="OldSOMCP" unit="" datatype="DOUBLE"/>
+				<res id="YoungSOMCP" unit="" datatype="DOUBLE"/>
+			</header>
+		</resource>
+
+		<resource id="phosphorus" interface="phosphorusfile" frequence="ONCE">
+			<header>
+				<res id="soiltype" datatype="CHAR" key="vSoiltype"/>
+				<res id="depth" unit="http://www.wurvoc.org/vocabularies/om-1.8/metre" datatype="DOUBLEARRAY"/>
+				<res id="Bactpc" unit="" datatype="DOUBLE"/>
+				<res id="CritinflowP" unit="" datatype="DOUBLE"/>
+				<res id="Fungpc" unit="http://www.wurvoc.org/vocabularies/om-1.8/gram_per_gram" datatype="DOUBLE"/>
+				<res id="Ligpcmax" unit="" datatype="DOUBLE"/>
+				<res id="Ligpcmin" unit="" datatype="DOUBLE"/>
+				<res id="Minpcact" unit="" datatype="DOUBLE"/>
+				<res id="Pcsommicro" unit="" datatype="DOUBLE"/>
+				<res id="Pinorgcrit" unit="http://www.wurvoc.org/vocabularies/om-1.8/kilogram_per_hectare" datatype="DOUBLE"/>
+				<res id="RatemicrobupP" unit="http://www.wurvoc.org/vocabularies/om-1.8/reciprocal_day" datatype="DOUBLEARRAY"/>
+			</header>
+		</resource>
+
+		<!-- #################################################################################################### -->
+		<transform id="weather_transform" frequence="DAILY" class="net.simplace.sim.transformers.DefaultSQLStatementTransformer">
+			<header>
+				<res id="CURRENTDATE" datatype="DATE" key="CURRENT.DATE"/>
+				<res id="seconds" datatype="INTARRAY"/>
+				<res id="RainAndIrr" unit="mm" datatype="DOUBLEARRAY"/>
+				<res id="SradiationMJ" unit="MJ*m**-2" datatype="DOUBLE"/>
+				<res id="e_s" unit="kPa" datatype="DOUBLE"/>
+				<res id="e_a" unit="kPa" datatype="DOUBLE"/>
+				<res id="AirTemperatureMean" unit="°C" datatype="DOUBLE"/>
+				<res id="AirTemperatureMax" unit="°C" datatype="DOUBLE"/>
+				<res id="AirTemperatureMin" unit="°C" datatype="DOUBLE"/>
+			</header>
+			<input id="statement">SELECT
+				CURRENTDATE,
+				86400 AS seconds,
+				Rain AS
+				RainAndIrr,
+				Irradiation/1000 as SradiationMJ,
+				(0.6108*EXP(17.27*AirTemperatureMax/(AirTemperatureMax+237.3)) +
+				0.6108*EXP(17.27*(AirTemperatureMin)/(AirTemperatureMin+237.3)))*0.5
+				AS e_s,
+				0.6108*EXP(17.27*AirTemperatureMin/(AirTemperatureMin+237.3)) AS
+				e_a,
+				(AirTemperatureMin+AirTemperatureMax)* 0.5 AS
+				AirTemperatureMean,
+				AirTemperatureMax,
+				AirTemperatureMin
+				FROM weather</input>
+		</transform>
+		<transform id="soil_transform" resource="soil" frequence="ONCE" class="net.simplace.sim.transformers.SoilLayerTransformer">
+			<header>
+				<res id="location" datatype="INT" key="vLocationID"/>
+				<res id="soiltype" datatype="CHAR"/>
+				<res id="dampingdepth" unit="m" datatype="DOUBLE"/>
+				<res id="soilwater_fc_global" unit="cm3*cm-3" datatype="DOUBLE"/>
+				<res id="soilwater_sat_global" unit="cm3*cm-3" datatype="DOUBLE"/>
+				<res id="drainage_rate" unit="mm" datatype="DOUBLE"/>
+				<res id="deltatheta" unit="-" datatype="DOUBLE"/>
+				<res id="DZF" unit="m" datatype="DOUBLE"/>
+				<res id="depth" datatype="DOUBLEARRAY"/>
+				<res id="soilwater_fc" unit="cm3*cm-3" datatype="DOUBLEARRAY"/>
+				<res id="soilwater_red" unit="cm3*cm-3" datatype="DOUBLEARRAY"/>
+				<res id="soilwater_wp" unit="cm3*cm-3" datatype="DOUBLEARRAY"/>
+				<res id="soilwater_sat" unit="cm3*cm-3" datatype="DOUBLEARRAY"/>
+				<res id="soilwater_init" unit="cm3*cm-3" datatype="DOUBLEARRAY"/>
+				<res id="bulkdensity" unit="g*cm-3" datatype="DOUBLEARRAY"/>
+				<res id="clay" unit="g/100g" datatype="DOUBLEARRAY"/>
+				<res id="carbon" unit="g/100g" datatype="DOUBLEARRAY"/>
+				<res id="ammonium" unit="mg/kg" datatype="DOUBLEARRAY"/>
+				<res id="nitrate" unit="mg/kg" datatype="DOUBLEARRAY"/>
+				<res id="sand" unit="g/100g" datatype="DOUBLEARRAY"/>
+				<res id="soilwater_res" unit="cm3*cm-3" datatype="DOUBLEARRAY"/>
+				<res id="macroporevolume" unit="-" datatype="DOUBLEARRAY"/>
+				
+				<!-- for SlimP: -->
+
+				<res id="SoilLayerDepth" datatype="DOUBLEARRAY" unit="http://www.wurvoc.org/vocabularies/om-1.8/metre" description="Clay content per layer"/>
+				<res id="CaCO3" datatype="DOUBLEARRAY" unit="http://www.wurvoc.org/vocabularies/om-1.8/percent" description="CaCO3 concentration per layer"/>
+				<res id="PH" datatype="DOUBLEARRAY" unit="http://www.wurvoc.org/vocabularies/om-1.8/one" description="pH value of soil per layer"/>
+				<res id="BSA" datatype="DOUBLEARRAY" unit="http://www.wurvoc.org/vocabularies/om-1.8/percent" description="Base saturation by the ammonium acetate method"/>
+				<res id="LowerBoundaryPConcentration" datatype="DOUBLE" unit="http://www.wurvoc.org/vocabularies/om-1.8/gram_per_litre" description="P concentration in the lower boundary of the soil profile"/>
+				<res id="RootMaxPUptakeRate" datatype="DOUBLE" unit="http://www.wurvoc.org/vocabularies/om-1.8/gram_per_metre" description="Maximum uptake rate per one metre root"/>
+				<res id="InitialDissolvedPConcentration" datatype="DOUBLEARRAY" unit="http://www.wurvoc.org/vocabularies/om-1.8/parts_per_million" description="Initial dissolved P per layer"/>
+				<res id="InitialAdsorbedPConcentration" datatype="DOUBLEARRAY" unit="http://www.wurvoc.org/vocabularies/om-1.8/parts_per_million" description="Initial adsorbed P per layer"/>
+				<res id="InitialFixedPConcentration" datatype="DOUBLEARRAY" unit="http://www.wurvoc.org/vocabularies/om-1.8/parts_per_million" description="Initial fixed P per layer"/>
+				<res id="slimalfa" unit="-" datatype="DOUBLEARRAY"/>
+			</header>
+			<input id="layercount"/>
+			<input id="layerthickness">0.05</input>
+			<!-- spatial discretization of soil -->
+			<input id="depthfieldid">depth</input>
+		</transform>
+		<transform id="carbon_transform" resource="carbon" frequence="ONCE" class="net.simplace.sim.transformers.SoilLayerTransformer">
+			<header>
+				<res id="soiltype" datatype="CHAR" key="vSoiltype"/>
+				<res id="depth" datatype="DOUBLEARRAY"/>
+				<res id="Lignfct" unit="" datatype="DOUBLE"/>
+				<res id="Brabove" unit="" datatype="DOUBLE"/>
+				<res id="Fmicrolab" unit="" datatype="DOUBLE"/>
+				<res id="Li" unit="" datatype="DOUBLE"/>
+				<res id="Ymin" datatype="DOUBLEARRAY"/>
+				<res id="Kdecomp1" unit="" datatype="DOUBLEARRAY"/>
+				<res id="Kdecomp2" unit="" datatype="DOUBLEARRAY"/>
+				<res id="Kdecomp3" unit="" datatype="DOUBLEARRAY"/>
+				<res id="Kdecomp4" unit="" datatype="DOUBLEARRAY"/>
+				<res id="Kdecomp5" unit="" datatype="DOUBLEARRAY"/>
+				<res id="Kdecomp6" unit="" datatype="DOUBLEARRAY"/>
+				<res id="Kdecomp10" unit="" datatype="DOUBLEARRAY"/>
+				<res id="Kdecomp11" unit="" datatype="DOUBLEARRAY"/>
+				<res id="Kdecomp12" unit="" datatype="DOUBLEARRAY"/>
+				<res id="Kdecomp13" unit="" datatype="DOUBLEARRAY"/>
+				<res id="Kdecomp14" unit="" datatype="DOUBLEARRAY"/>
+				<res id="Kdecomp15" unit="" datatype="DOUBLEARRAY"/>
+				<res id="MineralisationDepth" unit="" datatype="DOUBLE"/>
+			</header>
+			<input id="layercount"/>
+			<input id="layerthickness">0.05</input>
+			<input id="depthfieldid">depth</input>
+		</transform>
+		<transform id="nitrogen_transform" resource="nitrogen" frequence="ONCE" class="net.simplace.sim.transformers.SoilLayerTransformer">
+			<header>
+				<res id="soiltype" datatype="CHAR" key="vSoiltype"/>
+				<res id="depth" datatype="DOUBLEARRAY"/>
+				<res id="FracNH4Volat" unit="" datatype="DOUBLE"/>
+				<res id="Bactnc" unit="" datatype="DOUBLE"/>
+				<res id="Critinflow" unit="" datatype="DOUBLE"/>
+				<res id="Fungnc" unit="" datatype="DOUBLE"/>
+				<res id="Ligncmax" unit="" datatype="DOUBLE"/>
+				<res id="Ligncmin" unit="" datatype="DOUBLE"/>
+				<res id="Minncact" unit="" datatype="DOUBLE"/>
+				<res id="Ncsommicro" unit="" datatype="DOUBLE"/>
+				<res id="Ninorgcrit" unit="" datatype="DOUBLE"/>
+				<res id="Ratemicrobup" unit="" datatype="DOUBLEARRAY"/>
+				<res id="SOMStabilisationByTexture" unit="" datatype="DOUBLE"/>
+			</header>
+			<input id="layercount"/>
+			<input id="layerthickness">0.05</input>
+			<input id="depthfieldid">depth</input>
+		</transform>
+		<transform id="soilcrop_transform" resource="soilcrop" frequence="ONCE" class="net.simplace.sim.transformers.SoilLayerTransformer">
+			<header>
+				<res id="depth" datatype="DOUBLEARRAY"/>
+				<res id="soiltype" datatype="CHAR" key="vSoiltype"/>
+				<res id="Celroot" unit="" datatype="DOUBLE"/>
+				<res id="Celshoot" unit="" datatype="DOUBLE"/>
+				<res id="Ligbranch" unit="" datatype="DOUBLE"/>
+				<res id="Ligroot" unit="" datatype="DOUBLE"/>
+				<res id="Ligshoot" unit="" datatype="DOUBLE"/>
+				<res id="Ligstem" unit="" datatype="DOUBLE"/>
+			</header>
+			<input id="layercount"/>
+			<input id="layerthickness">0.05</input>
+			<input id="depthfieldid">depth</input>
+		</transform>
+		<transform id="init_transform" resource="init" frequence="ONCE" class="net.simplace.sim.transformers.SoilLayerTransformer">
+			<header>
+				<res id="soiltype" datatype="CHAR" key="vSoiltype"/>
+				<res id="depth" datatype="DOUBLEARRAY"/>
+				<res id="CellosesoilC" unit="" datatype="DOUBLEARRAY"/>
+				<res id="CellosesoilN" unit="" datatype="DOUBLEARRAY"/>
+				<res id="LigncellosesoilC" unit="" datatype="DOUBLEARRAY"/>
+				<res id="LigncellosesoilN" unit="" datatype="DOUBLEARRAY"/>
+				<res id="RootsoilC" unit="" datatype="DOUBLEARRAY"/>
+				<res id="RootsoilN" unit="" datatype="DOUBLEARRAY"/>
+				<res id="MetabsoilC" unit="" datatype="DOUBLEARRAY"/>
+				<res id="MetabsoilN" unit="" datatype="DOUBLEARRAY"/>
+				<res id="CelloseSurfC" unit="" datatype="DOUBLE"/>
+				<res id="CellosesurfN" unit="" datatype="DOUBLE"/>
+				<res id="LigncellosesurfC" unit="" datatype="DOUBLE"/>
+				<res id="LigncellosesurfN" unit="" datatype="DOUBLE"/>
+				<res id="BranchsurfC" unit="" datatype="DOUBLE"/>
+				<res id="BranchsurfN" unit="" datatype="DOUBLE"/>
+				<res id="StemsurfC" unit="" datatype="DOUBLE"/>
+				<res id="StemsurfN" unit="" datatype="DOUBLE"/>
+				<res id="MetabsurfC" unit="" datatype="DOUBLE"/>
+				<res id="MetabsurfN" unit="" datatype="DOUBLE"/>
+				<res id="microLabCN" unit="" datatype="DOUBLE"/>
+				<res id="microLabFrac" unit="" datatype="DOUBLE"/>
+				<res id="microRstCN" unit="" datatype="DOUBLE"/>
+				<res id="microRstFrac" unit="" datatype="DOUBLE"/>
+				<res id="OldSOMCN" unit="" datatype="DOUBLE"/>
+				<res id="YoungSOMCN" unit="" datatype="DOUBLE"/>
+			</header>
+			<input id="layercount"/>
+			<input id="layerthickness">0.05</input>
+			<input id="depthfieldid">depth</input>
+		</transform>
+
+		<transform id="initp_transform" resource="initp" frequence="ONCE" class="net.simplace.sim.transformers.SoilLayerTransformer">
+			<header>
+				<res id="soiltype" datatype="CHAR" key="vSoiltype"/>
+				<res id="depth" unit="http://www.wurvoc.org/vocabularies/om-1.8/metre" datatype="DOUBLEARRAY"/>
+				<res id="CellosesurfP" unit="http://www.wurvoc.org/vocabularies/om-1.8/kilogram_per_hectare" datatype="DOUBLE"/>
+				<res id="LigncellosesurfP" unit="http://www.wurvoc.org/vocabularies/om-1.8/kilogram_per_hectare" datatype="DOUBLE"/>
+				<res id="BranchsurfP" unit="http://www.wurvoc.org/vocabularies/om-1.8/kilogram_per_hectare" datatype="DOUBLE"/>
+				<res id="StemsurfP" unit="http://www.wurvoc.org/vocabularies/om-1.8/kilogram_per_hectare" datatype="DOUBLE"/>
+				<res id="MetabsurfP" unit="http://www.wurvoc.org/vocabularies/om-1.8/kilogram_per_hectare" datatype="DOUBLE"/>
+				<res id="CellosesoilP" unit="http://www.wurvoc.org/vocabularies/om-1.8/kilogram_per_hectare" datatype="DOUBLEARRAY"/>
+				<res id="LigncellosesoilP" unit="http://www.wurvoc.org/vocabularies/om-1.8/kilogram_per_hectare" datatype="DOUBLEARRAY"/>
+				<res id="RootsoilP" unit="http://www.wurvoc.org/vocabularies/om-1.8/kilogram_per_hectare" datatype="DOUBLEARRAY"/>
+				<res id="MetabsoilP" unit="" datatype="DOUBLEARRAY"/>
+				<res id="OldSOMCP" unit="" datatype="DOUBLE"/>
+				<res id="YoungSOMCP" unit="" datatype="DOUBLE"/>
+			</header>
+			<input id="layercount"/>
+			<input id="layerthickness">0.05</input>
+			<input id="depthfieldid">depth</input>
+		</transform>
+
+		<transform id="phosphorus_transform" resource="phosphorus" frequence="ONCE" class="net.simplace.sim.transformers.SoilLayerTransformer">
+			<header>
+				<res id="soiltype" datatype="CHAR" key="vSoiltype"/>
+				<res id="depth" datatype="DOUBLEARRAY"/>
+				<res id="Bactpc" unit="http://www.wurvoc.org/vocabularies/om-1.8/gram_per_gram" datatype="DOUBLE"/>
+				<res id="CritinflowP" unit="http://www.wurvoc.org/vocabularies/om-1.8/gram_per_gram" datatype="DOUBLE"/>
+				<res id="Fungpc" unit="" datatype="DOUBLE"/>
+				<res id="Ligpcmax" unit="http://www.wurvoc.org/vocabularies/om-1.8/gram_per_gram" datatype="DOUBLE"/>
+				<res id="Ligpcmin" unit="http://www.wurvoc.org/vocabularies/om-1.8/gram_per_gram" datatype="DOUBLE"/>
+				<res id="Minpcact" unit="" datatype="DOUBLE"/>
+				<res id="Pcsommicro" unit="http://www.wurvoc.org/vocabularies/om-1.8/gram_per_gram" datatype="DOUBLE"/>
+				<res id="Pinorgcrit" unit="" datatype="DOUBLE"/>
+				<res id="RatemicrobupP" unit="" datatype="DOUBLEARRAY"/>
+			</header>
+			<input id="layercount"/>
+			<input id="layerthickness">0.05</input>
+			<input id="depthfieldid">depth</input>
+		</transform>
+
+		<transform id="at" frequence="DAILY" resource="location" class="net.simplace.sim.transformers.AstronomicParametersTransformer">
+			<header>
+				<res id="DOY" datatype="INT" key="CURRENT.DOY"/>
+				<!-- <res id="ExperimentID" datatype="CHAR" key="vLocation" /> -->
+				<res id="location" datatype="INT" key="vLocationID"/>
+				<res id="DayLength" datatype="DOUBLE"/>
+				<res id="PhotoperiodicDayLength" datatype="DOUBLE"/>
+				<res id="SolarConstant" datatype="DOUBLE"/>
+				<res id="SINLD" datatype="DOUBLE"/>
+				<res id="COSLD" datatype="DOUBLE"/>
+				<res id="DSINB" datatype="DOUBLE"/>
+				<res id="DSINBE" datatype="DOUBLE"/>
+			</header>
+			<input id="SunInclinationField">SunInclination</input>
+			<input id="LatitudeField">Latitude</input>
+			<input id="IdField">location</input>
+		</transform>
+	</resources>
+
+
+	<!-- #################################################################################################### -->
+	<!-- ##################################### SIMCOMPONENTS ######################################### -->
+	<!-- #################################################################################################### -->
+
+
+	<simmodel>
+		<!-- to estimate ET Hargreaves -->
+		<simcomponent id="RadiationTemperature" class="net.simplace.sim.components.radiation.fao56.SolarRadiationFromTemperature">
+			<!-- <input id="cLatitude" source="vLatitude" /> -->
+			<input id="cLatitude" source="location.Latitude"/>
+			<input id="iTMax" source="weather.AirTemperatureMax"/>
+			<input id="iTMin" source="weather.AirTemperatureMin"/>
+		</simcomponent>
+
+
+		<!-- #################################################################################################### -->
+		<!-- crop management -->
+		<simcomponent id="DefaultManagement" class="net.simplace.sim.components.DefaultManagement">
+<!-- 			<action rule="${CURRENT.DATE} eq ${phenology.sowingdate}"> -->
+		<!--	<action rule="${CURRENT.DOY} eq ${phenology.sowing}">-->
+
+			<action rule="${SowingRule.DoSow}">
+				<mgm id="DoSow" datatype="BOOLEAN" default="false" rule="true"/>
+				 <mgm id="Crop" datatype="CHAR" unit="-" rule="${vCultivarGroup}" />
+			</action>
+			<!--<action rule="${spinupreset}">-->
+				<!--<mgm id="EventNr" datatype="INT" mode="RESET" default="1"/>-->
+			<!--</action>-->
+			<!--<action rule="${phenology.residues} gt 0">-->
+				<!--<mgm id="ResiduesDeadLeaves" datatype="DOUBLE" default="0" rule="${Biomass.rDLV}"/> --> <!-- DLV: decrease in leaf mass by senescence -->
+			<!--</action>-->
+			  <action rule="${Phenology.sDVS}&gt;0 &amp;&amp; ${Phenology.sDVS}&lt;2.0">
+       			 <mgm id="WithCrop" datatype="BOOLEAN" default="false" rule="true" />
+      		</action>
+			<action rule="${HarvestManagement.DoHarvest}">
+				 <mgm id="DayAfterHarvest" datatype="BOOLEAN" default="false" rule="true"/> 
+				<mgm id="EventNr" datatype="INT" mode="RESET" default="1"/>  <!--1-->
+			 </action>
+<!-- 			<action rule="${CURRENT.DOY} == ${management2.DOY}"> -->
+<!-- 				<mgm id="FertilizerAmount" datatype="DOUBLE" default="0" rule="${management2.Amount}"/> -->
+<!-- 				<mgm id="EventNr" datatype="INT" mode="SUM" default="1" rule="1"/> -->
+<!-- 			</action> -->
+			<action rule="${Phenology.sDVS} gt ${management2.DVS}">
+				<mgm id="FertilizerAmount" datatype="DOUBLE" default="0" rule="${management2.Amount}" />
+				<mgm id="EventNr" datatype="INT" mode="SUM" default="1" rule="1" />
+			</action>
+<!-- 			<action rule="(${CURRENT.DOY} == ${management2.DOY}) or ${HarvestManagement.DoHarvest}"> -->
+<!-- 				<mgm id="DoUpdateFertilizerSettings" datatype="BOOLEAN" default="false" rule="true"/> -->
+<!-- 			</action> -->
+			<action rule="${Phenology.sDVS} gt ${management2.DVS} or ${HarvestManagement.DoHarvest}">
+				<mgm id="DoUpdateFertilizerSettings" datatype="BOOLEAN" default="false" rule="true" />
+			</action>
+
+			<!--action rule="
+ 			   ( ${Phenology.sDVS} ge 2 or  
+			     (${Phenology.sDVS} gt 0.1 and ${phenology.maxharvest} eq ${CURRENT.DOY})
+			   )  
+ 			   and (${Phenology.CropCycleCount} == 5)">
+				<mgm id="DoInitialize" datatype="BOOLEAN" default="false" rule="true"/>
+			</!action-->
+
+		<!-- 		<action rule="${CURRENT.DOY} == 290"> -->
+			<!-- 		<mgm id="StartOutput" datatype="BOOLEAN" default="false" rule="true"/> -->
+			<!-- 	</action> -->
+		<!-- 		<action rule="${CURRENT.DOY} == 300"> -->
+			<!-- 		<mgm id="EndOutput" datatype="BOOLEAN" default="false" rule="true"/> -->
+			<!-- 	</action> -->
+		
+			<!-- <action rule="${Phenology.IsMaturity}"> 
+ 				<mgm id="DoInitialize" datatype="BOOLEAN" default="false" rule="true"/> 
+		</action>  -->
+		</simcomponent>
+		<!-- #################################################################################################### -->
+
+		<!-- ============================ RULE-BASED SOWING ============================
+		     Ported from the EU SUSTAg v2 solution, with only the input names remapped
+		     to this solution's: weather.AirTemperatureMin / weather.Rain instead of
+		     weather.tmin / weather.rain, and DefaultManagement.WithCrop instead of
+		     CropManagement.WithCrop. Placement matches the source solution: the three
+		     components sit after DefaultManagement, so its DoSow action reads the
+		     previous day's SowingRule.DoSow, the same one-day latch the source has.
+		     A variable that reads its own value returns the previous day's value,
+		     which is how the daily buffers and the season latch are built.
+		     ============================================================================ -->
+		<simcomponent id="SowingWindowDates" class="net.simplace.sim.components.FWSimpleSimComponent">
+			<description title="The cell's planting window, resolved once per day">Resolves the two day-of-year thresholds the sowing rules are evaluated between. The schedule's own vSowWindowStartDOY / vSowWindowEndDOY win, because they are the calendar product's published window for this cell; where the schedule carries none -- an export written without the site stage, or a cell with no NPKGRIDS rate, which is omitted from the schedule entirely -- the project file's vSowWindowStartDOY and vSowWindowLengthDays are used instead. Evaluated before SowingRule, so both are today's values.</description>
+			<process>
+				<var id="WindowStart" datatype="INT" rule="if(check:isNull(${sowwindow.vSowWindowStartDOY})) { ${vSowWindowStartDOY} } else { ${sowwindow.vSowWindowStartDOY} }"/>
+				<var id="WindowEnd" datatype="INT" rule="if(check:isNull(${sowwindow.vSowWindowEndDOY})) { ${vSowWindowStartDOY} + ${vSowWindowLengthDays} } else { ${sowwindow.vSowWindowEndDOY} }"/>
+			</process>
+		</simcomponent>
+
+		<simcomponent id="SowingWindowClimate" class="net.simplace.sim.components.FWSimpleSimComponent">
+			<description title="Rolling climate window for rule-based sowing">Short daily buffers of minimum temperature and rainfall shift back one day each step; from them the 7-day mean minimum temperature, the 3-day accumulated rainfall and the volumetric soil moisture of the top 5 cm layer are derived.</description>
+			<process>
+				<!-- minimum temperature buffer: Tmin0 = today, Tmin1..Tmin5 = 1..5 days ago -->
+				<var id="Tmin0" datatype="DOUBLE" rule="${weather.AirTemperatureMin}"/>
+				<var id="Tmin1" datatype="DOUBLE" rule="${SowingWindowClimate.Tmin0}"/>
+				<var id="Tmin2" datatype="DOUBLE" rule="${SowingWindowClimate.Tmin1}"/>
+				<var id="Tmin3" datatype="DOUBLE" rule="${SowingWindowClimate.Tmin2}"/>
+				<var id="Tmin4" datatype="DOUBLE" rule="${SowingWindowClimate.Tmin3}"/>
+				<var id="Tmin5" datatype="DOUBLE" rule="${SowingWindowClimate.Tmin4}"/>
+				<!-- 7-day mean minimum temperature (today plus the six buffered days) -->
+				<var id="Avg7Tmin" datatype="DOUBLE" rule="if(check:isNull(${SowingWindowClimate.Tmin5})) { ${weather.AirTemperatureMin} } else { (${weather.AirTemperatureMin} + ${SowingWindowClimate.Tmin0} + ${SowingWindowClimate.Tmin1} + ${SowingWindowClimate.Tmin2} + ${SowingWindowClimate.Tmin3} + ${SowingWindowClimate.Tmin4} + ${SowingWindowClimate.Tmin5}) / 7.0 }"/>
+				<!-- rainfall buffer: Rain0 = today, Rain1 = yesterday -->
+				<var id="Rain0" datatype="DOUBLE" rule="${weather.Rain}"/>
+				<var id="Rain1" datatype="DOUBLE" rule="${SowingWindowClimate.Rain0}"/>
+				<!-- 3-day accumulated rainfall (today plus the two buffered days) -->
+				<var id="Rain3Sum" datatype="DOUBLE" rule="if(check:isNull(${SowingWindowClimate.Rain1})) { ${weather.Rain} } else { ${weather.Rain} + ${SowingWindowClimate.Rain0} + ${SowingWindowClimate.Rain1} }"/>
+				<!-- volumetric soil moisture, wilting point and field capacity of the top 5 cm soil layer (index 0) -->
+				<var id="MoistTop5" datatype="DOUBLE" rule="if(check:isNull(${SlimWater.TotalVolumetricWaterContentPerLayer})) { null } else { ${SlimWater.TotalVolumetricWaterContentPerLayer}[0] }"/>
+				<var id="WP5" datatype="DOUBLE" rule="${soil_transform.soilwater_wp}[0]"/>
+				<var id="FC5" datatype="DOUBLE" rule="${soil_transform.soilwater_fc}[0]"/>
+			</process>
+		</simcomponent>
+
+		<simcomponent id="SowingRule" class="net.simplace.sim.components.FWSimpleSimComponent">
+			<description title="Rule-based sowing trigger">Sets DoSow on the first day inside the planting window [vSowWindowStartDOY .. vSowWindowStartDOY+vSowWindowLengthDays] on which any rule is met: 7-day mean minimum temperature le vSowTmin7Max, OR 3-day accumulated rainfall ge vSowRain3Sum, OR top-5cm volumetric moisture ge wilting point + vSowMoistFracAW*(FC-WP). Sowing never happens while a crop is already in the field. If no rule has fired by the last window day, sowing is forced on that day so no season is lost. HasSown latches after sowing and is released when the next window opens, so at most one sowing per window. vSowWindowStartDOY is supplied per grid cell by the project file.</description>
+			<process>
+				<var id="HasSown" datatype="BOOLEAN" rule="if(${CURRENT.DOY} == ${SowingWindowDates.WindowStart}) { false } else { if(${SowingRule.DoSow} or ${SowingRule.HasSown}) { true } else { false } }"/>
+				<!-- RuleMet = true when at least one weather rule holds today (used to flag forced vs rule-driven sowing) -->
+				<var id="RuleMet" datatype="BOOLEAN" rule="${SowingWindowClimate.Avg7Tmin} le ${vSowTmin7Max} or ${SowingWindowClimate.Rain3Sum} ge ${vSowRain3Sum} or ( not check:isNull(${SowingWindowClimate.MoistTop5}) and ${SowingWindowClimate.MoistTop5} ge (${SowingWindowClimate.WP5} + ${vSowMoistFracAW} * (${SowingWindowClimate.FC5} - ${SowingWindowClimate.WP5})) )"/>
+				<var id="DoSow" datatype="BOOLEAN" rule="if( ${CURRENT.DOY} ge ${SowingWindowDates.WindowStart} and ${CURRENT.DOY} le ${SowingWindowDates.WindowEnd} and not (${SowingRule.HasSown} or ${SowingRule.DoSow}) and not ${DefaultManagement.WithCrop} and ( ${SowingWindowClimate.Avg7Tmin} le ${vSowTmin7Max} or ${SowingWindowClimate.Rain3Sum} ge ${vSowRain3Sum} or ( not check:isNull(${SowingWindowClimate.MoistTop5}) and ${SowingWindowClimate.MoistTop5} ge (${SowingWindowClimate.WP5} + ${vSowMoistFracAW} * (${SowingWindowClimate.FC5} - ${SowingWindowClimate.WP5})) ) or (${vSowForceAtWindowEnd} == 1 and ${CURRENT.DOY} == ${SowingWindowDates.WindowEnd}) ) ) { true } else { false }"/>
+				<!-- Per-season flag (1/0): was the sowing forced by the deadline (no rule met) rather than rule-driven? Reset when the window opens. -->
+				<var id="SeasonSowForced" datatype="INT" rule="if(${CURRENT.DOY} == ${SowingWindowDates.WindowStart}) { 0 } else { if(${SowingRule.DoSow} and not ${SowingRule.RuleMet}) { 1 } else { if(check:isNull(${SowingRule.SeasonSowForced})) { 0 } else { ${SowingRule.SeasonSowForced} } } }"/>
+			</process>
+		</simcomponent>
+
+		<simcomponent id="SowingDate" class="net.simplace.sim.components.FWSimpleSimComponent">
+			<description title="Realized sowing day of year">Latches the day of year on which sowing actually occurred (DefaultManagement.DoSow), so phenology and the yearly output use the realized sowing date. Defaults to vSowWindowStartDOY before the first sowing.</description>
+			<process>
+				<var id="SowingDOY" datatype="INT" rule="if(${DefaultManagement.DoSow}) { ${CURRENT.DOY} } else { if(check:isNull(${SowingDate.SowingDOY})) { ${SowingWindowDates.WindowStart} } else { ${SowingDate.SowingDOY} } }"/>
+			</process>
+		</simcomponent>
+		<!-- ========================== END RULE-BASED SOWING ========================== -->
+
+
+		<simcomponent id="Radiation" class="net.simplace.sim.components.FWSimpleSimComponent">
+			<description title="Get the solar ratiation from Temperature if missing value in weather data">10.</description>
+			<process>
+				<var id="SolarRadiationMJ" datatype="DOUBLE" rule="if(${weather.Irradiation} lt -99) ${RadiationTemperature.SolarRadiation} else ${weather_transform.SradiationMJ}"/>
+				<var id="SolarRadiationJ" datatype="DOUBLE" rule="${Radiation.SolarRadiationMJ} * 1000000"/>
+			</process>
+		</simcomponent>
+
+		<!-- #################################################################################################### -->
+		<simcomponent id="SimpleFertilizer" class="net.simplace.sim.components.management.Fertilizer">
+			<input id="iAmount" source="DefaultManagement.FertilizerAmount"/>
+			<input id="cNitrate" source="fertilizerparameters.Nitrate"/>
+			<input id="cAmmonium" source="fertilizerparameters.Ammonium"/>
+			<input id="cPotassium" source="fertilizerparameters.Potassium"/>
+			<input id="cPhosphorus" source="fertilizerparameters.Phosphorus"/>
+			<input id="cOrganicP" source="fertilizerparameters.OrganicP"/>
+			<input id="cOrganicN" source="fertilizerparameters.OrganicN"/>
+			<input id="cOrganicC" source="fertilizerparameters.OrganicC"/>
+			<input id="cNitrateAndAmmonium" source="fertilizerparameters.NitrateAndAmmonium"/>
+		</simcomponent>
+		<!-- #################################################################################################### -->
+		<simcomponent id="Phenology" class="net.simplace.sim.components.models.lintul5.Phenology">
+			<input id="cPL">true</input>
+<!-- 			<input id="cIDPL" source="phenology.sowing"/> -->
+			<input id="cIDPL" source="SowingDate.SowingDOY" />
+			<input id="cIDSL" source="crop.IDSL"/>
+			<input id="cTSUMEM" source="crop.TSUMEM"/>
+			<input id="cTSUM1" source="crop.TSUM1"/>
+			<input id="cTSUM2" source="crop.TSUM2"/>
+			<input id="cTBASEM" source="crop.TBASEM"/>
+			<input id="cTEFFMX" source="crop.TEFFMX"/>
+		
+			<input id="cPhotoperiodTableHour" source="crop.PhotoperiodTableHour"/>
+			<input id="cPhotoperiodTableFactor" source="crop.PhotoperiodTableFactor"/>
+			
+<!-- 			<input id="cDTSMTB" source="crop.DTSMTB"/> -->
+			
+			<input id="cTsumIncrementTableMeanTemp" source="crop.TsumIncrementTableMeanTemp"/>
+			<input id="cTsumIncrementTableRate" source="crop.TsumIncrementTableRate"/>
+			
+			<input id="cDVSI" source="crop.DVSI"/>
+			<input id="iDDLP" source="at.PhotoperiodicDayLength"/>
+			<input id="iTMIN" source="weather.AirTemperatureMin"/>
+			<input id="iTMAX" source="weather.AirTemperatureMax"/>
+			<input id="iDoSow" source="DefaultManagement.DoSow"/>
+			<input id="iDoHarvest" source="HarvestManagement.DoHarvest"/>
+			<!-- <input id="iDoInitialize" source="DefaultManagement.DoInitialize" /> -->
+			<input id="iDoInitialize" source="DefaultManagement.DoSow" /> 
+<!-- 		<input id="iDoInitialize" source="HarvestManagement.DoInitialize" />  -->
+		</simcomponent>
+		<!-- #################################################################################################### -->
+		<simcomponent id="Irradiation" class="net.simplace.sim.components.models.lintul5.Irradiation">
+			<input id="iDAYL" source="at.DayLength"/>
+			<input id="iSINLD" source="at.SINLD"/>
+			<input id="iCOSLD" source="at.COSLD"/>
+			<input id="iDTR" source="Radiation.SolarRadiationJ"/>
+		</simcomponent>
+		<!-- #################################################################################################### -->
+		<simcomponent id="RadiationUseEfficiency" class="net.simplace.sim.components.models.lintul5.RadiationUseEfficiency">
+			<input id="cCO" source="vCO2"/>
+<!-- 			<input id="cCOTB" source="crop.COTB"/> -->
+<!-- 			<input id="cRUETB" source="crop.RUETB"/> -->
+<!-- 			<input id="cTMNFTB" source="crop.TMNFTB"/> -->
+<!-- 			<input id="cTMPFTB" source="crop.TMPFTB"/> -->
+			
+			<input id="cCOTableCo2" source="crop.COTableCo2"/>
+			<input id="cCOTableFactor" source="crop.COTableFactor"/>
+		
+			<input id="cRUETableDVS" source="crop.RUETableDVS"/>
+			<input id="cRUETableRUE" source="crop.RUETableRUE"/>
+			
+			<input id="cTMPFTableMeanTemperature" source="crop.TMPFTableMeanTemperature"/>
+			<input id="cTMPFTableFactor" source="crop.TMPFTableFactor"/>
+			
+			
+			<input id="cTMNFTableMinTemperature" source="crop.TMNFTableMinTemperature"/>
+			<input id="cTMNFTableFactor" source="crop.TMNFTableFactor"/>
+		
+			<input id="iDVS" source="Phenology.sDVS"/>
+			<input id="iTMAX" source="weather_transform.AirTemperatureMax"/>
+			<input id="iTMIN" source="weather_transform.AirTemperatureMin"/>
+		</simcomponent>
+		<!-- #################################################################################################### -->
+		<simcomponent id="ET0" class="net.simplace.sim.components.evapotran.fao56.ReferenceETHargreaves">
+			<input id="iSolarRadiation" source="Radiation.SolarRadiationMJ"/>
+			<input id="iTMax" source="weather.AirTemperatureMax"/>
+			<input id="iTMin" source="weather.AirTemperatureMin"/>
+		</simcomponent>
+		<!-- #################################################################################################### -->
+		<simcomponent id="PotentialEvapoTranspiration" class="net.simplace.sim.components.evapotran.fao56.CropEvapoTranspirationDualCoeff">
+			<input id="cCharacteristicMeanRelHumidity" source="vRHminCharacteristic"/>
+			<input id="cCharacteristicWindspeed" source="vu2Characteristic"/>
+			<input id="cCropHeight" source="crop.CropHt"/>
+			<input id="cKcMin" source="vKcMin"/>
+			<input id="cKcbIni" source="crop.KcbIni"/>
+			<input id="cKcbMid" source="crop.KcbMid"/>
+			<input id="cWettedSoilFraction" source="vWettedSoilFraction"/>
+			<input id="iK_r" source="vK_r"/>
+			<input id="iK_s" source="vK_s"/>
+			<input id="iDVS" source="Phenology.sDVS"/>
+			<input id="iDoHarvest" source="HarvestManagement.DoHarvest"/>
+			<input id="iDoSow" source="DefaultManagement.DoSow"/>
+			<input id="iLAI" source="Biomass.sLAI"/>
+			<input id="iReferenceCropEvapotranspiration" source="ET0.ReferenceCropEvapotranspiration"/>
+		</simcomponent>
+		<!-- #################################################################################################### -->
+		<simcomponent id="SeedsToSprouts" class="net.simplace.sim.components.crop.translocation.SeedsToSprouts">
+			<input id="cSeedWeight" source="seeds.SeedWeight"/>
+			<input id="cDailyFractionRoots" source="seeds.DailyFractionRoots"/>
+			<input id="cTotalFractionRoots" source="seeds.TotalFractionRoots"/>
+			<input id="cDailyFractionLeaves" source="seeds.DailyFractionLeaves"/>
+			<input id="cTotalFractionLeaves" source="seeds.TotalFractionLeaves"/>
+			<input id="iDoSow" source="DefaultManagement.DoSow"/>
+			<input id="iRWRT" source="Biomass.rRWRT"/>
+			<input id="iRWLV" source="Biomass.rRWLVG"/>
+			<input id="iDevelopmentStage" source="Phenology.sDVS"/>
+		</simcomponent>
+		<!-- #################################################################################################### -->
+		<simcomponent id="SlimRoots" class="net.simplace.sim.components.soil.slim.SlimRoots">
+			<input id="cSoilLayerDepth" source="soil_transform.depth"/>
+			<input id="cBulkDensity" source="soil_transform.bulkdensity"/>
+			<input id="cSEEDD" source="slim.SEEDD"/>
+			<input id="cMaximalSeminalRootLengthPerDay" source="crop.MaximalSeminalRootLengthPerDay"/>
+			<input id="cDeadRootsDevStage" source="slim.DeadRootsDevStage"/>
+			<input id="cDailyDeadRootsRate" source="slim.DailyDeadRootsRate"/>
+			<input id="cBulkDensityThresholdLower" source="slim.BulkDensityThresholdLower"/>
+			<input id="cBulkDensityThresholdMiddle" source="slim.BulkDensityThresholdMiddle"/>
+			<input id="cBulkDensityThresholdUpper" source="slim.BulkDensityThresholdUpper"/>
+			<input id="cMinimalBDSeminalRootReductionFactor" source="slim.MinimalBDSeminalRootReductionFactor"/>
+			<input id="cSoilStrengthParameter" source="slim.SoilStrengthParameter"/>
+			<input id="cSandPercentage" source="soil_transform.sand"/>
+			<input id="iSoilTemperature" source="STMPsimCalculator.SoilTempArray"/>
+			<input id="iDryFactor" source="SlimWater.DRYFAC"/>
+			<input id="iTMIN" source="weather.AirTemperatureMin"/>
+			<input id="iTMAX" source="weather.AirTemperatureMax"/>
+			<input id="iDevStage" source="Phenology.sDVS"/>
+			<input id="iRWRT" source="SeedsToSprouts.RWRT"/>
+			<input id="iIsHarvest" source="HarvestManagement.DoHarvest"/>
+			<input id="cMacroporeVolume" source="soil_transform.macroporevolume"/>
+			<input id="cMacroporeRootGrowthFactor" source="slim.MacroporeRootGrowthFactor"/>
+			<input id="cBiomassLossRateAtPartitioning" source="slim.BiomassLossRateAtPartitioning"/>
+			<input id="cMaximalRootDepth" source="crop.RDMCR" />
+		</simcomponent>
+		<!-- #################################################################################################### -->
+		<simcomponent id="SlimWater" class="net.simplace.sim.components.soil.slim.SlimWater">
+<!-- 			<input id="iDoInitialize" source="HarvestManagement.DoInitialize"/> -->
+			<input id="iDoInitialize" source="DefaultManagement.DoSow"/>
+			<input id="cALFA" source="soil_transform.slimalfa"/>
+			<input id="cCalculateRunoffWater" source="slim.CalculateRunoffWater"/>
+			<input id="cDP" source="slim.DP"/>
+			<input id="cELIM" source="slim.ELIM"/>
+			<input id="cIFWGEN" source="slim.IFWGEN"/>
+			<!-- <input id="cLatitude" source="vLatitude" /> -->
+			<input id="cLatitude" source="location.Latitude"/>
+
+			<input id="cMD" source="slim.MD"/>
+			<input id="cMT" source="slim.MT"/>
+			<input id="cMaxSoilEvaporationDepth" source="slim.MaxSoilEvaporationDepth"/>
+			<input id="cSEEDD" source="slim.SEEDD"/>
+			<input id="cSMD" source="slim.SMD"/>
+			<input id="cSoilLayerDepth" source="soil_transform.depth"/>
+			<input id="cSoilWaterFieldCapacity" source="soil_transform.soilwater_fc"/>
+			<input id="cSoilWaterInitial" source="soil_transform.soilwater_init"/>
+			<input id="cSoilWaterReducedThreshold" source="soil_transform.soilwater_red"/>
+			<input id="cSoilWaterSaturation" source="soil_transform.soilwater_sat"/>
+			<input id="cSoilWaterWiltingPoint" source="soil_transform.soilwater_wp"/>
+			<input id="cWALIQ" source="slim.WALIQ"/>
+			<input id="cWM1S" source="slim.WM1S"/>
+			<input id="cWMGENS" source="slim.WMGENS"/>
+			<input id="cWMGENT" source="slim.WMGENT"/>
+			<input id="cWRGENS" source="slim.WRGENS"/>
+			<input id="cWRGENT" source="slim.WRGENT"/>
+			<input id="cWRSS" source="slim.WRSS"/>
+			<input id="cWRST" source="slim.WRST"/>
+			<input id="iFRR" source="SlimRoots.RootRestrictionFactor"/>
+			<input id="iMD95" source="SlimRoots.MD95"/>
+			<input id="iPotentialTranspiration" source="PotentialEvapoTranspiration.PotentialTranspiration"/>
+			<input id="iRAIN" source="weather.Rain"/>
+			<input id="iReferenceCropEvapotranspiration" source="ET0.ReferenceCropEvapotranspiration"/>
+			<input id="iWithCrop" source="Phenology.WithCrop"/>
+		</simcomponent>
+		<!-- #################################################################################################### -->
+		<simcomponent id="LintulWaterStress" class="net.simplace.sim.components.models.lintul.LintulWaterStress">
+			<input id="iPotentialTranspiration" source="SlimWater.PotentialTranspiration"/>
+			<input id="iActualTranspiration" source="SlimWater.ActualTranspiration"/>
+		</simcomponent>
+		<!-- #################################################################################################### -->
+		<simcomponent id="NPKDemandSlimNP" class="net.simplace.sim.components.experimental.slim.NPKDemandSlimNP">
+<!-- 			<input id="iDoInitialize" source="HarvestManagement.DoInitialize"/> -->
+			<input id="iDoInitialize" source="DefaultManagement.DoSow"/>
+			<input id="cDVSI" source="crop.DVSI"/>
+			<input id="cTDWI" source="crop.TDWI"/>
+			
+<!-- 			<input id="cFRTB" source="crop.FRTB"/> -->
+			<input id="cRootsPartitioningTableDVS" source="crop.RootsPartitioningTableDVS"/>
+			<input id="cRootsPartitioningTableFraction" source="crop.RootsPartitioningTableFraction"/>
+			
+			
+<!-- 			<input id="cFLTB" source="crop.FLTB"/> -->
+			<input id="cLeavesPartitioningTableDVS" source="crop.LeavesPartitioningTableDVS"/>
+			<input id="cLeavesPartitioningTableFraction" source="crop.LeavesPartitioningTableFraction"/>
+			
+<!-- 			<input id="cFSTB" source="crop.FSTB"/> -->
+			<input id="cStemsPartitioningTableDVS" source="crop.StemsPartitioningTableDVS"/>
+			<input id="cStemsPartitioningTableFraction" source="crop.StemsPartitioningTableFraction"/>
+			
+			<input id="cDVSNLT" source="crop.DVSNLT"/>
+			<input id="cDVSNT" source="crop.DVSNT"/>
+			<input id="cFNTRT" source="crop.FNTRT"/>
+			<input id="cFRNX" source="crop.FRNX"/>
+			<input id="cFRPX" source="crop.FRPX"/>
+			<input id="cFRKX" source="crop.FRKX"/>
+			<input id="cLRNR" source="crop.LRNR"/>
+			<input id="cLSNR" source="crop.LSNR"/>
+			<input id="cLRPR" source="crop.LRPR"/>
+			<input id="cLSPR" source="crop.LSPR"/>
+			<input id="cLRKR" source="crop.LRKR"/>
+			<input id="cLSKR" source="crop.LSKR"/>
+			<input id="cNMAXSO" source="crop.NMAXSO"/>
+			<input id="cPMAXSO" source="crop.PMAXSO"/>
+			<input id="cKMAXSO" source="crop.KMAXSO"/>
+			<input id="cRNFLV" source="crop.RNFLV"/>
+			<input id="cRNFST" source="crop.RNFST"/>
+			<input id="cRNFRT" source="crop.RNFRT"/>
+			<input id="cRPFLV" source="crop.RPFLV"/>
+			<input id="cRPFST" source="crop.RPFST"/>
+			<input id="cRPFRT" source="crop.RPFRT"/>
+			<input id="cRKFLV" source="crop.RKFLV"/>
+			<input id="cRKFST" source="crop.RKFST"/>
+			<input id="cRKFRT" source="crop.RKFRT"/>
+			<input id="cTCNT" source="crop.TCNT"/>
+			<input id="cTCPT" source="crop.TCPT"/>
+			<input id="cTCKT" source="crop.TCKT"/>
+			<input id="cNFIXF" source="crop.NFIXF"/>
+			
+<!-- 			<input id="cNMXLV" source="crop.NMXLV"/> -->
+			
+			<input id="cNMaxTableDVS" source="crop.NMaxTableDVS"/>
+			<input id="cNMaxTableConcentration" source="crop.NMaxTableConcentration"/>
+			
+<!-- 			<input id="cPMXLV" source="crop.PMXLV"/> -->
+			
+			<input id="cPMaxTableDVS" source="crop.PMaxTableDVS"/>
+			<input id="cPMaxTableConcentration" source="crop.PMaxTableConcentration"/>
+			
+					
+<!-- 			<input id="cKMXLV" source="crop.KMXLV"/> -->
+
+			<input id="cKMaxTableDVS" source="crop.KMaxTableDVS"/>
+			<input id="cKMaxTableConcentration" source="crop.KMaxTableConcentration"/>
+			
+			
+			<input id="cIOPT" source="vIOPT"/>
+			<!--input id="iTRANRF" source="vTRANRF" / -->
+			<input id="iTRANRF" source="LintulWaterStress.TRANRF"/>
+			<input id="iDVS" source="Phenology.sDVS"/>
+			<input id="iEMERG" source="Phenology.EMERG"/>
+			<input id="iIDEMERG" source="Phenology.IDEMERG"/>
+			<input id="iWLVG" source="Biomass.sWLVG"/>
+			<input id="iWRT" source="Biomass.sWRT"/>
+			<input id="iWST" source="BiomassTranslocation.WST"/>
+			<input id="iWSO" source="BiomassTranslocation.WSO"/>
+			<input id="iDLV" source="Biomass.rDLV"/>
+			<input id="iDRRT" source="Biomass.rDRRT"/>
+			<input id="iDRST" source="Biomass.rDRST"/>
+			<input id="iDoSow" source="DefaultManagement.DoSow"/>
+			<input id="iDoHarvest" source="HarvestManagement.DoHarvest"/>
+			<input id="iKMINT" source="NPKSupply.sKMINT"/>
+			<input id="cSoilLayerDepth" source="soil_transform.depth"/>
+			<input id="cBulkDensity" source="soil_transform.bulkdensity"/>
+			<input id="cSoilWaterFieldCapacity" source="soil_transform.soilwater_fc"/>
+			<input id="cSoilWaterReducedThreshold" source="soil_transform.soilwater_red"/>
+			<input id="cSoilWaterWiltingPoint" source="soil_transform.soilwater_wp"/>
+			<input id="cSoilWaterSaturation" source="soil_transform.soilwater_sat"/>
+			<input id="cSoilWaterInitial" source="soil_transform.soilwater_init"/>
+			<input id="cSoilWaterResidual" source="soil_transform.soilwater_res"/>
+			<input id="cCNO3" source="soil_transform.nitrate"/>
+			<input id="cCNH4" source="soil_transform.ammonium"/>
+			<input id="cMT" source="slim.MT"/>
+			<input id="cSCONC" source="slim.SCONC"/>
+			<input id="cDP" source="slim.DP"/>
+			<input id="cSCMIN" source="slim.SCMIN"/>
+			<input id="cFLOWNR" source="slim.FLOWNR"/>
+			<input id="cAMR1" source="slim.AMR1"/>
+			<input id="cAMR2" source="slim.AMR2"/>
+			<input id="cTEMCO1" source="slim.TEMCO1"/>
+			<input id="cTEMCO2" source="slim.TEMCO2"/>
+			<input id="cAX" source="slim.AX"/>
+			<input id="cAREA" source="slim.AREA"/>
+			<input id="cBGEN" source="slim.BGEN"/>
+			<input id="cAMEQ" source="slim.AMEQ"/>
+			<input id="cWRST" source="slim.WRST"/>
+			<input id="cWRSS" source="slim.WRSS"/>
+			<input id="cSMD" source="slim.SMD"/>
+			<input id="cWMGENT" source="slim.WMGENT"/>
+			<input id="cWRGENT" source="slim.WRGENT"/>
+			<input id="cWMGENS" source="slim.WMGENS"/>
+			<input id="cWRGENS" source="slim.WRGENS"/>
+			<input id="cIFWGEN" source="slim.IFWGEN"/>
+			<input id="iSoilTemperature" source="STMPsimCalculator.SoilTempArray"/>
+			<input id="iRAIN" source="weather.Rain"/>
+			<input id="iActualTranspiration" source="SlimWater.ActualTranspiration"/>
+			<input id="iTotalWater" source="SlimWater.TotalWaterContentPerLayer"/>
+			<input id="iRetainedWater" source="SlimWater.sWR"/>
+			<input id="iMobileWater" source="SlimWater.sWM"/>
+			<input id="iLessMobileWater" source="SlimWater.sWLM"/>
+			<input id="iPercolatingWater" source="SlimWater.sW_out"/>
+			<input id="iDrynessFactor" source="SlimWater.DRYFAC"/>
+			<input id="iWFAST" source="SlimWater.WFAST"/>
+			<input id="iWHT15R" source="SlimWater.sWHT15R"/>
+			<input id="iRootLength" source="SlimRoots.TotalRootLengthPerLayer"/>
+			<input id="iMD95" source="SlimRoots.MD95"/>
+			<input id="iNinorg" source="SoilCNP.Ninorg"/>
+			<input id="iAmmoniumFertilisation" source="SimpleFertilizer.Ammonium"/>
+			<input id="iNitrateFertilisation" source="SimpleFertilizer.Nitrate"/>
+
+			<input id="cClay" source="soil_transform.clay"/>
+			<input id="cCaCO3" source="soil_transform.CaCO3"/>
+			<input id="cPH" source="soil_transform.PH"/>
+			<input id="cBSA" source="soil_transform.BSA"/>
+			<input id="cLowerBoundaryPConcentration" source="soil.LowerBoundaryPConcentration"/>
+			<input id="cRootMaxPUptakeRate" source="soil.RootMaxPUptakeRate"/>
+			<input id="cInitialDissolvedPConcentration" source="soil_transform.InitialDissolvedPConcentration"/>
+			<input id="cInitialAdsorbedPConcentration" source="soil_transform.InitialAdsorbedPConcentration"/>
+			<input id="cInitialFixedPConcentration" source="soil_transform.InitialFixedPConcentration"/>
+
+			<!-- to be checked -->
+			<input id="iPFertilizer" source="SimpleFertilizer.Phosphorus"/>
+			<input id="iMineralizedPRate" source="SoilCNP.PinorgSolRate"/> <!-- dissolved P; SoilCNP.PinorgSolRate -->
+		</simcomponent>
+
+
+		<simcomponent id="BiomassTranslocation" class="net.simplace.sim.components.crop.translocation.BiomassTranslocation">
+			<input id="cFRTDM" source="crop.FRTDM"/>
+			<input id="iIsAnthesis" source="Phenology.IsAnthesis"/>
+			<input id="iDevStage" source="Phenology.sDVS"/>
+			<input id="iWLVG" source="Biomass.sWLVG"/>
+			<input id="iWLVD" source="Biomass.sWLVD"/>
+			<input id="iWST" source="Biomass.sWST"/>
+			<input id="iWSO" source="Biomass.sWSO"/>
+		</simcomponent>
+
+
+		<!-- #################################################################################################### -->
+		<simcomponent id="NPKSupply" class="net.simplace.sim.components.models.lintul5.modular.NPKSupply">
+			<!-- nur noch für K. N und P über NPKDemand/SoilCNP -->
+			<input id="cKRF" source="management1.KRF"/>
+			<input id="cNRF" source="management1.NRF"/>
+			<input id="cPRF" source="management1.PRF"/>
+			<input id="cKMINI" source="management1.KMINS"/>
+			<input id="cNMINI" source="management1.NMINS"/>
+			<input id="cPMINI" source="management1.PMINS"/>
+			<input id="cRTKMINS" source="management1.RTKMINS"/>
+			<input id="cRTNMINS" source="management1.RTNMINS"/>
+			<input id="cRTPMINS" source="management1.RTPMINS"/>
+			<input id="iFERK" source="SimpleFertilizer.Potassium"/>
+			<input id="iFERN" source="SimpleFertilizer.NitrateAndAmmonium"/>
+			<input id="iFERP" source="SimpleFertilizer.Phosphorus"/>
+			<input id="iEMERG" source="Phenology.EMERG"/>
+			<input id="iDoSow" source="DefaultManagement.DoSow"/>
+			<input id="iDoHarvest" source="HarvestManagement.DoHarvest"/>
+			<input id="iKUPTR" source="NPKDemandSlimNP.rKUPTR"/>
+			<input id="iNUPTR" source="NPKDemandSlimNP.rNUPTR"/>
+			<input id="iPUPTR" source="NPKDemandSlimNP.rPUPTR"/>
+			<input id="iNLIMIT" source="NPKDemandSlimNP.NLIMIT"/>
+		</simcomponent>
+		<simcomponent id="CropResidues" class="net.simplace.sim.components.FWSimpleSimComponent">
+			<!-- The residue component should normally run before the biomass component. -->
+			<description title="Collect dead biomass and nutrients that go to soil">
+			</description>
+			<process>
+				<var id="DeadRootsNRatePerLayer" datatype="DOUBLEARRAY"
+					rule="
+				var dr = ${SlimRoots.DeadRootRatePerLayer};
+				var n = ${NPKDemandSlimNP.rRNLDRT};		
+				if((${Phenology.sDVS} ge 2) and not ${DefaultManagement.DayAfterHarvest}){n = n+ ${NPKDemandSlimNP.sANRT};}		
+				var drsum = array:sum(dr);
+				var f = 0.0;
+				if(drsum > 0){f = n/drsum};
+				return array:calc(dr,'*',f);				
+				"/>
+				<var id="DeadRootsPRatePerLayer" datatype="DOUBLEARRAY"
+					rule="
+				var dr = ${SlimRoots.DeadRootRatePerLayer};
+				var p = ${NPKDemandSlimNP.rRPLDRT};				
+				if((${Phenology.sDVS} ge 2) and not ${DefaultManagement.DayAfterHarvest}){p = p+ ${NPKDemandSlimNP.sAPRT};}		
+				var drsum = array:sum(dr);
+				var f = 0.0;
+				if(drsum > 0){f = p/drsum};
+				return array:calc(dr,'*',f);				
+				"/>
+			</process>
+		</simcomponent>
+		<!-- #################################################################################################### -->
+		<simcomponent id="Biomass" class="net.simplace.sim.components.models.lintul5.modular.Biomass">
+			<input id="cDVSI" source="crop.DVSI"/>
+			<input id="cTDWI" source="crop.TDWI"/>
+			<input id="cRGRLAI" source="crop.RGRLAI"/>
+			
+<!-- 			<input id="cSLATB" source="crop.SLATB"/> -->
+			
+			<input id="cSLATableDVS" source="crop.SLATableDVS"/>
+			<input id="cSLATableSLA" source="crop.SLATableSLA"/>
+			
+			<input id="cLAICR" source="crop.LAICR"/>
+			<input id="cTBASE" source="crop.TBASE"/>
+			
+<!-- 			<input id="cKDIFTB" source="crop.KDIFTB"/> -->
+			
+			<input id="cKDIFTableDVS" source="crop.KDIFTableDVS"/>
+			<input id="cKDIFTableK" source="crop.KDIFTableK"/>
+			
+<!-- 			<input id="cFRTB" source="crop.FRTB"/> -->
+			
+			<input id="cRootsPartitioningTableDVS" source="crop.RootsPartitioningTableDVS"/>
+			<input id="cRootsPartitioningTableFraction" source="crop.RootsPartitioningTableFraction"/>	
+			
+<!-- 			<input id="cFLTB" source="crop.FLTB"/> -->
+			
+			<input id="cLeavesPartitioningTableDVS" source="crop.LeavesPartitioningTableDVS"/>
+			<input id="cLeavesPartitioningTableFraction" source="crop.LeavesPartitioningTableFraction"/>
+			
+<!-- 			<input id="cFSTB" source="crop.FSTB"/> -->
+			
+			<input id="cStemsPartitioningTableDVS" source="crop.StemsPartitioningTableDVS"/>
+			<input id="cStemsPartitioningTableFraction" source="crop.StemsPartitioningTableFraction"/>
+			
+<!-- 			<input id="cFOTB" source="crop.FOTB"/> -->
+			
+			<input id="cStorageOrgansPartitioningTableDVS" source="crop.StorageOrgansPartitioningTableDVS"/>
+			<input id="cStorageOrgansPartitioningTableFraction" source="crop.StorageOrgansPartitioningTableFraction"/>
+			
+			
+			
+			<input id="cRDRL" source="crop.RDRL"/>
+			
+<!-- 			<input id="cRDRLTB" source="crop.RDRLTB"/> -->
+			
+			<input id="cRDRLeavesTableMeanTemp" source="crop.RDRLeavesTableMeanTemp"/>
+			<input id="cRDRLeavesTableRelativeRate" source="crop.RDRLeavesTableRelativeRate"/>
+			
+						
+			<input id="cRDRSHM" source="crop.RDRSHM"/>
+			
+				
+<!-- 			<input id="cRDRRTB" source="crop.RDRRTB"/> -->
+
+			<input id="cRDRRootsTableDVS" source="crop.RDRRootsTableDVS"/>
+			<input id="cRDRRootsTableRelativeRate" source="crop.RDRRootsTableRelativeRate"/>
+			
+			
+<!-- 			<input id="cRDRSTB" source="crop.RDRSTB"/> -->
+			
+			<input id="cRDRStemsTableDVS" source="crop.RDRStemsTableDVS"/>
+			<input id="cRDRStemsTableRelativeRate" source="crop.RDRStemsTableRelativeRate"/>
+			
+			
+			
+			<input id="cRDI" source="crop.RDI"/>
+			<input id="cRRI" source="crop.RRI"/>
+			<input id="cDVSDR" source="crop.DVSDR"/>
+			<input id="cDVSDLT" source="crop.DVSDLT"/>
+			<input id="cRDRNS" source="crop.RDRNS"/>
+			<input id="cNLAI" source="crop.NLAI"/>
+			<input id="cNLUE" source="crop.NLUE"/>
+			<input id="cNPART" source="crop.NPART"/>
+			<input id="cNSLA" source="crop.NSLA"/>
+			<input id="cRWRTI" source="vRWRTI"/>
+			<input id="iTMIN" source="weather_transform.AirTemperatureMin"/>
+			<input id="iTMAX" source="weather_transform.AirTemperatureMax"/>
+			<input id="iAVRAD" source="Irradiation.AVRAD"/>
+			<input id="iTRANRF" source="LintulWaterStress.TRANRF"/>
+			<input id="iRDM" source="crop.RDMCR"/>
+			<input id="iDVS" source="Phenology.sDVS"/>
+			<input id="iEMERG" source="Phenology.EMERG"/>
+			<input id="iIDEMERG" source="Phenology.IDEMERG"/>
+			<input id="iRUE" source="RadiationUseEfficiency.RUE"/>
+			<input id="iRTMCO" source="RadiationUseEfficiency.RTMCO"/>
+			<input id="iNNI" source="NPKDemandSlimNP.NNI"/>
+			<input id="iNPKI" source="NPKDemandSlimNP.NPKI"/>
+			<input id="iDoSow" source="DefaultManagement.DoSow"/>
+			<input id="iDoHarvest" source="HarvestManagement.DoHarvest"/>
+		</simcomponent>
+
+		<!-- #################################################################################################### -->
+		<simcomponent id="SoilCNP" class="net.simplace.sim.components.soil.soilcn.SoilCNP">
+<!-- 			<input id="iDoInitialize" source="HarvestManagement.DoInitialize"/> -->
+			<input id="iDoInitialize" source="DefaultManagement.DoSow"/>
+			<input id="cLignfct" source="carbon_transform.Lignfct"/>
+			<input id="cBrabove" source="carbon_transform.Brabove"/>
+			<input id="cFmicrolab" source="carbon_transform.Fmicrolab"/>
+			<input id="cLi" source="carbon_transform.Li"/>
+			<input id="cYmin" source="carbon_transform.Ymin"/>
+			<input id="cKdecomp1" source="carbon_transform.Kdecomp1"/>
+			<input id="cKdecomp2" source="carbon_transform.Kdecomp2"/>
+			<input id="cKdecomp3" source="carbon_transform.Kdecomp3"/>
+			<input id="cKdecomp4" source="carbon_transform.Kdecomp4"/>
+			<input id="cKdecomp5" source="carbon_transform.Kdecomp5"/>
+			<input id="cKdecomp6" source="carbon_transform.Kdecomp6"/>
+			<input id="cKdecomp10" source="carbon_transform.Kdecomp10"/>
+			<input id="cKdecomp11" source="carbon_transform.Kdecomp11"/>
+			<input id="cKdecomp12" source="carbon_transform.Kdecomp12"/>
+			<input id="cKdecomp13" source="carbon_transform.Kdecomp13"/>
+			<input id="cMineralisationDepth" source="carbon_transform.MineralisationDepth"/>
+			<input id="cFracNH4Volat" source="nitrogen.FracNH4Volat"/>
+			<input id="cBactnc" source="nitrogen.Bactnc"/>
+			<input id="cCritinflow" source="nitrogen.Critinflow"/>
+			<input id="cFungnc" source="nitrogen.Fungnc"/>
+			<input id="cLigncmax" source="nitrogen.Ligncmax"/>
+			<input id="cLigncmin" source="nitrogen.Ligncmin"/>
+			<input id="cMinncact" source="nitrogen.Minncact"/>
+			<input id="cNcsommicro" source="nitrogen.Ncsommicro"/>
+			<input id="cNinorgcrit" source="nitrogen.Ninorgcrit"/>
+			<input id="cRatemicrobup" source="nitrogen_transform.Ratemicrobup"/>
+			<input id="cSOMStabilisationByTexture" source="nitrogen_transform.SOMStabilisationByTexture"/>  <!-- parameter S in Corbeels et al (2005), sensitive to long-term C and N losses -->
+			<input id="cBactpc" source="phosphorus.Bactpc"/>
+			<input id="cCritinflowP" source="phosphorus.CritinflowP"/>
+			<input id="cLigpcmax" source="phosphorus.Ligpcmax"/>
+			<input id="cLigpcmin" source="phosphorus.Ligpcmin"/>
+			<input id="cMinpcact" source="phosphorus.Minpcact"/>
+			<input id="cPcsommicro" source="phosphorus.Pcsommicro"/>
+			<input id="cPinorgcrit" source="phosphorus.Pinorgcrit"/>
+			<input id="cRatemicrobupP" source="phosphorus_transform.RatemicrobupP"/>
+			<input id="cArea">1.0</input>
+			<input id="cWatactype">1</input>  <!-- 1 (1: stronger effect of drought on decomposition rate than 2) or 2 ; 2 => the Paul formalism is choosen (Paul et al, 2000) -->
+			<input id="cWaterEffectSwitch">Off</input>
+			<input id="cBotDepth" source="soil_transform.depth"/>
+			<input id="cSoilFieldCapacity" source="soil_transform.soilwater_fc"/>
+			<input id="cSoilWiltingPoint" source="soil_transform.soilwater_wp"/>
+			<input id="cBulkDensity" source="soil_transform.bulkdensity"/>
+			<input id="cClay" source="soil_transform.clay"/>
+			<input id="cOrganicCarbon" source="soil_transform.carbon"/>    <!-- ????? -->
+			<input id="cAmmonia" source="soil_transform.ammonium"/>
+			<input id="cNitrate" source="soil_transform.nitrate"/>
+			<input id="cSand" source="soil_transform.sand"/>
+			<input id="cCelroot" source="soilcrop.Celroot"/>
+			<input id="cCelshoot" source="soilcrop.Celshoot"/>
+			<input id="cLigbranch" source="soilcrop.Ligbranch"/>
+			<input id="cLigroot" source="soilcrop.Ligroot"/>
+			<input id="cLigshoot" source="soilcrop.Ligshoot"/>
+			<input id="cLigstem" source="soilcrop.Ligstem"/>
+			<input id="cCellosesoilC" source="init_transform.CellosesoilC"/>
+			<input id="cCellosesoilN" source="init_transform.CellosesoilN"/>
+			<input id="cLigncellosesoilC" source="init_transform.LigncellosesoilC"/>
+			<input id="cLigncellosesoilN" source="init_transform.LigncellosesoilN"/>
+			<input id="cRootsoilC" source="init_transform.RootsoilC"/>
+			<input id="cRootsoilN" source="init_transform.RootsoilN"/>
+			<input id="cMetabsoilC" source="init_transform.MetabsoilC"/>
+			<input id="cMetabsoilN" source="init_transform.MetabsoilN"/>
+			<input id="cCelloseSurfC" source="init_transform.CelloseSurfC"/>
+			<input id="cCellosesurfN" source="init_transform.CellosesurfN"/>
+			<input id="cLigncellosesurfC" source="init_transform.LigncellosesurfC"/>
+			<input id="cLigncellosesurfN" source="init_transform.LigncellosesurfN"/>
+			<input id="cBranchsurfC" source="init_transform.BranchsurfC"/>
+			<input id="cBranchsurfN" source="init_transform.BranchsurfN"/>
+			<input id="cStemsurfC" source="init_transform.StemsurfC"/>
+			<input id="cStemsurfN" source="init_transform.StemsurfN"/>
+			<input id="cMetabsurfC" source="init_transform.MetabsurfC"/>
+			<input id="cMetabsurfN" source="init_transform.MetabsurfN"/>
+			<input id="cmicroLabCN" source="init_transform.microLabCN"/>
+			<input id="cmicroLabFrac" source="init_transform.microLabFrac"/>
+			<input id="cmicroRstCN" source="init_transform.microRstCN"/>
+			<input id="cmicroRstFrac" source="init_transform.microRstFrac"/>
+			<input id="cOldSOMCN" source="init_transform.OldSOMCN"/>
+			<input id="cYoungSOMCN" source="init_transform.YoungSOMCN"/>
+			<input id="cCellosesoilP" source="initp_transform.CellosesoilP"/>
+			<input id="cLigncellosesoilP" source="initp_transform.LigncellosesoilP"/>
+			<input id="cRootsoilP" source="initp_transform.RootsoilP"/>
+			<input id="cMetabsoilP" source="initp_transform.MetabsoilP"/>
+			<input id="cCellosesurfP" source="initp_transform.CellosesurfP"/>
+			<input id="cLigncellosesurfP" source="initp_transform.LigncellosesurfP"/>
+			<input id="cBranchsurfP" source="initp_transform.BranchsurfP"/>
+			<input id="cStemsurfP" source="initp_transform.StemsurfP"/>
+			<input id="cMetabsurfP" source="initp_transform.MetabsurfP"/>
+			<input id="cOldSOMCP" source="initp_transform.OldSOMCP"/>
+			<input id="cYoungSOMCP" source="initp_transform.YoungSOMCP"/>
+			<input id="cInitialPNRatio" source="vInitialPNRatio"/>
+			<input id="iSoilTemp" source="STMPsimCalculator.SoilTempArray"/>
+			<input id="iSoilWC" source="SlimWater.TotalVolumetricWaterContentPerLayer"/>
+			<input id="iNinorg" source="NPKDemandSlimNP.Ninorg"/>
+			<input id="iDeadRoots" source="SlimRoots.DeadRootRatePerLayer"/>
+			<input id="iDeadRootsN" source="CropResidues.DeadRootsNRatePerLayer"/>
+			<input id="iDeadRootsP" source="CropResidues.DeadRootsPRatePerLayer"/>
+			<input id="iDeadLeaves" source="Biomass.rDLV"/>
+			<input id="iDeadLeavesN" source="NPKDemandSlimNP.rRNLDLV"/>
+			<input id="iDeadLeavesP" source="NPKDemandSlimNP.rRPLDLV"/>
+			<input id="iDeadStems" source="Biomass.rDRST"/>
+			<input id="iDeadStemsN" source="NPKDemandSlimNP.rRNLDST"/>
+			<input id="iDeadStemsP" source="NPKDemandSlimNP.rRPLDST"/>
+			<input id="iFertilizerOrganicC" source="SimpleFertilizer.OrganicC"/>
+			<input id="iFertilizerOrganicN" source="SimpleFertilizer.OrganicN"/>
+			<input id="iFertilizerOrganicP" source="SimpleFertilizer.OrganicP"/>
+			<input id="iNinorg" source="NPKDemandSlimNP.Ninorg"/>
+			<input id="iPinorgSol" source="NPKDemandSlimNP.sDissolvedP"/>   <!-- dissolved inorg P from SlimP -->
+		</simcomponent>
+
+		<!-- #################################################################################################### -->
+		<simcomponent id="SnowCoverCalculator" class="net.simplace.sim.components.soil.temperature.SnowCoverCalculator">
+			<input id="cCarbonContent" source="vCarbonContent"/>
+			<input id="iTempMax" source="weather.AirTemperatureMax"/>
+			<input id="iTempMin" source="weather.AirTemperatureMin"/>
+			<input id="iRadiation" source="Radiation.SolarRadiationMJ"/>
+			<input id="iRAIN" source="weather.Rain"/>
+			<input id="iCropResidues" source="Biomass.sTAGB"/>
+			<input id="iPotentialSoilEvaporation" source="SlimWater.PotentialSoilEvaporation"/>
+			<input id="iLeafAreaIndex" source="Biomass.sLAI"/>
+			<input id="iSoilTempArray" source="STMPsimCalculator.SoilTempArray"/>
+		</simcomponent>
+		<!-- #################################################################################################### -->
+		<simcomponent id="STMPsimCalculator" class="net.simplace.sim.components.soil.temperature.STMPsimCalculator">
+			<input id="cSoilLayerDepth" source="soil_transform.depth"/>
+			<input id="cFirstDayMeanTemp" source="vFirstDayMeanTemp"/>
+			<input id="cAVT" source="vAverageGroundTemperature"/>
+			<input id="cABD" source="vAverageBulkDensity"/>
+			<input id="cDampingDepth" source="soil_transform.dampingdepth"/>
+			<input id="iSoilSurfaceTemperature" source="SnowCoverCalculator.SoilSurfaceTemperature"/>
+			<input id="iSoilWaterContent" source="SlimWater.TotalWaterContent"/>
+		</simcomponent>
+
+
+		<!-- #################################################################################################### -->
+
+<!-- 		<simcomponent id="HarvestManagement" class="net.simplace.sim.components.DefaultManagement">  -->
+<!-- 			<action rule="${HarvestManagement.DoHarvest}"> -->
+<!-- 				<mgm id="DayAfterHarvest" datatype="BOOLEAN" default="false" rule="true"/> -->
+<!-- 			</action> -->
+<!-- 			<action rule="(${HarvestManagement.DayAfterHarvest} and ${Phenology.CropCycleCount} lt 6) or ${HarvestManagement.DoInitialize}"> -->
+<!-- 				<mgm id="DoUpdatePhenology" datatype="BOOLEAN" default="false" rule="true"/> -->
+<!-- 			</action> -->
+<!-- 			<action rule="${HarvestManagement.DayAfterHarvest} and ${Phenology.CropCycleCount} == 6"> -->
+<!-- 				<mgm id="DoInitialize" datatype="BOOLEAN" default="false" rule="true"/> -->
+<!-- 			</action> -->
+<!-- 			<action rule="(${Phenology.sDVS} ge 2 or (${Phenology.sDVS} gt 0.1 and ${phenology.maxharvest} eq ${CURRENT.DOY})) and not ${DefaultManagement.DayAfterHarvest}">  -->
+<!--  				<mgm id="DoHarvest" datatype="BOOLEAN" default="false" rule="true"/> -->
+<!-- 				<mgm id="Crop" datatype="CHAR"/>  -->
+<!-- 			</action>  -->
+			
+			 <simcomponent id="HarvestManagement" class="net.simplace.sim.components.DefaultManagement">
+      <action rule="${Phenology.sDVS}&gt;=2.0">
+        <mgm id="DoHarvest" datatype="BOOLEAN" default="false" unit="-" rule="true" />
+      </action>
+	</simcomponent>
+	<simcomponent id="CountCropYear" class="net.simplace.sim.components.util.SimpleCounter">
+      <input id="cIncrement">1</input>
+      <input id="cStartValue">0</input>
+      <input id="iDoCount" source="DefaultManagement.WithCrop" />
+      <input id="iReset" source="DefaultManagement.DoSow" />
+    </simcomponent>
+  </simmodel>
+
+
+
+	<!-- #################################################################################################### -->
+	<!-- ################################ OUTPUTS ########################################## -->
+	<!-- #################################################################################################### -->
+	<outputs>
+
+		<!-- DAILY OUTPUT -->
+			
+		<output id="Daily_crop_growth" interface="crop_growth" frequence="DAILY" cachesize="10">
+			<header>
+				<out id="Location" rule="vLocationID" datatype="INT" unit="-"/>
+				<out id="Year" rule="CURRENT.YEAR" description="current model year" datatype="INT" unit="-"/>
+				<out id="DOY" rule="CURRENT.DOY" description="current model day of year" datatype="INT" unit="-"/>
+				<out id="DATE" rule="CURRENT.DATE" description="current model date" datatype="DATE" unit="-"/>
+				<out id="NUTSID" rule="vNUTSID" description="current model date" datatype="CHAR" unit="-"/>
+				<out id="STATE_ID" rule="vSTATE_ID" description="current model date" datatype="CHAR" unit="-"/>
+				<out id="DevStage" rule="Phenology.sDVS" description="development stage of crop (from 0 to 2)" datatype="DOUBLE" unit="http://www.wurvoc.org/vocabularies/om-1.8/one" format="%.6f"/>
+				<out id="LAI" rule="Biomass.sLAI" description="leaf area index  (leaf area per soil surface)" datatype="DOUBLE" format="%.6f"/>
+				<out id="DoSow" rule="DefaultManagement.DoSow" datatype="BOOLEAN" unit="-" />
+				<out id="NumberOfResets" rule="CountCropYear.NumberOfResets" datatype="INT" unit="-" />
+			</header>
+		</output>
+		
+		<output id="LintulYearly" interface="lintul5yearly" frequence="BOOLEAN" rule="HarvestManagement.DoHarvest" cachesize="10">
+			<header>
+				<out id="Year" rule="CURRENT.YEAR" description="current model year" datatype="INT" unit="-"/>
+				<out id="DOY" rule="CURRENT.DOY" description="current model day of year" datatype="INT" unit="-"/>
+				<out id="DATE" rule="CURRENT.DATE" description="current model date" datatype="DATE" unit="-"/>
+				<out id="DoSow" rule="DefaultManagement.DoSow" datatype="BOOLEAN" unit="-" /> 
+				<out id="DevStage" rule="Phenology.sDVS" description="development stage of crop (from 0 to 2)" datatype="DOUBLE" unit="http://www.wurvoc.org/vocabularies/om-1.8/one" format="%.6f"/>
+				<out id="PlantingDOY" rule="SowingDate.SowingDOY" datatype="INT" unit="-" />
+				<!-- The window the date was chosen inside. Written because it has two
+				     possible sources (the schedule, else the project file) and a
+				     sowing date cannot be read without knowing which applied. -->
+				<out id="SowWindowStart" rule="SowingWindowDates.WindowStart" datatype="INT" unit="-" />
+				<out id="SowWindowEnd" rule="SowingWindowDates.WindowEnd" datatype="INT" unit="-" />
+				<!-- 1 where the deadline forced the sowing because no rule fired, so a
+				     date that is really the window's last day stays identifiable. -->
+				<out id="ForcedSow" rule="SowingRule.SeasonSowForced" datatype="INT" unit="-" />
+				<out id="EmergenceDATE" rule="Phenology.EmergenceDate" datatype="DATE" unit="-"/>
+				<out id="EmergenceDOY" rule="Phenology.EmergenceDOY" datatype="INT" unit="-"/>
+				<out id="AnthesisDate" datatype="DATE" rule="Phenology.AnthesisDate"/>
+				<out id="AnthesisDOY" datatype="INT" rule="Phenology.AnthesisDOY"/>
+				<out id="MilkripenessDate" rule="Phenology.MilkripenessDate" description="current model date of year" datatype="DATE" unit="-"/>
+				<out id="MilkripenessDOY" rule="Phenology.MilkripenessDOY" description="current model date of year" datatype="INT" unit="-"/>
+				<out id="MaturityDate" rule="Phenology.MaturityDate" description="current model date of year" datatype="DATE" unit="-"/>
+				<out id="MaturityDOY" rule="Phenology.MaturityDOY" description="current model date of year" datatype="INT" unit="-"/>
+				<out id="HarvestDATE" rule="CURRENT.DATE" description="current model date of year" datatype="DATE" unit="-"/>
+				<out id="FertilizeAmount" mode="SUM" datatype="DOUBLE" rule="DefaultManagement.FertilizerAmount" format="%.6f"/>
+				<out id="FertilizeAmount_Nitrogen" mode="SUM" datatype="DOUBLE" rule="SimpleFertilizer.NitrateAndAmmonium" format="%.6f"/>
+				<out id="Yield_t_ha" rule="(${Biomass.sWSO})*0.01" mode="MAX" description="weight of storage organs" datatype="DOUBLE" unit="http://www.wurvoc.org/vocabularies/om-1.8/gram_per_square_metre" format="%.6f"/>
+				<out id="Yield_translocated_t_ha" rule="(${BiomassTranslocation.WSO})*0.01" mode="MAX" description="weight of storage organs" datatype="DOUBLE" unit="http://www.wurvoc.org/vocabularies/om-1.8/gram_per_square_metre" format="%.6f"/>
+				<out id="AGBiomass_t_ha" rule="(${Biomass.sTAGB})*0.01" mode="MAX" description="total above-ground living biomass" datatype="DOUBLE" format="%.6f"
+					unit="http://www.wurvoc.org/vocabularies/om-1.8/gram_per_square_metre"/>
+				<out id="maxLAI" rule="Biomass.sLAI" mode="MAX" description="leaf area index  (leaf area per soil surface)" datatype="DOUBLE" format="%.6f"
+					unit="http://www.wurvoc.org/vocabularies/om-1.8/square_metre_per_square_metre"/>
+				<out id="maxSeminal_RootDepth" rule="SlimRoots.sSeminalRootDepth" mode="MAX" description="actual rooting depth" datatype="DOUBLE" unit="http://www.wurvoc.org/vocabularies/om-1.8/metre" format="%.6f"/>
+				<out id="maxRootDepth" datatype="DOUBLE" mode="MAX" rule="SlimRoots.cMaximalRootDepth" format="%.6f"/>
+				<out id="Rain" datatype="DOUBLE" mode="SUM" rule="weather.Rain" format="%.6f"/>
+				<out id="Radiation" datatype="DOUBLE" mode="SUM" rule="weather_transform.SradiationMJ" format="%.6f"/> 
+				<out id="Tmax" datatype="DOUBLE" mode="AVG" rule="weather.AirTemperatureMax" format="%.6f"/>
+				<out id="Tmin" datatype="DOUBLE" mode="AVG" rule="weather.AirTemperatureMin" format="%.6f"/>
+				<out id="TRANRF" rule="LintulWaterStress.TRANRF" mode="AVG" description="Transpiration reduction factor" datatype="DOUBLE" unit="http://www.wurvoc.org/vocabularies/om-1.8/one" format="%.6f"/>
+				<out id="NNI" datatype="DOUBLE" mode="AVG" rule="NPKDemandSlimNP.NNI" format="%.6f"/>
+				<out id="PNI" datatype="DOUBLE" mode="AVG" rule="NPKDemandSlimNP.PNI" format="%.6f"/>
+				<out id="KNI" datatype="DOUBLE" mode="AVG" rule="NPKDemandSlimNP.KNI" format="%.6f"/>
+				<out id="NPKI" datatype="DOUBLE" mode="AVG" rule="NPKDemandSlimNP.NPKI" format="%.6f"/>
+				
+				<!-- soil nutrients and uptake -->
+				<out id="NUptake_SlimN" datatype="DOUBLE" mode="MAX" rule="NPKDemandSlimNP.NUptake"/>
+				<out id="cropNuptake_kg_ha" mode="MAX" description="total N uptake by crop from soil" datatype="DOUBLE" rule="(${NPKDemandSlimNP.sNUPTT})*10" format="%.6f"/>
+				<out id="cropNuptake_kg_ha_sum" mode="SUM" description="total N uptake by crop from soil" datatype="DOUBLE" rule="(${NPKDemandSlimNP.sNUPTT})*10" format="%.6f"/>
+				<out id="cropPuptake_kg_ha" mode="MAX" description="total P uptake by crop from soil" datatype="DOUBLE" rule="(${NPKDemandSlimNP.sPUPTT})*10" format="%.6f"/>
+				<out id="TotalUptakeP" datatype="DOUBLE" mode="MAX" rule="NPKDemandSlimNP.sTotalUptakeP" format="%.6f"/>
+				<out id="CumulatedFertilizerP" description="Cumulated fertilizer over time" datatype="DOUBLE" mode="MAX" rule="NPKDemandSlimNP.CumulatedFertilizerP" format="%.6f"/>
+				<out id="TotalCropAvailWaterContent_Sum" datatype="DOUBLE" mode="SUM" rule="SlimWater.TotalCropAvailWaterContent" format="%.6f"/>
+				<out id="TotalCropAvailWaterContent_Avg" datatype="DOUBLE" mode="AVG" rule="SlimWater.TotalCropAvailWaterContent" format="%.6f"/>
+				
+				<!-- fertilizer input -->
+				<out id="inputChemN_kg_ha" datatype="DOUBLE" mode="SUM" rule="(${SimpleFertilizer.NitrateAndAmmonium})*10" format="%.6f"/>
+				<out id="PLeaching" datatype="DOUBLE" mode="SUM" rule="NPKDemandSlimNP.rLeachedPRate" format="%.6f"/>
+				<out id="CumulatedSeepN" datatype="DOUBLE" mode="LAST" rule="NPKDemandSlimNP.CumulatedSeepN" format="%.6f"/>
+				<out id="NitrateLossSeepage" description="Nitrate loss at the lower boundary of the soil profile through percolation (g/m2)" datatype="DOUBLE" rule="NPKDemandSlimNP.NitrateLossSeepage" format="%.6f"/>
+				<out id="NitrateLossSeepage_SUM_kg_ha" description="Nitrate loss at the lower boundary of the soil profile through percolation (g/m2)" datatype="DOUBLE" mode="SUM" rule="(${NPKDemandSlimNP.NitrateLossSeepage})*10" format="%.6f"/>
+				<out id="CumulatedSeepN" description="Cumulated amount of nitrogen lost through leaching at the lower boundary of the soil profile (g/m2)" datatype="DOUBLE"
+					rule="NPKDemandSlimNP.CumulatedSeepN" format="%.6f"/>
+				<out id="CumulatedMineralizedP" datatype="DOUBLE" rule="NPKDemandSlimNP.CumulatedMineralizedP" format="%.6f"/>
+				<out id="WSEEP_SUM" datatype="DOUBLE" mode="SUM" rule="SlimWater.WSEEP" format="%.6f"/>		
+				<out id="WDRAIN_SUM" datatype="DOUBLE" mode="SUM" rule="SlimWater.WDRAIN" format="%.6f"/>		
+				<out id="ActualTranspiration" datatype="DOUBLE" mode="SUM" rule="SlimWater.ActualTranspiration" format="%.6f"/>
+				<out id="ActualEvapotranspiration" datatype="DOUBLE" mode="SUM" rule="SlimWater.ActualEvapotranspiration" format="%.6f"/>
+				<out id="PotentialEvapotranspiration" datatype="DOUBLE" mode="SUM" rule="SlimWater.PotentialEvapotranspiration" format="%.6f"/>
+				<out id="ReferenceEvapotranspiration" datatype="DOUBLE" mode="SUM" rule="ET0.ReferenceCropEvapotranspiration" format="%.6f"/>
+
+				<!-- Roots -->
+				<out id="RootLengthDensityPerLayer_30"  mode="LAST" datatype="DOUBLE" rule="array:avg(${SlimRoots.RootLengthDensityPerLayer},1,10)" />
+				<out id="RootLengthDensityPerLayer_30-45" mode="LAST"  datatype="DOUBLE" rule="array:avg(${SlimRoots.RootLengthDensityPerLayer},11,15)" />
+				<out id="RootLengthDensityPerLayer_45-75"  mode="LAST" datatype="DOUBLE" rule="array:avg(${SlimRoots.RootLengthDensityPerLayer},16,25)" />
+				<out id="RootLengthDensityPerLayer_75-105"  mode="LAST" datatype="DOUBLE" rule="array:avg(${SlimRoots.RootLengthDensityPerLayer},26,35)" />
+				<out id="RootLengthDensityPerLayer_105-135"  mode="LAST" datatype="DOUBLE" rule="array:avg(${SlimRoots.RootLengthDensityPerLayer},36,45)" />
+				<out id="RootLengthDensityPerLayer_135-165" mode="LAST" datatype="DOUBLE" rule="array:avg(${SlimRoots.RootLengthDensityPerLayer},46,55)" />
+				<out id="RootLengthDensityPerLayer_165-195"  mode="LAST" datatype="DOUBLE" rule="array:avg(${SlimRoots.RootLengthDensityPerLayer},56,65)" />
+				
+				<out id="sSeminalRootLength_30"  mode="LAST" datatype="DOUBLE" rule="array:sum(${SlimRoots.sSeminalRootLength},1,10)" /> 
+				<out id="sSeminalRootLength_30-45"  mode="LAST" datatype="DOUBLE" rule="array:sum(${SlimRoots.sSeminalRootLength},10,15)" />
+				<out id="sSeminalRootLength_45-75"  mode="LAST" datatype="DOUBLE" rule="array:sum(${SlimRoots.sSeminalRootLength},15,25)" />
+				<out id="sSeminalRootLength_75-105" mode="LAST" datatype="DOUBLE" rule="array:sum(${SlimRoots.sSeminalRootLength},25,35)" />
+				<out id="sSeminalRootLength_105-135" mode="LAST"  datatype="DOUBLE" rule="array:sum(${SlimRoots.sSeminalRootLength},35,45)" />
+				<out id="sSeminalRootLength_135-165"  mode="LAST" datatype="DOUBLE" rule="array:sum(${SlimRoots.sSeminalRootLength},45,55)" />
+				<out id="sSeminalRootLength_165-195"  mode="LAST" datatype="DOUBLE" rule="array:sum(${SlimRoots.sSeminalRootLength},55,65)" />					
+			
+				<out id="WaterUptakePerLayer_30" mode="LAST" datatype="DOUBLE" rule="array:sum(${SlimWater.WaterUptakePerLayer},1,10)" format="%.2f"/>
+				<out id="WaterUptakePerLayer_30-45" mode="LAST" datatype="DOUBLE" rule="array:sum(${SlimWater.WaterUptakePerLayer},10,15)" format="%.2f"/>
+				<out id="WaterUptakePerLayer_45-75" mode="LAST" datatype="DOUBLE" rule="array:sum(${SlimWater.WaterUptakePerLayer},15,25)" format="%.2f"/>
+				<out id="WaterUptakePerLayer_75-105" mode="LAST" datatype="DOUBLE" rule="array:sum(${SlimWater.WaterUptakePerLayer},25,35)" format="%.2f"/>
+				<out id="WaterUptakePerLayer_105-135" mode="LAST" datatype="DOUBLE" rule="array:sum(${SlimWater.WaterUptakePerLayer},35,45)" format="%.2f"/>
+				<out id="WaterUptakePerLayer_135-165" mode="LAST" datatype="DOUBLE" rule="array:sum(${SlimWater.WaterUptakePerLayer},45,55)" format="%.2f"/>
+				<out id="WaterUptakePerLayer_165-195" mode="LAST" datatype="DOUBLE" rule="array:sum(${SlimWater.WaterUptakePerLayer},55,65)" format="%.2f"/>
+
+				<out id="MineralNinProfile_30"  mode="LAST" datatype="DOUBLE" rule="array:sum(${NPKDemandSlimNP.Ninorg},1,10)" format="%.2f"/>
+				<out id="MineralNinProfile_30-45"  mode="LAST" datatype="DOUBLE" rule="array:sum(${NPKDemandSlimNP.Ninorg},10,15)" format="%.2f"/>
+				<out id="MineralNinProfile_45-75"  mode="LAST" datatype="DOUBLE" rule="array:sum(${NPKDemandSlimNP.Ninorg},15,25)" format="%.2f"/>
+				<out id="MineralNinProfile_75-105" mode="LAST" datatype="DOUBLE" rule="array:sum(${NPKDemandSlimNP.Ninorg},25,35)" format="%.2f"/>
+				<out id="MineralNinProfile_105-135"  mode="LAST" datatype="DOUBLE" rule="array:sum(${NPKDemandSlimNP.Ninorg},35,45)" format="%.2f"/>
+				<out id="MineralNinProfile_135-165"  mode="LAST" datatype="DOUBLE" rule="array:sum(${NPKDemandSlimNP.Ninorg},45,55)" format="%.2f"/>
+				<out id="MineralNinProfile_165-195"  mode="LAST" datatype="DOUBLE" rule="array:sum(${NPKDemandSlimNP.Ninorg},55,65)" format="%.2f"/>
+
+				<out id="NitrogenUptakePerLayer_30"  datatype="DOUBLE" rule="array:sum(${NPKDemandSlimNP.NitrogenUptakePerLayer},1,10)" />
+				<out id="NitrogenUptakePerLayer_30-45"  datatype="DOUBLE" rule="array:sum(${NPKDemandSlimNP.NitrogenUptakePerLayer},10,15)" />
+				<out id="NitrogenUptakePerLayer_45-75"  datatype="DOUBLE" rule="array:sum(${NPKDemandSlimNP.NitrogenUptakePerLayer},15,25)" />
+				<out id="NitrogenUptakePerLayer_75-105"  datatype="DOUBLE" rule="array:sum(${NPKDemandSlimNP.NitrogenUptakePerLayer},25,35)" />
+				<out id="NitrogenUptakePerLayer_105-135"  datatype="DOUBLE" rule="array:sum(${NPKDemandSlimNP.NitrogenUptakePerLayer},35,45)" />
+				<out id="NitrogenUptakePerLayer_135-165" datatype="DOUBLE" rule="array:sum(${NPKDemandSlimNP.NitrogenUptakePerLayer},45,55)" />
+				<out id="NitrogenUptakePerLayer_165-195"  datatype="DOUBLE" rule="array:sum(${NPKDemandSlimNP.NitrogenUptakePerLayer},55,65)" />
+			
+				<out id="Seminal_RootDepth" rule="SlimRoots.sSeminalRootDepth" description="actual rooting depth" datatype="DOUBLE" unit="http://www.wurvoc.org/vocabularies/om-1.8/metre"/>	  
+
+				<out id="CumulatedMineralizedP_kg_ha" mode="LAST" datatype="DOUBLE" rule="(${NPKDemandSlimNP.CumulatedMineralizedP})*10"/>
+				<out id="CumulatedMineralizedN_kg_ha" mode="LAST" datatype="DOUBLE" rule="(${NPKDemandSlimNP.CumulatedMineralizedN})*10"/>
+			
+
+				<!-- soil CNP -->        
+				<out id="mean_soilNt_0_30cm_%" datatype="DOUBLE" rule="array:sum(${SoilCNP.sSoilN},1,10)/(0.3*1.4*100000)" mode="AVG" format="%.3f" />  <!-- 0-30cm, Einheit sSoilN in kg/ha  --> 
+				<out id="mean_soilNt_30_45cm_%" datatype="DOUBLE" rule="array:sum(${SoilCNP.sSoilN},10,15)/(0.3*1.5*100000)" mode="AVG" format="%.3f" />  <!-- 0-30cm, Einheit sSoilN in kg/ha  --> 
+				<out id="mean_soilNt_45_75cm_%" datatype="DOUBLE" rule="array:sum(${SoilCNP.sSoilN},15,25)/(0.3*1.6*100000)" mode="AVG" format="%.3f" />  <!-- 0-30cm, Einheit sSoilN in kg/ha  --> 
+	
+				<out id="mean_SOC_0_30cm_%" datatype="DOUBLE" rule="array:sum(${SoilCNP.sSoilC},1,6)/(0.3*1.4*100000)" mode="AVG" format="%.3f" />  <!-- 0-30cm, Einheit sSoilN in kg/ha  --> 
+				<out id="mean_SOC_30_60cm_%" datatype="DOUBLE" rule="array:sum(${SoilCNP.sSoilC},7,12)/(0.3*1.5*100000)" mode="AVG" format="%.3f" />  <!-- 0-30cm, Einheit sSoilN in kg/ha  --> 
+				<out id="mean_SOC_60_90cm_%" datatype="DOUBLE" rule="array:sum(${SoilCNP.sSoilC},13,18)/(0.3*1.6*100000)" mode="AVG" format="%.3f" />  <!-- 0-30cm, Einheit sSoilN in kg/ha  --> 
+				
+				<out id="Fixed_P_0-30cm_%" datatype="DOUBLE" rule="array:sum(${NPKDemandSlimNP.sFixedP},1,6)/(0.3*1.4*100000)" mode="AVG" format="%.3f" />
+				<out id="Adsorbed_P_0-30cm_%" datatype="DOUBLE" rule="array:sum(${NPKDemandSlimNP.sAdsorbedP},1,6)/(0.3*1.4*100000)" mode="AVG" format="%.3f" />
+				<out id="DissolvedP_0-30cm_%" datatype="DOUBLE" rule="array:sum(${NPKDemandSlimNP.sDissolvedP},1,6)/(0.3*1.4*100000)" mode="AVG" format="%.3f" />
+			
+				<out id="mean_inorgP_30-50cm_%" datatype="DOUBLE" mode="AVG" rule="(array:sum(${NPKDemandSlimNP.sFixedP},7,12)+array:sum(${NPKDemandSlimNP.sAdsorbedP},7,12)+array:sum(${NPKDemandSlimNP.sDissolvedP},7,12))/(0.2*1.5*10000)"  format="%.3f" />              
+				<out id="mean_inorgP 50-100cm_%" datatype="DOUBLE" mode="AVG"  rule="(array:sum(${NPKDemandSlimNP.sFixedP},13,18)+array:sum(${NPKDemandSlimNP.sAdsorbedP},13,18)+array:sum(${NPKDemandSlimNP.sDissolvedP},13,18))/(0.5*1.6*10000)"  format="%.3f" />
+			</header>
+		</output>
+	
+	</outputs>
+</solution>

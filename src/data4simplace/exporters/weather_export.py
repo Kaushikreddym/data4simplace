@@ -7,7 +7,16 @@ columns ``Date, Precipitation, TempMin, TempMean, TempMax, Radiation,
 Windspeed, RefET, Gridcell, RelHumCalc`` with a ``-99.9`` sentinel. Column
 order, delimiter and sentinel are taken from the reference when available.
 
-``Windspeed`` needs ``SFCWIND: sfcwind`` in ``climate.variables`` and is written
+**Files are nested one directory per grid row**, ``weather/<row>/<file>``,
+because that is the shape a SIMPLACE solution reads directly::
+
+    <filename>${_DATADIR_}/${vRow}/daily_mean_RES1_C${vColumn}R${vRow}.csv.gz</filename>
+
+A flat directory made every run rebuild that tree as ~70 000 symlinks before it
+could start, and put 70 000 entries in one directory. Exports written before
+this change are flat; readers should accept either layout.
+
+``Windspeed`` needs ``SFCWIND: sfcWind`` in ``climate.variables`` and is written
 as the **2 m** equivalent of the 10 m MSWX product (see `_wind_10m_to_2m`).
 ``RefET`` has no MSWX source and stays at the sentinel.
 """
@@ -36,7 +45,7 @@ _CANONICAL_TO_SIMPLACE = {
     "tasmax": "TempMax",
     "rsds": "Radiation",
     "hurs": "RelHumCalc",
-    "sfcwind": "Windspeed",
+    "sfcWind": "Windspeed",
 }
 # ``RefET`` is the only reference column MSWX cannot provide; conform() fills
 # it with the reference sentinel.
@@ -63,7 +72,7 @@ def _wind_10m_to_2m(values: np.ndarray, height_m: float = _MSWX_WIND_HEIGHT_M) -
 
 #: Per-variable unit/height corrections applied on the way to a SIMPLACE column.
 _CANONICAL_TRANSFORMS = {
-    "sfcwind": _wind_10m_to_2m,
+    "sfcWind": _wind_10m_to_2m,
 }
 
 
@@ -164,6 +173,18 @@ class WeatherExporter(BaseExporter):
         # Precompute the shared date column and the per-variable value cubes.
         dates = pd.to_datetime(climate["time"].values).strftime("%Y-%m-%d")
         present = {c: v for c, v in _CANONICAL_TO_SIMPLACE.items() if c in climate.data_vars}
+        # A variable the handler loaded and regridded but this map has no entry
+        # for is dropped here, silently and at full cost. That is exactly how
+        # `Windspeed` stayed at the sentinel through a whole Europe export, so
+        # it is said out loud -- a name that differs only in case (`sfcwind` vs
+        # `sfcWind`) looks like a working config until someone reads a column.
+        if unmapped := sorted(set(climate.data_vars) - set(_CANONICAL_TO_SIMPLACE)):
+            logger.warning(
+                "Climate variables loaded but not written to any SIMPLACE column: %s. "
+                "Check the spelling in climate.variables against %s",
+                ", ".join(unmapped),
+                ", ".join(sorted(_CANONICAL_TO_SIMPLACE)),
+            )
         cubes = {col: np.round(_to_simplace(canon, np.asarray(climate[canon].values)), 2)
                  for canon, col in present.items()}  # each shaped (time, lat, lon)
         written: list[Path] = []
@@ -180,7 +201,11 @@ class WeatherExporter(BaseExporter):
             frame = pd.DataFrame({"Date": dates, **columns})
             frame["Gridcell"] = self._gridcell_id(cell)
             fname = f"daily_mean_RES1_C{gcol}R{grow}.csv.gz"
-            written.append(self.write_csv(frame, out_dir / fname))
+            written.append(self.write_csv(frame, out_dir / str(grow) / fname))
 
-        logger.info("Exported %d weather files to %s", len(written), out_dir)
+        logger.info(
+            "Exported %d weather files to %s (nested one directory per grid row)",
+            len(written),
+            out_dir,
+        )
         return written

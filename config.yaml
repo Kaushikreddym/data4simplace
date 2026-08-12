@@ -11,6 +11,10 @@ flags:
   run_soil_processing: true         # SoilGrids soil processing
   compute_ptf: false                # Optional pedotransfer functions (hydraulics)
   run_npk_processing: true          # NPK / fertilizer processing (NPKGRIDS)
+  # Per-cell sowing calendar (SAGE/GGCMI) + altitude (DEM) + the CO2 series.
+  # These are the inputs both SIMPLACE and torchcrop need and no other stage
+  # supplies; without them each runner substitutes a continental constant.
+  run_site_processing: true
   # Classify each cell irrigated (1) / rainfed (0) from the crop's irrigated and
   # rainfed harvested area, and add the vIRR column to the management CSV.
   run_irrigation_classification: true
@@ -19,6 +23,7 @@ flags:
   export_simplace_weather: true     # SIMPLACE weather file export
   export_simplace_soil: true        # SIMPLACE soil file export
   export_simplace_management: true  # SIMPLACE management / fertilizer export
+  export_simplace_site: true        # site/site.csv + site/co2.csv
   # One SIMPLACE soil file per primary class (soil_1.csv .. soil_3.csv), each
   # aggregated over its own 250 m pixels and carrying the class area and the
   # cell's heterogeneity metrics. Needs soil.aggregation_method: top3.
@@ -56,6 +61,18 @@ paths:
   mirca_root: "/data01/FDS/muduchuru/Land/MIRCA-OS/data/contents/Monthly Growing Area Grids/Monthly Growing Area Grids"
   # ECIRA base directory: the parent of Crop_IR / Crop_A / Crop_RF.
   ecira_root: "/data01/FDS/muduchuru/Land/ECIRA"
+  # --- site stage inputs ---
+  # Gridded crop calendars. site.calendar_source picks the product expected
+  # here: `sage` -> <crop>.crop.calendar.fill.nc (gunzip the crop in use first),
+  # `ggcmi` -> the phase-3 files under Data/Agri/GGCMI.
+  calendar_root: "/data01/FDS/muduchuru/Data/Agri/SAGE_crop_calendar"
+  # Terrain DEM for the per-cell altitude. GMTED2010 at 0.0625 deg; NOT
+  # Land/Elevation/EGM96_30arcsec.nc4, which is a geoid offset rather than
+  # terrain and is rejected by name.
+  dem_path: "/data01/FDS/muduchuru/Land/GMTED/GMTED2010_15n015_00625deg.nc"
+  # Annual global CO2 as `year,ppm`. null -> the built-in global-mean table,
+  # which site/co2.csv then labels a fallback in its header comment.
+  co2_file: null
   output_dir: "./output"
 
 # --- SIMPLACE reference files (source of truth for output structure) ---------
@@ -63,6 +80,29 @@ reference:
   weather_dir: "/beegfs/muduchuru/simplace/Brandenburg_1KM_winter_wheat/data/weather"
   soil_dir: "/beegfs/muduchuru/simplace/Brandenburg_1KM_winter_wheat/data/soil"
   management_file: "/beegfs/muduchuru/simplace/Brandenburg_1KM_winter_wheat/data/management/fertilizer_winter_wheat.csv"
+  # Long-layout references (used when export.layout is long or both). The
+  # dialect - column names, units and delimiter - is selected from these files'
+  # columns, and columns SoilGrids cannot derive (alfa, n, ksat, RootingDepth,
+  # ...) are carried over from the file's own first row so the output runs.
+  # null -> the built-in EU SUSTAg spelling.
+  soil_file_long: null
+  # e.g. "/data01/FDS/muduchuru/Data/SIMPLACE/Rotation_monocrop/data/soil/SLIM_soil_EU_SUSTAg.csv"
+  management_file_long: null
+
+# --- Export layout -----------------------------------------------------------
+# wide -> the Brandenburg schema: one row per location, depth in the column
+#         names (clay_1 .. clay_6). The default; nothing changes.
+# long -> the row-per-depth schema the EU SUSTAg and ERA5 solutions read, where
+#         each property is declared datatype="DOUBLEARRAY" and SIMPLACE builds
+#         the arrays from the rows sharing a key. Writes soil/soil_long.csv and
+#         management/fertilizer_<crop>_long.csv.
+# both -> both files. They are two serialisations of one computation, so the
+#         second is nearly free and lets a wide-driven and a long-driven
+#         SIMPLACE run be compared on identical inputs.
+export:
+  layout: wide
+  soil_layout: null         # null -> export.layout
+  management_layout: null   # null -> export.layout
 
 # --- MSWX variable folder -> canonical name mapping --------------------------
 climate:
@@ -73,7 +113,7 @@ climate:
     RSDS: rsds          # surface downwelling shortwave radiation [W m-2]
     PR: pr              # precipitation [mm day-1]
     HURS: hurs          # near-surface relative humidity [%]
-    SFCWIND: sfcwind    # near-surface wind speed [m s-1] at 10 m; the exporter
+    SFCWIND: sfcWind    # near-surface wind speed [m s-1] at 10 m; the exporter
                         # converts it to the 2 m equivalent SIMPLACE expects
   chunks:
     # A tile's window is small (~50x50 cells), so the time axis is the only one
@@ -115,6 +155,12 @@ npk:
   fertilizer_scenario: null  # null -> taken from the reference file
   composition_file: null     # null -> fertilizer_composition.xml next to the reference
   amount_decimals: 3
+  # What `Amount` means in the long layout. The SUSTAg long dialect carries no
+  # `vType`, so there is no carrier content to divide by and the amount is the
+  # **nutrient** in g/m2. Writing product grams into a nutrient field is a
+  # silent factor-of-3.7 error for KAS, so `product` is refused on a dialect
+  # with no fertilizer-type column.
+  long_amount_basis: nutrient
 
 # --- Irrigated / rainfed cell classification ---------------------------------
 # vIRR = 1 where the irrigated share of the crop's harvested area,
@@ -139,6 +185,30 @@ irrigation:
   crop_group: null
   column: vIRR             # column name added to the management CSV
   write_netcdf: true       # also write management/irrigation_class_<crop>.nc
+
+# --- Site: per-cell sowing calendar, altitude and CO2 ------------------------
+# Written to site/site.csv (one row per exported cell) and site/co2.csv (one
+# global annual series). SIMPLACE reads these as vWGS84_lat/lon, vAltitude and
+# vSowingDOY; torchcrop as site.latitude / site.altitude / site.idpl.
+site:
+  # sage  -> Sacks et al. (2010), 0.5 deg climatology of planting/harvest dates
+  #          with a start/end window. ~1/3 of European cells are extrapolated by
+  #          the product itself, which the export carries as calendar_filled.
+  # ggcmi -> GGCMI phase 3 (planting + maturity day), built for gridded crop
+  #          models. Use it when SAGE is also the evaluation reference, since
+  #          sowing-vs-SAGE would otherwise be a round trip.
+  calendar_source: sage
+  # Crop name in the product (SAGE `Wheat.Winter`, GGCMI `wwh`). null -> derived
+  # from npk.simplace_crop.
+  calendar_crop: null
+  # Sowing DOY for cells no date could be sampled or filled for. Written with
+  # calendar_source: fallback, so an assumed date never looks like a sampled one.
+  fallback_sowing_doy: 270
+  # Copy the nearest covered cell's calendar into uncovered cropland cells,
+  # bounded by the exported cell mask so nothing is carried out to sea.
+  fill_calendar_gaps: true
+  # Terrain variable of paths.dem_path. null -> the first recognised name.
+  dem_variable: elevation
 
 # --- SoilGrids configuration -------------------------------------------------
 soil:
@@ -177,6 +247,13 @@ soil:
   # Statistic written to the SIMPLACE CSVs: mean (variable-specific mean rules:
   # arithmetic, geometric for soc/nitrogen, H+ mean for phh2o) | median.
   export_statistic: mean
+  # Depth axis of the long-layout soil file (export.layout: long | both).
+  #   native   -> SoilGrids' own horizons, with no depth remap at all. The long
+  #               format carries depth in the rows, so it has no fixed layer
+  #               count to force them onto - that is the point of the layout.
+  #   simplace -> remap onto the wide reference's layer bottoms, so the two
+  #               files describe the same layering and compare directly.
+  long_depths: native
   # Initial mineral N for ammonium_*/nitrate_*. SoilGrids 'nitrogen' is total
   # (largely organic) N: the exporter turns it into a per-layer stock (kg N/ha)
   # with bulk density, takes this fraction as mineral and splits it by

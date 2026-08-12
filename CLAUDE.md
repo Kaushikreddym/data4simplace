@@ -1,8 +1,14 @@
 # CLAUDE.md — Project Guidelines & Developer Instructions
 
-## Role
+## Role: Senior Python Architect.
+Objective: Write minimal, idiomatic, high-performance Python 3.11+ code without unnecessary boilerplate or narrative fluff.
 
-Act as a **senior Python data engineer and geospatial developer**.
+Guidelines:
+1. Architecture: Use `@dataclass(slots=True)` or Pydantic models for structured data. Group related logic into compact classes. Avoid loose dictionary passing and procedural scripts.
+2. Code Density: Prefer functional constructs (comprehensions, generators, `match/case`) over verbose nested loops and multi-branch logic.
+3. Zero Commentary Fluff: Never include inline comments stating what the code does (e.g., `# Loop through list`). Only comment on non-obvious business logic or technical constraints.
+4. Clean Error Handling: Avoid repetitive nested `try/except` blocks inside inner loops or utility functions. Perform validation at execution boundaries.
+5. Do not wrap code in verbose explanations or conversational summaries.
 
 ## Project Overview
 
@@ -23,6 +29,9 @@ conventions required by the **SIMPLACE** crop-model simulation framework.
 | Cropland cover (Copernicus PROBA-V LC100) | `/data01/FDS/muduchuru/Land/LULC/CopernicusLandCover` |
 | Harvested area — MIRCA-OS (irrigated + rainfed) | `/data01/FDS/muduchuru/Land/MIRCA-OS/data/contents/Monthly Growing Area Grids/Monthly Growing Area Grids` |
 | Harvested area — ECIRA (irrigated + growing) | `/data01/FDS/muduchuru/Land/ECIRA` |
+| Crop calendar — SAGE (Sacks et al.) | `/data01/FDS/muduchuru/Data/Agri/SAGE_crop_calendar` |
+| Crop calendar — GGCMI phase 3 | `/data01/FDS/muduchuru/Data/Agri/GGCMI` |
+| Terrain DEM — GMTED2010 | `/data01/FDS/muduchuru/Land/GMTED/GMTED2010_15n015_00625deg.nc` |
 | SIMPLACE reference — weather | `/beegfs/muduchuru/simplace/Brandenburg_1KM_winter_wheat/data/weather` |
 | SIMPLACE reference — soil | `/beegfs/muduchuru/simplace/Brandenburg_1KM_winter_wheat/data/soil` |
 | SIMPLACE reference — management | `/beegfs/muduchuru/simplace/Brandenburg_1KM_winter_wheat/data/management/fertilizer_winter_wheat.csv` |
@@ -56,6 +65,12 @@ data4simplace/
 │       ├── npk/
 │       │   ├── __init__.py
 │       │   └── npk_handler.py      # NPK dataset aligner & loader
+│       ├── site/
+│       │   ├── __init__.py
+│       │   ├── calendar.py         # SAGE / GGCMI sowing calendar -> target grid
+│       │   ├── elevation.py        # GMTED2010 DEM -> per-cell altitude
+│       │   ├── co2.py              # Annual global CO2 series
+│       │   └── handler.py          # Composes the three + the gap fill
 │       ├── management/
 │       │   ├── __init__.py
 │       │   └── irrigation.py       # Harvested area -> vIRR cell classification
@@ -67,6 +82,7 @@ data4simplace/
 │           ├── base_exporter.py    # Reference CSV parser engine
 │           ├── weather_export.py   # SIMPLACE weather file generator
 │           ├── soil_export.py      # SIMPLACE soil profile file generator
+│           ├── site_export.py      # Per-cell site table (site.csv)
 │           └── mgmt_export.py      # SIMPLACE fertilizer schedule exporter
 └── tests/
     └── __init__.py
@@ -90,11 +106,13 @@ Every pipeline step is controlled by an explicit boolean flag:
 | `run_soil_processing` | SoilGrids soil processing |
 | `compute_ptf` | Optional Pedotransfer Functions (hydraulic parameters) |
 | `run_npk_processing` | NPK/fertilizer processing |
+| `run_site_processing` | Per-cell sowing calendar, altitude and the CO₂ series |
 | `run_irrigation_classification` | Irrigated/rainfed cell classification (`vIRR`) |
 | `apply_agricultural_mask` | Restrict every output to PROBA-V cropland cells |
 | `write_soil_statistics` | Per-class NetCDF statistics + class-share table |
 | `export_simplace_weather` | SIMPLACE weather file export |
 | `export_simplace_soil` | SIMPLACE soil file export |
+| `export_simplace_site` | `site/site.csv` + `site/co2.csv` |
 | `export_simplace_management` | SIMPLACE management/fertilizer export |
 | `export_top3_soil_csvs` | One SIMPLACE soil file per primary class (`soil_1..n.csv`) |
 
@@ -140,6 +158,64 @@ Every pipeline step is controlled by an explicit boolean flag:
 - **Per-class statistics:** with `write_soil_statistics=true` the stage also
   describes the `soil.n_primary_classes` most frequent classes per cell; see
   [Primary-Class Statistics](#primary-class-statistics-intermediate-outputs).
+
+### Site Handler (sowing calendar, altitude, CO₂)
+
+`site/site.csv` carries one row per exported cell describing the **place**
+rather than its soil or its weather, and `site/co2.csv` carries one global
+annual series. These are the three inputs both crop models need that no other
+stage supplies, so before this stage each runner substituted its own constant —
+`cropmodelling4eu.torchcrop.run` sowed every cell from Crete to Lapland on
+DOY 270, which is
+the largest single error in that run.
+
+| Column | Source |
+| --- | --- |
+| `latitude`, `longitude` | The cell table |
+| `altitude_m` | GMTED2010, binned mean onto the 10 km cell |
+| `sowing_doy`, `sowing_start_doy`, `sowing_end_doy`, `harvest_doy`, `season_length_days` | The crop calendar |
+| `calendar_filled` | The **product's** own extrapolation flag |
+| `calendar_source` | Where *this pipeline* got the date: `product` / `nearest` / `fallback` |
+
+- **Calendar** (`site.calendar_source`): `sage` reads the Sacks et al. (2010)
+  0.5° climatology `<crop>.crop.calendar.fill.nc`; `ggcmi` reads the GGCMI
+  phase-3 planting/maturity file. `site.calendar_crop` overrides the mapping
+  from `npk.simplace_crop` (`winter_wheat` → SAGE `Wheat.Winter`, GGCMI `wwh`).
+- **Sampling is nearest-neighbour, never interpolated.** These are dates from
+  discrete reporting units: the mean of DOY 300 and DOY 40 is not a date, and a
+  bilinear blend across a reporting boundary invents a season no one grows. The
+  coarse-source branch of `TargetGrid.regrid` already does exactly this.
+- **Two different "filled" concepts, kept separate.** `calendar_filled` is
+  SAGE's own flag for a cell it extrapolated from a neighbouring reporting unit
+  (about a third of Europe — half the Alps, none of the North German Plain).
+  `calendar_source` is *this pipeline's* provenance: `nearest` where
+  `site.fill_calendar_gaps` copied a neighbouring cell's calendar into an
+  uncovered cropland cell, `fallback` where nothing could be reached and
+  `site.fallback_sowing_doy` was used. An assumed date is therefore never
+  indistinguishable from a sampled one.
+- **The gap fill is bounded by the exported cell mask**, reusing
+  `soil.classify.fill_missing_cells` — an unbounded search would carry a land
+  calendar out over the sea, the same failure the soil fill guards against.
+  Under tiled execution the bound is the *tile's* mask, so a fringe cell whose
+  only covered neighbour lies in the next tile keeps the fallback.
+- **Altitude must come from terrain.**
+  `Land/Elevation/EGM96_30arcsec.nc4` holds `geoid_altitude`, a WGS84→EGM96
+  vertical *offset* of ±100 m; it lives in a directory called `Elevation` and
+  its units are metres, so `site/elevation.py` rejects a geoid variable by name.
+  `GMTED2010_maximum_15arcsec.nc4` is terrain but publishes only a per-pixel
+  *maximum*, biased high exactly where altitude matters, so the default is the
+  0.0625° mean `elevation`.
+- **CO₂ is one global series, not a field.** It is well mixed on the timescale a
+  crop model integrates over: the inter-hemispheric gradient is a few ppm
+  against the 90 ppm rise across the export's own 1979–2024 window. Without
+  `paths.co2_file` a built-in global-mean table is interpolated, and the written
+  file's header records `source: fallback` so such a run stays identifiable.
+
+**Circularity warning.** `cropmodelling4eu/evaluation/sage_calendar_evaluation.ipynb`
+compares
+the simulated sowing date against SAGE. With `calendar_source: sage` that
+comparison becomes a round trip rather than a test — maturity stays a genuine
+comparison, and `calendar_source: ggcmi` keeps sowing independent too.
 
 ### NPK Handler (NPKGRIDS)
 
@@ -192,6 +268,35 @@ fixed at 0.0792:0.083 g/g — so it is replaced by the straight carriers
 composition file) at the same DVS. Events are then ordered by `DVS` and
 renumbered 1..n per cell.
 
+### Planting Window (`vSowWindowStartDOY` / `vSowWindowEndDOY`)
+
+A rule-based SIMPLACE solution does not take a sowing *date*. It evaluates
+weather rules from a window's first day and sows on the first day one holds,
+forcing a sowing on the last day if none does — so what it reads is the pair of
+day-of-year thresholds SAGE actually publishes (`plant.start` … `plant.end`),
+not the midpoint `sowing_doy` collapses them to.
+
+With `site.write_management_window` (default) the pair is appended to the
+schedule by `SowingWindow` (`site/window.py`), one value per location repeated
+across that cell's event rows, exactly as `vIRR` is. **Column order is the
+contract**: SIMPLACE binds a CSV resource by position, so the window follows
+`vIRR`, and a solution reading it must declare every earlier column too.
+
+Three corrections stand between SAGE's fields and a usable pair:
+
+| Case | Handling |
+| --- | --- |
+| No window published, but a date is | Centred on the date, `site.window_min_days` either side — a cell with a date must still sow |
+| Window crosses New Year (`end < start`) | Re-wrapped to its true length, then moved off the year end. The solution's `DOY >= start and DOY <= end` has no wrap, and an inverted pair is false every day of the year |
+| Length outside `[window_min_days, window_max_days]` | Clamped. A zero-length window is a fixed date again, which is the failure this path exists to remove |
+
+**The schedule is not a complete cell set.** A cell with no NPKGRIDS rate is
+[omitted from the schedule](#exported-cell-set) and therefore carries no window,
+so a solution must keep a fallback — `cropmodelling4eu`'s takes the project
+file's `vSowWindowStartDOY` / `vSowWindowLengthDays`. The **long** layout writes
+no window at all: no long dialect declares a column for it, and inventing one
+is the silent mis-map [Export Layouts](#export-layouts-exportlayout) forbids.
+
 ### Irrigation Classification (`vIRR`)
 
 `management/irrigation.py` labels every target cell irrigated or rainfed from the
@@ -240,8 +345,96 @@ its 1 km pixel centres, which never splits a pixel across cells.
 - Assign uniform `SimplaceID` cell identifiers across **all** outputs.
 - Dynamically inspect the reference CSV files for exact headers, column order,
   missing-value sentinels (`-99`), and depth horizons.
-- Generate weather, soil, and management/fertilizer files matching SIMPLACE
-  input standards.
+- Generate weather, soil, site, and management/fertilizer files matching
+  SIMPLACE input standards.
+
+### Export Layouts (`export.layout`)
+
+SIMPLACE reads a soil profile in one of two shapes, and which one a solution
+expects is declared in its own `<resource>` header. `export.layout: wide |
+long | both` selects which is written (`export.soil_layout` /
+`export.management_layout` override per file). The default is `wide`, so no
+existing output changes.
+
+| Layout | Shape | Files |
+| --- | --- | --- |
+| `wide` | One row per `location`, depth in the column names (`clay_1`..`clay_6`) | `soil/soil.csv`, `management/fertilizer_<crop>.csv` |
+| `long` | One row per `(location, depth)`, SIMPLACE assembles the arrays | `soil/soil_long.csv`, `management/fertilizer_<crop>_long.csv` |
+
+The long form is a first-class SIMPLACE idiom, not a variant spelling. Both the
+EU SUSTAg and the Brandenburg solutions declare their soil the same way:
+
+```xml
+<res id="location"            datatype="INT"         key="vLocationID"/>
+<res id="depth"               datatype="DOUBLEARRAY"/>
+<res id="soilwater_wp"        datatype="DOUBLEARRAY" unit="cm3*cm-3"/>
+<res id="soilwater_fc_global" datatype="DOUBLE"      unit="cm3*cm-3"/>
+```
+
+**`DOUBLEARRAY` says the value is an array, not how the file encodes it.**
+SIMPLACE fills one either way:
+
+| Encoding | The file has | Used by |
+| --- | --- | --- |
+| Wide | `soilwater_wp_1` … `soilwater_wp_6` in one row per location | Brandenburg `soil.csv` |
+| Long | `soilwater_wp` repeated over rows sharing the key | EU SUSTAg `SLIM_soil_EU_SUSTAg.csv` |
+
+So a solution's `datatype` does **not** tell you which layout to export — only
+its interface's actual column names do. `DOUBLE` is a genuine per-location
+scalar in both encodings.
+
+**Both layouts are one computation, serialised twice.** `build_profile_table`
+produces the tidy `(location, depth)` table in canonical units;
+`SoilExporter` pivots it wide and `LongSoilExporter` renames it into a dialect.
+`layout: both` therefore costs almost nothing and lets a wide-driven and a
+long-driven run be compared on identical inputs.
+
+**The depth axis is free in the long form.** The wide layout must force
+SoilGrids' six horizons onto the six fixed SIMPLACE layer bottoms
+(0.1/0.3/0.5/0.7/1.0/2.0 m) through `remap_depth_weighted`. A long file can
+carry SoilGrids' **native** horizons with no remap at all — that is what
+`soil.long_depths: native` (the default) does; `simplace` remaps so the two
+files describe the same layering.
+
+**Dialects.** The two long reference files on this system disagree on names,
+units *and* delimiter, so the layout is reference-driven:
+`reference.soil_file_long` selects the dialect from its columns.
+
+| Dialect | Source | Divider | Key | Spelling |
+| --- | --- | --- | --- | --- |
+| `sustag` | `Rotation_monocrop/data/soil/SLIM_soil_EU_SUSTAg.csv` | `,` | `location` | `LL`/`DUL`/`SAT`/`BD`/`OC`/`NH4_mg_kg` |
+| `era5` | `ERA5_SIMPLACE/data/soil/20250616_CKASoilDataCefitAP5_Slim.csv` | `;` | `soiltype` | `soilwater_wp`/`_fc`/`_sat`/`bulkdensity_perc` |
+
+Unit conversions are part of the dialect, not an afterthought: SUSTAg's `OC` is
+g/100g where the pipeline's `carbon` is g/kg, and `NH4_mg_kg` is a
+concentration where the wide `ammonium_n` is a kg N/ha stock (inverted with the
+layer's bulk density and thickness, so both files describe the same nitrogen).
+**A canonical property with no entry in the selected dialect is dropped with a
+warning naming it, never written under a guessed name** — a silent mis-map
+between `soilwater_fc` and `soilwater_red` produces a plausible file and a
+wrong crop.
+
+Columns a real reference declares but SoilGrids cannot supply (`alfa`, `n`,
+`ksat`, `macroporevolume`, `RootingDepth`, `Soiltype`, `slim_alpha`, …) are
+carried from the long reference's own first row, exactly as the wide exporter
+does with `_reference_template`. Filling them with the `-99` sentinel would
+produce a file SIMPLACE cannot run.
+
+**The long fertilizer schedule keys differently, and drops `vType`:**
+
+| | Brandenburg (wide) | SUSTAg long |
+| --- | --- | --- |
+| irrigation | `vIRR`, appended | `vIRRIGATION`, a **key** column |
+| fertilizer type | `vType` + `fertilizer_composition.xml` | **absent** |
+| year | one schedule for all years | `Year` key, one block per year |
+| grouping | `location, Event` | `Location, ENZ, vCrop, Year, Number` |
+
+With no carrier column there is no carrier content to divide by, so `Amount` is
+the **nutrient** in g/m². Writing product grams into a nutrient field is a
+silent factor-of-3.7 error for KAS, so `npk.long_amount_basis` must say which
+and `product` is refused on a dialect with no fertilizer-type column. `ENZ` (the
+EnS v8 environmental zone) is not a pipeline input and is written as the
+sentinel rather than a plausible-looking zero.
 
 ## Agricultural Mask & Soil Aggregation Workflow
 
@@ -355,9 +548,9 @@ the physical ordering is restored after aggregation.
 
 ## Exported Cell Set
 
-Weather, soil and management must cover **exactly the same cells**: a weather
-file for a cell SIMPLACE has no soil profile for is unusable. The cell set is
-resolved once, in `spatial.export_cell_mask`, as the intersection of two
+Weather, soil, site and management must cover **exactly the same cells**: a
+weather file for a cell SIMPLACE has no soil profile for is unusable. The cell
+set is resolved once, in `spatial.export_cell_mask`, as the intersection of two
 conditions:
 
 | Condition | Applies when | Keeps a cell if |
@@ -365,10 +558,14 @@ conditions:
 | Cropland | `flags.apply_agricultural_mask` | it holds `soil.min_cropland_pixels` PROBA-V pixels at ≥ `soil.cropland_min_fraction` cover |
 | Valid soil | the soil stage ran | any soil property at any depth is non-NaN |
 
-The resulting mask is applied to climate, soil, hydraulics and NPK **and** to
-the cell table, so every exporter iterates the same cells. With
+The resulting mask is applied to climate, soil, hydraulics, site and NPK **and**
+to the cell table, so every exporter iterates the same cells. With
 `soil.fill_missing: false` the valid-soil condition means *aggregated from the
 cell's own 250 m pixels*; enabling the fill widens it to the filled cells.
+
+The site stage never narrows the set: a cell the crop calendar does not reach
+takes `site.fallback_sowing_doy` and is labelled, rather than being dropped.
+Only NPK narrows it, and only for the management file.
 
 ### 5. Exported statistic (`soil.export_statistic`)
 

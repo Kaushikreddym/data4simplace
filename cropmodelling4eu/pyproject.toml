@@ -1,0 +1,75 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cropmodelling4eu"
+version = "0.1.0"
+description = "Run, collect and evaluate SIMPLACE and torchcrop crop-model simulations over the data4simplace European export."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "ZALF", email = "msm-pb4@zalf.de" }]
+keywords = ["SIMPLACE", "torchcrop", "LINTUL", "crop-model", "Europe", "geospatial"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Topic :: Scientific/Engineering :: GIS",
+]
+
+dependencies = [
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "pyarrow>=14.0",
+    "xarray>=2024.0",
+    "netCDF4>=1.6",
+    "pyyaml>=6.0",
+    "pydantic>=2.0",
+    "lxml>=5.0",
+]
+
+[project.optional-dependencies]
+# torch is not a base dependency: the SIMPLACE side of the package runs a
+# Singularity container and needs none of it, and torch is a ~2 GB install.
+torchcrop = ["torch>=2.0"]
+evaluation = ["geopandas>=0.14", "cartopy>=0.22", "matplotlib>=3.8", "scipy>=1.10"]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "black>=24.0",
+    "ruff>=0.4",
+    "mypy>=1.8",
+    "build>=1.0",
+]
+
+[project.scripts]
+cropmodelling4eu = "cropmodelling4eu.cli:main"
+cm4eu = "cropmodelling4eu.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+cropmodelling4eu = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+markers = [
+    "slow: runs a crop model end to end (seconds, not milliseconds)",
+]
+
+[tool.black]
+line-length = 100
+target-version = ["py310"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.mypy]
+python_version = "3.10"
+warn_unused_ignores = true
+ignore_missing_imports = true

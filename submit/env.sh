@@ -19,7 +19,7 @@ export D4S_CONFIG="${D4S_CONFIG:-${D4S_PROJECT_DIR}/config.yaml}"
 # --- Run layout --------------------------------------------------------------
 # Outputs go to /beegfs: the weather export writes one gzipped CSV per cropland
 # cell (O(10^5) files for Europe), which is far more inodes than /data01 wants.
-export D4S_RUN_NAME="${D4S_RUN_NAME:-europe_torchcrop}"
+export D4S_RUN_NAME="${D4S_RUN_NAME:-EU}"
 export D4S_OUT_DIR="${D4S_OUT_DIR:-/data01/FDS/muduchuru/Data/SIMPLACE/${D4S_RUN_NAME}}"
 export D4S_WORK_DIR="${D4S_WORK_DIR:-${D4S_OUT_DIR}/_work}"   # per-task configs
 export D4S_LOG_DIR="${D4S_LOG_DIR:-${D4S_PROJECT_DIR}/submit/logs}"

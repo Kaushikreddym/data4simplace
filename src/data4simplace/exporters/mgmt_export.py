@@ -50,6 +50,11 @@ import xarray as xr
 
 from data4simplace.config import PipelineConfig
 from data4simplace.exporters.base_exporter import BaseExporter, ReferenceSpec, parse_reference_csv
+from data4simplace.exporters.layout import (
+    MANAGEMENT_DIALECTS,
+    LongDialect,
+    select_dialect,
+)
 from data4simplace.management.irrigation import IrrigationClassification
 from data4simplace.npk.composition import (
     K2O_TO_K,
@@ -58,6 +63,7 @@ from data4simplace.npk.composition import (
     default_composition_path,
     parse_fertilizer_composition,
 )
+from data4simplace.site.window import SowingWindow
 
 logger = logging.getLogger(__name__)
 
@@ -436,26 +442,61 @@ class ManagementExporter(BaseExporter):
             rates[nutrient] = values * factor * _KG_HA_TO_G_M2
         return rates
 
-    def _columns(self, irrigation: Optional[IrrigationClassification]) -> list[str]:
-        """Output columns: the reference schedule, plus ``vIRR`` when classified."""
-        columns = list(_SCHEDULE_COLUMNS)
+    def _window_columns(self) -> tuple[str, str]:
+        """The two planting-window column names, from the site config."""
+        site = self._config.site
+        return site.window_start_column, site.window_end_column
+
+    def _extensions(
+        self,
+        irrigation: Optional[IrrigationClassification],
+        window: Optional[SowingWindow],
+    ) -> list[str]:
+        """Columns this exporter adds after the reference's own, in order.
+
+        SIMPLACE binds a CSV resource's columns by **position**, so this order
+        is part of the file's contract with the solution: appending the window
+        before ``vIRR`` would feed a day-of-year into the irrigation flag.
+        """
+        columns = []
         if irrigation is not None:
             columns.append(self._config.irrigation.column)
+        if window is not None:
+            columns.extend(self._window_columns())
         return columns
 
+    def _columns(
+        self,
+        irrigation: Optional[IrrigationClassification],
+        window: Optional[SowingWindow] = None,
+    ) -> list[str]:
+        """Output columns: the reference schedule, plus the extensions."""
+        return list(_SCHEDULE_COLUMNS) + self._extensions(irrigation, window)
+
     def conform(self, frame: pd.DataFrame) -> pd.DataFrame:
-        """Reference column order, with the irrigation column kept on the end.
+        """Reference column order, with the extension columns kept on the end.
 
         The base class drops every column the reference does not declare, which
-        is what the reference-driven schema demands. ``vIRR`` is a deliberate
-        extension rather than drift, so it is re-appended *after* the reference
-        block — leaving the reference's own columns in their exact order.
+        is what the reference-driven schema demands. ``vIRR`` and the planting
+        window are deliberate extensions rather than drift, so they are
+        re-appended *after* the reference block — leaving the reference's own
+        columns in their exact order.
         """
-        column = self._config.irrigation.column
-        if column not in frame.columns:
+        site = self._config.site
+        extensions = [
+            column
+            for column in (
+                self._config.irrigation.column,
+                site.window_start_column,
+                site.window_end_column,
+            )
+            if column in frame.columns
+        ]
+        if not extensions:
             return super().conform(frame)
-        conformed = super().conform(frame.drop(columns=[column]))
-        conformed[column] = frame[column].to_numpy()
+        conformed = super().conform(frame.drop(columns=extensions))
+        for column in extensions:
+            conformed[column] = frame[column].to_numpy()
         return conformed
 
     def build_frame(
@@ -463,6 +504,7 @@ class ManagementExporter(BaseExporter):
         npk: xr.Dataset,
         cell_table: pd.DataFrame,
         irrigation: Optional[IrrigationClassification] = None,
+        window: Optional[SowingWindow] = None,
     ) -> pd.DataFrame:
         """Build the long fertilizer schedule, one row per cell and event.
 
@@ -476,16 +518,21 @@ class ManagementExporter(BaseExporter):
             Optional irrigated/rainfed classification. When given, its per-cell
             label is repeated onto every event row of that cell as the
             ``irrigation.column`` column.
+        window:
+            Optional planting window from the calendar. When given, its
+            ``(start, end)`` day-of-year pair is repeated onto every event row
+            of that cell, for a solution that sows by rule inside the window
+            rather than on a fixed day.
 
         Returns
         -------
         pandas.DataFrame
             Columns ``location``, ``FertilizerScenario``, ``crop``, ``Event``,
-            ``vType``, ``DVS``, ``Amount`` and, with a classification, ``vIRR``.
-            Empty when no cell has a rate.
+            ``vType``, ``DVS``, ``Amount`` and, with a classification, ``vIRR``,
+            then the window pair. Empty when no cell has a rate.
         """
         template = self.template()
-        columns = self._columns(irrigation)
+        columns = self._columns(irrigation, window)
         if not npk.data_vars or cell_table.empty:
             logger.warning("No NPK layers or no exported cells; empty schedule")
             return pd.DataFrame(columns=columns)
@@ -523,6 +570,11 @@ class ManagementExporter(BaseExporter):
             frame[self._config.irrigation.column] = np.repeat(
                 irrigation.column(cell_table), len(events)
             )
+        if window is not None:
+            start_column, end_column = self._window_columns()
+            start, end = window.columns(cell_table)
+            frame[start_column] = np.repeat(start, len(events))
+            frame[end_column] = np.repeat(end, len(events))
 
         # A cell with no NPKGRIDS rate is dropped, not filled with the reference
         # constants: an exported location must carry its own application.
@@ -549,6 +601,20 @@ class ManagementExporter(BaseExporter):
                 "%s: %d of %d scheduled cells irrigated (%s, share > %g)",
                 column, irrigated, kept, irrigation.source, irrigation.threshold,
             )
+        if window is not None:
+            start_column, end_column = self._window_columns()
+            per_cell = frame.groupby(_LOCATION_COLUMN, sort=False)[
+                [start_column, end_column]
+            ].first()
+            logger.info(
+                "Planting window: DOY %d-%d to %d-%d over %d scheduled cells "
+                "(median length %d d), written as %s/%s",
+                int(per_cell[start_column].min()), int(per_cell[end_column].min()),
+                int(per_cell[start_column].max()), int(per_cell[end_column].max()),
+                kept,
+                int((per_cell[end_column] - per_cell[start_column]).median()),
+                start_column, end_column,
+            )
         return frame[columns]
 
     def export(
@@ -557,10 +623,212 @@ class ManagementExporter(BaseExporter):
         cell_table: pd.DataFrame,
         output_dir: str | Path,
         irrigation: Optional[IrrigationClassification] = None,
+        window: Optional[SowingWindow] = None,
     ) -> Path:
         """Write ``fertilizer_<crop>.csv``; return its path."""
-        frame = self.build_frame(npk, cell_table, irrigation=irrigation)
+        frame = self.build_frame(npk, cell_table, irrigation=irrigation, window=window)
         out_path = (
             Path(output_dir) / "management" / f"fertilizer_{self._npk_config.simplace_crop}.csv"
+        )
+        return self.write_csv(frame, out_path)
+
+
+class LongManagementExporter(ManagementExporter):
+    """Export the fertilizer schedule in the EU SUSTAg long layout.
+
+    The Brandenburg schedule is already one row per event, so what the long
+    dialect changes is the *keying* rather than the shape:
+
+    ==================  ==========================  =========================
+    \\                   Brandenburg (wide default)  SUSTAg long
+    ==================  ==========================  =========================
+    irrigation          ``vIRR``, appended          ``vIRRIGATION``, a key
+    fertilizer type     ``vType`` + composition     **absent**
+    year                one schedule for all        ``Year``, one block each
+    grouping            ``location, Event``         ``Location, ENZ, vCrop,
+                                                     Year, Number``
+    ==================  ==========================  =========================
+
+    The missing ``vType`` is the trap. With no carrier column there is no
+    carrier content to divide by, so ``Amount`` is the **nutrient** itself;
+    writing product grams into a nutrient field is a silent factor-of-3.7 error
+    for KAS. ``npk.long_amount_basis`` therefore has to say which, and
+    ``product`` is refused on a dialect with no type column.
+    """
+
+    kind = "management (long)"
+
+    def __init__(self, config: PipelineConfig, reference_path: str | Path | None) -> None:
+        super().__init__(config, reference_path)
+        self._long_reference = config.reference.management_file_long
+        self._dialect: Optional[LongDialect] = None
+
+    def fallback_spec(self) -> ReferenceSpec:
+        """The selected dialect's own columns."""
+        return ReferenceSpec(
+            delimiter=self.dialect.delimiter,
+            columns=self.dialect.column_names,
+            missing_value=str(self._config.missing_value),
+        )
+
+    @property
+    def spec(self) -> ReferenceSpec:
+        """The long file's structure, from its own reference or the dialect.
+
+        Deliberately *not* the base class' spec: ``self._reference_path`` still
+        points at the wide schedule, which is what the schedule template is
+        recovered from, and conforming to that file's columns would undo the
+        whole layout.
+        """
+        if self._spec is None:
+            self._spec = self.fallback_spec()
+        return self._spec
+
+    @property
+    def dialect(self) -> LongDialect:
+        """The long dialect this run writes."""
+        if self._dialect is None:
+            columns = (
+                parse_reference_csv(
+                    self._long_reference, default_missing=str(self._config.missing_value)
+                ).columns
+                if self._long_reference is not None
+                and Path(self._long_reference).is_file()
+                else []
+            )
+            self._dialect = select_dialect(
+                columns, MANAGEMENT_DIALECTS, kind="management"
+            )
+        return self._dialect
+
+    def conform(self, frame: pd.DataFrame) -> pd.DataFrame:
+        """Order by the dialect. ``vIRR`` is a key column here, not an extra."""
+        return BaseExporter.conform(self, frame)
+
+    def build_frame(
+        self,
+        npk: xr.Dataset,
+        cell_table: pd.DataFrame,
+        irrigation: Optional[IrrigationClassification] = None,
+        window: Optional[SowingWindow] = None,
+    ) -> pd.DataFrame:
+        """Build the long schedule, one row per cell, year and event.
+
+        The planting window is **not** written: no long dialect declares a
+        column for it, and the dialect decides this file's schema. Dropping it
+        under a guessed name is the mis-map the layout module exists to prevent,
+        so a long-driven run takes its window from the project file instead.
+        """
+        if window is not None:
+            logger.warning(
+                "The %r dialect declares no planting-window column, so the "
+                "window is not written into the long schedule; a rule-based "
+                "solution reading this file must take its window from the "
+                "project file", self.dialect.name,
+            )
+        wide = super().build_frame(npk, cell_table, irrigation=irrigation)
+        if wide.empty:
+            return pd.DataFrame(columns=self.dialect.column_names)
+
+        events = self._to_nutrient_basis(wide)
+        events = self._expand_years(events)
+        events["ENZ"] = self._environmental_zone(events)
+        column = self._config.irrigation.column
+        if column not in events:
+            # The dialect declares an irrigation key, so a run without the
+            # classification writes the rainfed value rather than a blank key.
+            events[column] = 0
+        events = events.rename(columns={column: "vIRR"}) if column != "vIRR" else events
+
+        frame = self.dialect.build(events).reset_index(drop=True)
+        logger.info(
+            "Long fertilizer schedule: %d rows over %d locations and %d year(s) "
+            "(dialect %r, %s basis)",
+            len(frame), events["location"].nunique(), events["Year"].nunique(),
+            self.dialect.name, self._npk_config.long_amount_basis,
+        )
+        return frame
+
+    def _to_nutrient_basis(self, frame: pd.DataFrame) -> pd.DataFrame:
+        """Convert ``Amount`` from product to nutrient grams, if asked to.
+
+        Raises
+        ------
+        ValueError
+            If ``product`` is configured on a dialect with no fertilizer-type
+            column. The amounts would be product grams in a field the solution
+            reads as a nutrient, which no downstream check would catch.
+        """
+        basis = self._npk_config.long_amount_basis
+        has_type_column = any(
+            c.name.lower() in ("vtype", "type", "fertilizertype")
+            for c in self.dialect.columns
+        )
+        if basis == "product":
+            if not has_type_column:
+                raise ValueError(
+                    f"npk.long_amount_basis: product needs a fertilizer-type "
+                    f"column, and the {self.dialect.name!r} dialect has none "
+                    f"({', '.join(self.dialect.column_names)}). Without a "
+                    f"carrier the amount cannot be interpreted as a product; "
+                    f"use long_amount_basis: nutrient."
+                )
+            return frame
+
+        # Nutrient basis: undo the carrier division the wide schedule applies.
+        template = {(e.vtype, e.dvs): e.content for e in self.template().events}
+        contents = np.array(
+            [
+                template.get((str(vtype), float(dvs)), np.nan)
+                for vtype, dvs in zip(frame["vType"], frame["DVS"])
+            ]
+        )
+        out = frame.copy()
+        out["Amount"] = (out["Amount"].to_numpy() * contents).round(
+            self._npk_config.amount_decimals
+        )
+        return out
+
+    def _expand_years(self, frame: pd.DataFrame) -> pd.DataFrame:
+        """Repeat the schedule once per simulated year.
+
+        The dialect keys on ``Year``, and the pipeline derives one schedule from
+        a static NPKGRIDS rate, so every year gets the same applications. That
+        is a property of the input, not of this exporter: NPKGRIDS publishes no
+        time axis.
+        """
+        start = int(str(self._config.time.start)[:4])
+        end = int(str(self._config.time.end)[:4])
+        years = range(start, end + 1)
+        expanded = pd.concat(
+            [frame.assign(Year=year) for year in years], ignore_index=True
+        )
+        return expanded.sort_values(
+            ["location", "Year", "Event"], kind="stable"
+        ).reset_index(drop=True)
+
+    def _environmental_zone(self, frame: pd.DataFrame) -> np.ndarray:
+        """The ``ENZ`` key.
+
+        The EnS v8 environmental zones are not a pipeline input, so this writes
+        the missing sentinel rather than a plausible-looking zero: a wrong zone
+        would select the wrong calibration in a solution that keys on it.
+        """
+        return np.full(len(frame), self._config.missing_value)
+
+    def export(
+        self,
+        npk: xr.Dataset,
+        cell_table: pd.DataFrame,
+        output_dir: str | Path,
+        irrigation: Optional[IrrigationClassification] = None,
+        window: Optional[SowingWindow] = None,
+    ) -> Path:
+        """Write ``fertilizer_<crop>_long.csv``; return its path."""
+        frame = self.build_frame(npk, cell_table, irrigation=irrigation, window=window)
+        out_path = (
+            Path(output_dir)
+            / "management"
+            / f"fertilizer_{self._npk_config.simplace_crop}_long.csv"
         )
         return self.write_csv(frame, out_path)

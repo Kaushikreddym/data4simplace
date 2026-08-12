@@ -26,6 +26,9 @@ Design
 * The fertilizer schedule shards the same way, into
   ``management/fertilizer_<crop>.csv``. Its rows are per (cell, event), so the
   mosaic sorts stably to keep each cell's events in DVS order.
+* The site table shards into ``site/site.csv``. Its CO2 companion is a single
+  global series, so it is written once at combine time rather than by every
+  tile writing the same file.
 """
 
 from __future__ import annotations
@@ -40,7 +43,10 @@ import pandas as pd
 from data4simplace.climate import MSWXHandler
 from data4simplace.config import PipelineConfig
 from data4simplace.exporters import (
+    LongManagementExporter,
+    LongSoilExporter,
     ManagementExporter,
+    SiteExporter,
     SoilExporter,
     TopSoilExporter,
     WeatherExporter,
@@ -48,6 +54,12 @@ from data4simplace.exporters import (
 from data4simplace.grid import TargetGrid
 from data4simplace.management import IrrigationClassifier
 from data4simplace.npk import NPKHandler
+from data4simplace.site import (
+    SiteHandler,
+    fill_calendar_gaps,
+    load_co2_series,
+    write_co2_series,
+)
 from data4simplace.soil import SoilGridsHandler
 from data4simplace.spatial import apply_cell_mask, export_cell_mask, keep_cells
 
@@ -150,6 +162,8 @@ def _run_tile(
         soil, hydraulic = handler.load_processed()
         top_classes = handler.top_classes
 
+    site = SiteHandler(tcfg).load() if flags.run_site_processing else None
+
     npk = None
     if flags.run_npk_processing:
         loaded = NPKHandler(tcfg).load()
@@ -166,6 +180,14 @@ def _run_tile(
     climate = apply_cell_mask(climate, mask) if climate is not None else None
     soil = apply_cell_mask(soil, mask) if soil is not None else None
     hydraulic = apply_cell_mask(hydraulic, mask) if hydraulic is not None else None
+    if site is not None:
+        # Bounded by the tile's own export mask, so the fill never reaches
+        # beyond the tile -- a fringe cell on a tile edge whose only covered
+        # neighbour is in the next tile keeps the fallback instead of a
+        # neighbour's calendar, which is the conservative side of that trade.
+        if tcfg.site.fill_calendar_gaps:
+            site = fill_calendar_gaps(site, within=mask)
+        site = apply_cell_mask(site, mask)
     npk = apply_cell_mask(npk, mask) if npk is not None else None
     if top_classes is not None:
         top_classes.mask_cells(mask)
@@ -193,11 +215,27 @@ def _run_tile(
         WeatherExporter(tcfg, tcfg.reference.weather_dir).export(climate, ct, out_dir)
 
     if flags.export_simplace_soil and soil is not None:
-        frame = SoilExporter(tcfg, tcfg.reference.soil_dir).build_frame(
-            soil, ct, hydraulic=hydraulic
-        )
+        if tcfg.export.writes("soil", "wide"):
+            frame = SoilExporter(tcfg, tcfg.reference.soil_dir).build_frame(
+                soil, ct, hydraulic=hydraulic
+            )
+            if not frame.empty:
+                frame.to_csv(shard_dir / f"{w.name}.csv", index=False)
+        if tcfg.export.writes("soil", "long"):
+            exporter = LongSoilExporter(tcfg, tcfg.reference.soil_dir)
+            frame = exporter.build_frame(soil, ct, hydraulic=hydraulic)
+            if not frame.empty:
+                long_dir = _long_soil_shard_dir(out_dir)
+                long_dir.mkdir(parents=True, exist_ok=True)
+                exporter.conform(frame).to_csv(long_dir / f"{w.name}.csv", index=False)
+
+    if flags.export_simplace_site and site is not None:
+        exporter = SiteExporter(tcfg)
+        frame = exporter.build_frame(site, ct)
         if not frame.empty:
-            frame.to_csv(shard_dir / f"{w.name}.csv", index=False)
+            site_dir = _site_shard_dir(out_dir)
+            site_dir.mkdir(parents=True, exist_ok=True)
+            exporter.conform(frame).to_csv(site_dir / f"{w.name}.csv", index=False)
 
     if flags.export_top3_soil_csvs and top_classes is not None:
         exporter = TopSoilExporter(tcfg, tcfg.reference.soil_dir)
@@ -215,10 +253,17 @@ def _run_tile(
             exporter.conform(frame).to_csv(rank_dir / f"{w.name}.csv", index=False)
 
     if flags.export_simplace_management and npk is not None:
-        exporter = ManagementExporter(tcfg, tcfg.reference.management_file)
-        frame = exporter.build_frame(npk, ct, irrigation=irrigation)
-        if not frame.empty:
-            mgmt_dir = _management_shard_dir(out_dir)
+        for layout, cls, shard_fn in (
+            ("wide", ManagementExporter, _management_shard_dir),
+            ("long", LongManagementExporter, _long_management_shard_dir),
+        ):
+            if not tcfg.export.writes("management", layout):
+                continue
+            exporter = cls(tcfg, tcfg.reference.management_file)
+            frame = exporter.build_frame(npk, ct, irrigation=irrigation)
+            if frame.empty:
+                continue
+            mgmt_dir = shard_fn(out_dir)
             mgmt_dir.mkdir(parents=True, exist_ok=True)
             exporter.conform(frame).to_csv(mgmt_dir / f"{w.name}.csv", index=False)
 
@@ -235,11 +280,46 @@ def _management_shard_dir(out_dir: Path) -> Path:
     return out_dir / "management" / "_shards"
 
 
-def _concat_shards(shard_dir: Path, out_path: Path, label: str = "soil") -> None:
+def _site_shard_dir(out_dir: Path) -> Path:
+    """Shard directory for the per-tile site tables."""
+    return out_dir / "site" / "_shards"
+
+
+def _long_soil_shard_dir(out_dir: Path) -> Path:
+    """Shard directory for the per-tile long-layout soil tables."""
+    return out_dir / "soil" / "_shards_long"
+
+
+def _long_management_shard_dir(out_dir: Path) -> Path:
+    """Shard directory for the per-tile long-layout fertilizer schedules."""
+    return out_dir / "management" / "_shards_long"
+
+
+def _soil_long_key(config: PipelineConfig) -> str:
+    """The cell-identifier column of the long soil dialect this run writes."""
+    return LongSoilExporter(config, config.reference.soil_dir).dialect.key_column
+
+
+def _management_long_key(config: PipelineConfig) -> str:
+    """The cell-identifier column of the long management dialect."""
+    return LongManagementExporter(
+        config, config.reference.management_file
+    ).dialect.key_column
+
+
+def _concat_shards(
+    shard_dir: Path, out_path: Path, label: str = "soil", key: str = "location"
+) -> None:
     """Mosaic per-tile CSV shards into a single file (global rows).
 
     The sort is **stable**, so a product with several rows per cell (the
-    fertilizer schedule, one row per event) keeps its within-cell ordering.
+    fertilizer schedule one row per event, the long soil table one row per
+    depth) keeps its within-cell ordering.
+
+    ``key`` names the cell-identifier column, which the long dialects spell
+    differently (``Location``, ``soiltype``). An unrecognised key leaves the
+    shard order untouched rather than raising: concatenated-but-unsorted is a
+    usable file, and every shard is internally ordered already.
     """
     shards = sorted(shard_dir.glob("tile_*.csv"))
     if not shards:
@@ -247,7 +327,13 @@ def _concat_shards(shard_dir: Path, out_path: Path, label: str = "soil") -> None
         return
     frames = [pd.read_csv(p) for p in shards]
     combined = pd.concat(frames, ignore_index=True)
-    combined = combined.sort_values("location", kind="stable").reset_index(drop=True)
+    if key in combined.columns:
+        combined = combined.sort_values(key, kind="stable").reset_index(drop=True)
+    else:
+        logger.warning(
+            "%s shards have no %r column to sort on (columns: %s); keeping "
+            "shard order", label, key, list(combined.columns)[:6],
+        )
     out_path.parent.mkdir(parents=True, exist_ok=True)
     combined.to_csv(out_path, index=False)
     logger.info("Wrote mosaicked %s (%d rows) -> %s", label, len(combined), out_path)
@@ -301,10 +387,18 @@ def combine_tiles(
 
     soil_rows = 0
     if config.flags.export_simplace_soil:
-        out_path = out_dir / "soil" / "soil.csv"
-        _concat_shards(shard_dir, out_path, label="soil")
-        if out_path.is_file():
-            soil_rows = sum(1 for _ in out_path.open()) - 1  # minus header
+        if config.export.writes("soil", "wide"):
+            out_path = out_dir / "soil" / "soil.csv"
+            _concat_shards(shard_dir, out_path, label="soil")
+            if out_path.is_file():
+                soil_rows = sum(1 for _ in out_path.open()) - 1  # minus header
+        if config.export.writes("soil", "long"):
+            _concat_shards(
+                _long_soil_shard_dir(out_dir),
+                out_dir / "soil" / "soil_long.csv",
+                label="soil (long)",
+                key=_soil_long_key(config),
+            )
 
     top3_rows = 0
     if config.flags.export_top3_soil_csvs:
@@ -319,27 +413,59 @@ def combine_tiles(
 
     management_rows = 0
     if config.flags.export_simplace_management:
-        mgmt_dir = _management_shard_dir(out_dir)
-        mgmt_path = out_dir / "management" / f"fertilizer_{config.npk.simplace_crop}.csv"
-        _concat_shards(mgmt_dir, mgmt_path, label="management")
-        if mgmt_path.is_file():
-            management_rows = sum(1 for _ in mgmt_path.open()) - 1
+        crop = config.npk.simplace_crop
+        if config.export.writes("management", "wide"):
+            mgmt_path = out_dir / "management" / f"fertilizer_{crop}.csv"
+            _concat_shards(_management_shard_dir(out_dir), mgmt_path, label="management")
+            if mgmt_path.is_file():
+                management_rows = sum(1 for _ in mgmt_path.open()) - 1
+        if config.export.writes("management", "long"):
+            _concat_shards(
+                _long_management_shard_dir(out_dir),
+                out_dir / "management" / f"fertilizer_{crop}_long.csv",
+                label="management (long)",
+                key=_management_long_key(config),
+            )
+
+    site_rows = 0
+    if config.flags.export_simplace_site:
+        site_path = out_dir / "site" / "site.csv"
+        _concat_shards(_site_shard_dir(out_dir), site_path, label="site")
+        if site_path.is_file():
+            site_rows = sum(1 for _ in site_path.open()) - 1
+        # The CO2 series is global, so it is written once at combine time
+        # rather than sharded and re-written identically by every tile.
+        series, source = load_co2_series(config.paths.co2_file, _simulated_years(config))
+        write_co2_series(series, source, out_dir)
 
     weather_files = len(list((out_dir / "weather").glob("*.csv.gz")))
     logger.info(
         "Combined: %d weather files (already global), soil.csv %d rows, "
-        "per-class CSVs %d rows, fertilizer %d rows, %d tile markers present",
-        weather_files, soil_rows, top3_rows, management_rows, len(done),
+        "per-class CSVs %d rows, site %d rows, fertilizer %d rows, "
+        "%d tile markers present",
+        weather_files, soil_rows, top3_rows, site_rows, management_rows, len(done),
     )
     return {
         "weather_files": weather_files,
         "soil_rows": soil_rows,
         "top3_rows": top3_rows,
+        "site_rows": site_rows,
         "management_rows": management_rows,
         "tiles_expected": expected,
         "tiles_done": len(done),
         "tiles_missing": missing,
     }
+
+
+def _simulated_years(config: PipelineConfig) -> list[int]:
+    """Calendar years the run's time window spans, widened by a year each side.
+
+    A winter crop is sown the year before it is harvested, so a season that
+    straddles New Year needs the CO2 of both its years.
+    """
+    start = int(str(config.time.start)[:4])
+    end = int(str(config.time.end)[:4])
+    return list(range(start - 1, end + 2))
 
 
 def _tile_dirs(config: PipelineConfig) -> tuple[Path, Path, Path]:
@@ -457,13 +583,34 @@ def run_tiled(
         marker.write_text("ok\n")
 
     if config.flags.export_simplace_soil:
-        _concat_shards(shard_dir, out_dir / "soil" / "soil.csv", label="soil")
+        if config.export.writes("soil", "wide"):
+            _concat_shards(shard_dir, out_dir / "soil" / "soil.csv", label="soil")
+        if config.export.writes("soil", "long"):
+            _concat_shards(
+                _long_soil_shard_dir(out_dir),
+                out_dir / "soil" / "soil_long.csv",
+                label="soil (long)",
+                key=_soil_long_key(config),
+            )
+    if config.flags.export_simplace_site:
+        _concat_shards(_site_shard_dir(out_dir), out_dir / "site" / "site.csv", label="site")
+        series, source = load_co2_series(config.paths.co2_file, _simulated_years(config))
+        write_co2_series(series, source, out_dir)
     if config.flags.export_simplace_management:
-        _concat_shards(
-            _management_shard_dir(out_dir),
-            out_dir / "management" / f"fertilizer_{config.npk.simplace_crop}.csv",
-            label="management",
-        )
+        crop = config.npk.simplace_crop
+        if config.export.writes("management", "wide"):
+            _concat_shards(
+                _management_shard_dir(out_dir),
+                out_dir / "management" / f"fertilizer_{crop}.csv",
+                label="management",
+            )
+        if config.export.writes("management", "long"):
+            _concat_shards(
+                _long_management_shard_dir(out_dir),
+                out_dir / "management" / f"fertilizer_{crop}_long.csv",
+                label="management (long)",
+                key=_management_long_key(config),
+            )
 
     logger.info("Tiled run complete: %d/%d tiles, %d cells exported",
                 processed, len(windows), cells)

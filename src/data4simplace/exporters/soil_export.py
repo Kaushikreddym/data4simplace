@@ -42,7 +42,12 @@ import pandas as pd
 import xarray as xr
 
 from data4simplace.config import PipelineConfig
-from data4simplace.exporters.base_exporter import BaseExporter, ReferenceSpec
+from data4simplace.exporters.base_exporter import (
+    BaseExporter,
+    ReferenceSpec,
+    parse_reference_csv,
+)
+from data4simplace.exporters.layout import SOIL_DIALECTS, LongDialect, select_dialect
 from data4simplace.soil.multiclass import METADATA_COLUMNS, TopClassAggregation
 
 logger = logging.getLogger(__name__)
@@ -52,6 +57,11 @@ logger = logging.getLogger(__name__)
 _STEM_TO_SOILGRIDS = {
     "clay": "clay",
     "sand": "sand",
+    # Neither silt nor nitrogen appears in the Brandenburg wide reference, so
+    # `conform` drops them there. They are carried because the long dialects do
+    # declare silt, and because the C:N ratio needs total N.
+    "silt": "silt",
+    "nitrogen": "nitrogen",
     "bulkdensity": "bdod",
     "carbon": "soc",
     "PH": "phh2o",
@@ -248,6 +258,48 @@ class SoilExporter(BaseExporter):
         }
 
     # ------------------------------------------------------------------ #
+    # Property cubes (shared by both layouts)
+    # ------------------------------------------------------------------ #
+    def _property_cubes(
+        self,
+        soil: xr.Dataset,
+        hydraulic: xr.Dataset | None,
+        src_intervals: list[tuple[float, float]],
+        dst_intervals: list[tuple[float, float]],
+    ) -> dict[str, np.ndarray]:
+        """Every derivable property as ``{stem: (n_layers, n_lat, n_lon)}``.
+
+        This is the whole computation both the wide and the long serialisation
+        rest on: the SoilGrids layers remapped onto ``dst_intervals``, the PTF
+        as a fallback for water contents the ``wv*`` layers did not fill, and
+        the initial mineral N. Values are in the pipeline's canonical units
+        (texture %, bulk density kg/dm3, carbon g/kg, water m3/m3, mineral N
+        kg/ha), which is what the layouts convert *from*.
+        """
+        remapped: dict[str, np.ndarray] = {}
+        for stem, var in _STEM_TO_SOILGRIDS.items():
+            if var in soil.data_vars:
+                cube = remap_depth_weighted(
+                    np.asarray(soil[var].values), src_intervals, dst_intervals
+                )
+                remapped[stem] = cube * _STEM_UNIT_FACTOR.get(stem, 1.0)
+        if hydraulic is not None and "depth" in hydraulic.dims:
+            # The PTF only covers the depths where sand and clay were both
+            # available, so it carries its own source intervals.
+            hydraulic = hydraulic.load()
+            ptf_intervals = [_parse_interval_cm(str(d)) for d in hydraulic["depth"].values]
+            for stem, var in _STEM_TO_PTF.items():
+                # SoilGrids' measured-data water contents win where present.
+                if stem in remapped or var not in hydraulic.data_vars:
+                    continue
+                remapped[stem] = remap_depth_weighted(
+                    np.asarray(hydraulic[var].values), ptf_intervals, dst_intervals
+                )
+
+        remapped.update(self._mineral_nitrogen(soil, src_intervals, dst_intervals))
+        return remapped
+
+    # ------------------------------------------------------------------ #
     # Frame construction
     # ------------------------------------------------------------------ #
     def build_frame(
@@ -276,30 +328,8 @@ class SoilExporter(BaseExporter):
         dst_intervals = _bottoms_to_intervals_cm(self._layer_bottoms_cm(n_layers))
         template = self._reference_template()
 
-        # Materialise once, then remap every derivable variable onto SIMPLACE
-        # layers: {stem: array shaped (n_layers, n_lat, n_lon)}.
         soil = soil.load()
-        remapped: dict[str, np.ndarray] = {}
-        for stem, var in _STEM_TO_SOILGRIDS.items():
-            if var in soil.data_vars:
-                cube = remap_depth_weighted(
-                    np.asarray(soil[var].values), src_intervals, dst_intervals
-                )
-                remapped[stem] = cube * _STEM_UNIT_FACTOR.get(stem, 1.0)
-        if hydraulic is not None and "depth" in hydraulic.dims:
-            # The PTF only covers the depths where sand and clay were both
-            # available, so it carries its own source intervals.
-            hydraulic = hydraulic.load()
-            ptf_intervals = [_parse_interval_cm(str(d)) for d in hydraulic["depth"].values]
-            for stem, var in _STEM_TO_PTF.items():
-                # SoilGrids' measured-data water contents win where present.
-                if stem in remapped or var not in hydraulic.data_vars:
-                    continue
-                remapped[stem] = remap_depth_weighted(
-                    np.asarray(hydraulic[var].values), ptf_intervals, dst_intervals
-                )
-
-        remapped.update(self._mineral_nitrogen(soil, src_intervals, dst_intervals))
+        remapped = self._property_cubes(soil, hydraulic, src_intervals, dst_intervals)
 
         rows = np.asarray(cell_table["row"], dtype=int)
         cols = np.asarray(cell_table["col"], dtype=int)
@@ -344,6 +374,276 @@ class SoilExporter(BaseExporter):
         frame = self.build_frame(soil, cell_table, hydraulic)
         out_path = Path(output_dir) / "soil" / "soil.csv"
         return self.write_csv(frame, out_path)
+
+    # ------------------------------------------------------------------ #
+    # Tidy profile table (the long layout's input)
+    # ------------------------------------------------------------------ #
+    def build_profile_table(
+        self,
+        soil: xr.Dataset,
+        cell_table: pd.DataFrame,
+        hydraulic: xr.Dataset | None = None,
+        depths: str = "native",
+    ) -> pd.DataFrame:
+        """One row per ``(location, depth)`` in the pipeline's canonical units.
+
+        This is the same computation :meth:`build_frame` serialises wide, left
+        un-pivoted. It is what the long layouts render, and it is deliberately
+        *not* a reshape of the wide frame: the wide frame has already been
+        remapped onto the reference's six SIMPLACE layers and rounded, whereas a
+        long file can carry SoilGrids' own horizons.
+
+        Parameters
+        ----------
+        depths:
+            ``native`` keeps SoilGrids' horizons (no depth remap at all);
+            ``simplace`` remaps onto the wide reference's layer bottoms, so the
+            two files describe the same layering and can be compared directly.
+
+        Returns
+        -------
+        pandas.DataFrame
+            ``location``, ``depth_top_cm``, ``depth_bottom_cm``, every derivable
+            canonical property, and the profile-level ``soilwater_fc_global`` /
+            ``soilwater_sat_global`` repeated on each of a location's rows.
+            Rows are ordered by location, then by depth.
+        """
+        if "depth" not in soil.dims:
+            raise ValueError("Soil dataset must carry a 'depth' dimension")
+        if depths not in ("native", "simplace"):
+            raise ValueError(f"depths must be 'native' or 'simplace', got {depths!r}")
+
+        src_intervals = [_parse_interval_cm(str(d)) for d in soil["depth"].values]
+        if depths == "native":
+            dst_intervals = list(src_intervals)
+        else:
+            columns = self.spec.columns or self.fallback_spec().columns
+            dst_intervals = _bottoms_to_intervals_cm(
+                self._layer_bottoms_cm(self._n_layers(columns))
+            )
+
+        soil = soil.load()
+        cubes = self._property_cubes(soil, hydraulic, src_intervals, dst_intervals)
+
+        rows = np.asarray(cell_table["row"], dtype=int)
+        cols = np.asarray(cell_table["col"], dtype=int)
+        ids = np.asarray(cell_table["SimplaceID"], dtype=np.int64)
+        n_cells, n_layers = len(ids), len(dst_intervals)
+
+        # Cell-major: a location's layers stay contiguous and in depth order,
+        # which is what SIMPLACE's DOUBLEARRAY assembly assumes.
+        frame = pd.DataFrame(
+            {
+                "location": np.repeat(ids, n_layers),
+                "depth_top_cm": np.tile([t for t, _ in dst_intervals], n_cells),
+                "depth_bottom_cm": np.tile([b for _, b in dst_intervals], n_cells),
+            }
+        )
+        for stem, cube in cubes.items():
+            frame[stem] = cube[:, rows, cols].T.ravel()
+
+        # Per-layer properties SoilGrids has no source for. The wide reference
+        # carries constants for them, and a long solution declares them too
+        # (SUSTAg reads both a residual and a reduction-point water content),
+        # so they come across the same way rather than as a sentinel.
+        for stem in ("soilwater_res", "soilwater_red"):
+            values = self._template_layer_values(stem, n_layers)
+            if values is not None:
+                frame[stem] = np.tile(values, n_cells)
+
+        frame = self._add_profile_scalars(frame)
+        return frame
+
+    def _template_layer_values(self, stem: str, n_layers: int) -> np.ndarray | None:
+        """Per-layer constants for a property the pipeline cannot derive.
+
+        Some columns a long solution declares (``soilwater_res``) have no
+        SoilGrids source; the wide export carries the reference's own constants
+        for them, and so does this. ``None`` when the reference has no such
+        column, leaving the dialect to write the sentinel.
+        """
+        template = self._reference_template()
+        values = [template.get(f"{stem}_{n}") for n in range(1, n_layers + 1)]
+        if any(v is None for v in values):
+            return None
+        return np.asarray(values, dtype="float64")
+
+    @staticmethod
+    def _add_profile_scalars(frame: pd.DataFrame) -> pd.DataFrame:
+        """Attach the profile-level ``*_global`` water contents.
+
+        Both are thickness-weighted means over the whole profile, repeated on
+        every row of their location -- which is exactly the ``DOUBLE``-typed
+        resource entry a long solution declares next to its ``DOUBLEARRAY``
+        columns.
+        """
+        thickness = frame["depth_bottom_cm"] - frame["depth_top_cm"]
+        for stem, name in (
+            ("soilwater_fc", "soilwater_fc_global"),
+            ("soilwater_sat", "soilwater_sat_global"),
+        ):
+            if stem not in frame:
+                continue
+            weighted = (frame[stem] * thickness).groupby(frame["location"]).sum()
+            total = thickness.groupby(frame["location"]).sum()
+            frame[name] = frame["location"].map(weighted / total)
+        return frame
+
+
+class LongSoilExporter(SoilExporter):
+    """Export the soil profile in the row-per-depth layout.
+
+    Same computation as :class:`SoilExporter`, different serialisation: instead
+    of pivoting the layers into ``<stem>_<N>`` columns it writes one row per
+    ``(location, depth)`` and lets SIMPLACE assemble the arrays, which is what a
+    solution declaring ``datatype="DOUBLEARRAY"`` expects.
+
+    The dialect (column names, units, delimiter) is selected from
+    ``reference.soil_file_long`` when one is configured, and defaults to the EU
+    SUSTAg spelling otherwise. See :mod:`data4simplace.exporters.layout`.
+    """
+
+    kind = "soil (long)"
+
+    def __init__(self, config: PipelineConfig, reference_path: str | Path | None) -> None:
+        # The long reference, not the wide one, defines this file's structure.
+        super().__init__(config, config.reference.soil_file_long)
+        # ... but the wide reference still supplies the layer bottoms and the
+        # constants for columns SoilGrids cannot derive, so it is kept.
+        self._wide = SoilExporter(config, reference_path)
+        self._dialect: LongDialect | None = None
+
+    def fallback_spec(self) -> ReferenceSpec:
+        """The selected dialect's own columns, when no long reference is given."""
+        return ReferenceSpec(
+            delimiter=self.dialect.delimiter,
+            columns=self.dialect.column_names,
+            missing_value=str(self._config.missing_value),
+        )
+
+    @property
+    def dialect(self) -> LongDialect:
+        """The long dialect this run writes."""
+        if self._dialect is None:
+            reference = self._resolve_reference_file()
+            columns = (
+                parse_reference_csv(
+                    reference, default_missing=str(self._config.missing_value)
+                ).columns
+                if reference is not None
+                else []
+            )
+            self._dialect = select_dialect(columns, SOIL_DIALECTS, kind="soil")
+        return self._dialect
+
+    def build_frame(
+        self,
+        soil: xr.Dataset,
+        cell_table: pd.DataFrame,
+        hydraulic: xr.Dataset | None = None,
+    ) -> pd.DataFrame:
+        """Build the long soil table (one row per location and depth)."""
+        profile = self._wide.build_profile_table(
+            soil, cell_table, hydraulic, depths=self._config.soil.long_depths
+        )
+        self._warn_about_unmapped(profile)
+
+        frame = self.dialect.build(profile)
+        # Drop locations with nothing derivable, matching the wide exporter's
+        # rule that a written profile is one aggregated from real pixels.
+        derived = [
+            column.name
+            for column in self.dialect.columns
+            if column.source in profile.columns and column.source != "location"
+        ]
+        if derived:
+            valid = ~frame[derived].apply(pd.to_numeric, errors="coerce").isna().all(axis=1)
+            frame = frame[valid]
+        frame = frame.reset_index(drop=True)
+        logger.info(
+            "Long soil table: %d locations x %d depths = %d rows (dialect %r, "
+            "depths %s)",
+            frame[self.dialect.key_column].nunique() if not frame.empty else 0,
+            profile.groupby("location").size().max() if not profile.empty else 0,
+            len(frame), self.dialect.name, self._config.soil.long_depths,
+        )
+        return frame
+
+    def conform(self, frame: pd.DataFrame) -> pd.DataFrame:
+        """Reference column order, with non-derivable columns kept runnable.
+
+        A real long reference declares more than SoilGrids can supply: the EU
+        SUSTAg file adds ``alfa``, ``n``, ``ksat``, ``macroporevolume``,
+        ``dampingdepth``, ``drainage_rate``, ``RootingDepth`` and ``Soiltype``,
+        and the ERA5 one adds the van Genuchten pair, ``DZF`` and
+        ``slim_alpha``. The base class would fill those with the missing
+        sentinel, which SIMPLACE cannot run on -- so, exactly as the wide
+        exporter does with ``_reference_template``, they are carried over from
+        the reference's own first row.
+        """
+        spec = self.spec
+        if not spec.columns:
+            return frame
+        # The long reference's own first row, then the configured constants:
+        # config wins, since it is the more deliberate of the two.
+        template = {**self._long_template(), **self._config.soil.long_constants}
+        out = frame.copy()
+        unfilled = []
+        for column in spec.columns:
+            if column in out.columns:
+                continue
+            if column in template:
+                out[column] = template[column]
+            else:
+                out[column] = spec.missing_value
+                unfilled.append(column)
+        if unfilled:
+            logger.warning(
+                "Long soil columns %s have no derivable source, no reference "
+                "row and no soil.long_constants entry; written as %s, which "
+                "SIMPLACE cannot run on",
+                unfilled, spec.missing_value,
+            )
+        return out[spec.columns].fillna(spec.missing_value)
+
+    def _long_template(self) -> dict[str, object]:
+        """First row of the long reference, for the columns we cannot derive."""
+        reference = self._resolve_reference_file()
+        if reference is None:
+            return {}
+        row = pd.read_csv(reference, sep=self.spec.delimiter, nrows=1)
+        if row.empty:
+            return {}
+        return {str(k): v for k, v in row.iloc[0].to_dict().items()}
+
+    def _warn_about_unmapped(self, profile: pd.DataFrame) -> None:
+        """Name every derived property the dialect has no column for.
+
+        Silence here would be the dangerous case: a solution that reads
+        ``silt`` from a dialect that does not write it fails inside the
+        container, and a property dropped without a word is invisible.
+        """
+        carried = self.dialect.sources()
+        skip = {"depth_top_cm", "depth_bottom_cm", "location"}
+        unmapped = sorted(set(profile.columns) - carried - skip)
+        if unmapped:
+            logger.warning(
+                "Long dialect %r has no column for %s; %s dropped rather than "
+                "written under a guessed name",
+                self.dialect.name, ", ".join(unmapped),
+                "they are" if len(unmapped) > 1 else "it is",
+            )
+
+    def export(
+        self,
+        soil: xr.Dataset,
+        cell_table: pd.DataFrame,
+        output_dir: str | Path,
+        hydraulic: xr.Dataset | None = None,
+    ) -> Path:
+        """Write ``soil/soil_long.csv``; return its path."""
+        frame = self.build_frame(soil, cell_table, hydraulic)
+        return self.write_csv(frame, Path(output_dir) / "soil" / "soil_long.csv")
 
 
 class TopSoilExporter(SoilExporter):

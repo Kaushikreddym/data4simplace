@@ -23,6 +23,9 @@ class ExecutionFlags(BaseModel):
     run_soil_processing: bool = False
     compute_ptf: bool = False
     run_npk_processing: bool = False
+    # Per-cell sowing calendar, altitude and the CO2 series -- the inputs both
+    # SIMPLACE and torchcrop need that no other stage supplies. See the site block.
+    run_site_processing: bool = False
     # Classify every target cell irrigated (1) / rainfed (0) from the crop's
     # irrigated and rainfed harvested area, and add the vIRR column to the
     # SIMPLACE management file. See the irrigation block.
@@ -34,6 +37,9 @@ class ExecutionFlags(BaseModel):
     export_simplace_weather: bool = False
     export_simplace_soil: bool = False
     export_simplace_management: bool = False
+    # site/site.csv (one row per cell: lat/lon, altitude, sowing calendar) and
+    # site/co2.csv (the annual global CO2 series).
+    export_simplace_site: bool = False
     # One SIMPLACE soil CSV per primary class (soil_1.csv .. soil_n.csv), each
     # aggregated over its own 250 m pixels and carrying the class' area and the
     # cell's heterogeneity metrics. Requires soil.aggregation_method: top3.
@@ -90,6 +96,17 @@ class PathsConfig(BaseModel):
     # ECIRA base directory, i.e. the parent of Crop_IR / Crop_A / Crop_RF.
     # Needed when irrigation.source is ``ecira`` or ``merged``.
     ecira_root: Optional[Path] = None
+    # Directory of gridded crop calendars, read by the site stage. Which product
+    # is expected there follows site.calendar_source: ``sage`` looks for
+    # ``<crop>.crop.calendar.fill.nc``, ``ggcmi`` for the phase-3 files.
+    calendar_root: Optional[Path] = None
+    # Terrain DEM for the per-cell altitude, e.g.
+    # ``GMTED2010_15n015_00625deg.nc``. Must be *terrain*: a geoid/EGM96
+    # conversion grid is rejected by name (see site/elevation.py).
+    dem_path: Optional[Path] = None
+    # Annual global CO2 series as ``year,ppm``. Unset -> the built-in
+    # global-mean table, and the written file records that it is a fallback.
+    co2_file: Optional[Path] = None
     output_dir: Path = Path("./output")
 
 
@@ -101,6 +118,43 @@ class ReferenceConfig(BaseModel):
     weather_dir: Optional[Path] = None
     soil_dir: Optional[Path] = None
     management_file: Optional[Path] = None
+    # Long-layout references (export.layout: long | both). The dialect -- column
+    # names, units and delimiter -- is selected from these files' columns; unset
+    # falls back to the built-in EU SUSTAg spelling.
+    soil_file_long: Optional[Path] = None
+    management_file_long: Optional[Path] = None
+
+
+class ExportConfig(BaseModel):
+    """Which layout(s) the soil and management files are written in.
+
+    ``wide`` is the Brandenburg reference schema: one row per location, with the
+    depth axis in the column names (``clay_1`` ... ``clay_6``). ``long`` is the
+    row-per-depth schema the EU SUSTAg and ERA5 solutions read, where every
+    property is declared ``datatype="DOUBLEARRAY"`` and SIMPLACE assembles the
+    arrays from the rows sharing a key.
+
+    ``both`` writes each file twice. They are two serialisations of one
+    computation, so the second costs almost nothing and lets a wide-driven and a
+    long-driven SIMPLACE run be compared on identical inputs.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    layout: Literal["wide", "long", "both"] = "wide"
+    # Per-file overrides. None -> whatever `layout` says.
+    soil_layout: Optional[Literal["wide", "long", "both"]] = None
+    management_layout: Optional[Literal["wide", "long", "both"]] = None
+
+    def resolved(self, kind: Literal["soil", "management"]) -> str:
+        """The layout in force for one product."""
+        override = self.soil_layout if kind == "soil" else self.management_layout
+        return override or self.layout
+
+    def writes(self, kind: Literal["soil", "management"], layout: str) -> bool:
+        """Whether ``kind`` is written in ``layout`` ("wide" or "long")."""
+        resolved = self.resolved(kind)
+        return resolved == layout or resolved == "both"
 
 
 class ClimateConfig(BaseModel):
@@ -168,6 +222,12 @@ class NPKConfig(BaseModel):
     composition_file: Optional[Path] = None
     # Decimal places for the written ``Amount`` (g product / m^2).
     amount_decimals: int = Field(3, ge=0, le=6)
+    # What ``Amount`` means in the long layout (export.layout: long | both).
+    # The SUSTAg long dialect carries no ``vType``, so there is no carrier to
+    # divide by and the amount is the **nutrient** in g/m^2. Writing product
+    # grams into a nutrient field is a silent factor-of-3.7 error for KAS, so
+    # ``product`` is refused on a dialect with no fertilizer-type column.
+    long_amount_basis: Literal["nutrient", "product"] = "nutrient"
 
     @model_validator(mode="after")
     def _check_split(self) -> "NPKConfig":
@@ -214,6 +274,59 @@ class IrrigationConfig(BaseModel):
     column: str = "vIRR"
     # Write the gridded classification next to the schedule as a NetCDF.
     write_netcdf: bool = True
+
+
+class SiteConfig(BaseModel):
+    """Per-cell sowing calendar, altitude and CO2 (the site stage).
+
+    These three are the inputs both crop models need and no other stage
+    supplies, so before this stage each runner substituted its own constant --
+    one sowing day-of-year for the whole continent, an altitude of zero and a
+    hard-coded CO2 table.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    # ``sage``  - Sacks et al. (2010) crop calendar: a 0.5 degree climatology of
+    #             planting/harvest dates with a start/end window, assembled from
+    #             census and extension reports. About a third of European cells
+    #             are extrapolated from a neighbouring reporting unit, which the
+    #             product flags and the export carries as ``calendar_filled``.
+    # ``ggcmi`` - GGCMI phase 3 calendar: planting and maturity day, built for
+    #             gridded crop models. The alternative when the SAGE dates are
+    #             also the reference an evaluation compares the run against.
+    calendar_source: Literal["sage", "ggcmi"] = "sage"
+    # Crop name in the calendar product (SAGE ``Wheat.Winter``, GGCMI ``wwh``).
+    # None -> derived from npk.simplace_crop, which has no default for crops the
+    # mapping does not know: guessing would silently sow the wrong calendar.
+    calendar_crop: Optional[str] = None
+    # Sowing day-of-year for cells no calendar date could be sampled or filled
+    # for. Written with ``calendar_source: fallback`` so an assumed date stays
+    # distinguishable from a sampled one in every downstream analysis.
+    fallback_sowing_doy: int = Field(270, ge=1, le=366)
+    # Copy the nearest covered cell's calendar into cells the product does not
+    # cover (coastal and fringe cropland). Bounded by the exported cell mask, so
+    # the search never carries a land calendar out to sea.
+    fill_calendar_gaps: bool = True
+    # Terrain variable of paths.dem_path. None -> the first of elevation /
+    # surface_altitude / altitude / ... that the file carries.
+    dem_variable: Optional[str] = None
+
+    # --- The planting window written into the fertilizer schedule ------------
+    # A rule-based solution sows on the first day inside [start, end] on which a
+    # weather rule holds, so it reads a window rather than a date. Written onto
+    # every event row of the cell, like vIRR, because the schedule is the only
+    # per-cell table such a solution already reads daily.
+    write_management_window: bool = True
+    window_start_column: str = "vSowWindowStartDOY"
+    window_end_column: str = "vSowWindowEndDOY"
+    # Bounds on the window's length. A zero-length window turns a rule back into
+    # a fixed date; one longer than max_days lets the deadline sit so far out
+    # that the forced-sowing guard stops being a guard. The min doubles as the
+    # half-width of the window centred on the sowing date where the calendar
+    # product publishes no start/end pair.
+    window_min_days: int = Field(7, ge=1, le=182)
+    window_max_days: int = Field(120, ge=1, le=364)
 
 
 class SoilConfig(BaseModel):
@@ -277,6 +390,21 @@ class SoilConfig(BaseModel):
     # Statistic the SIMPLACE CSVs carry: ``mean`` applies the variable-specific
     # mean rules (arithmetic / geometric / pH H+), ``median`` the plain median.
     export_statistic: Literal["mean", "median"] = "mean"
+    # Depth axis of the long-layout soil file (export.layout: long | both).
+    #   native   - SoilGrids' own horizons, with no depth remap at all. The long
+    #              format puts depth in the rows, so it has no fixed layer count
+    #              to force them onto; this is the whole point of the layout.
+    #   simplace - remap onto the wide reference's layer bottoms, so the long and
+    #              wide files describe the same layering and compare directly.
+    long_depths: Literal["native", "simplace"] = "native"
+    # Per-column constants for long-layout columns SoilGrids cannot derive
+    # (van Genuchten ``alfa``/``n``, ``ksat``, ``macroporevolume``,
+    # ``dampingdepth``, ``drainage_rate``, ``deltatheta``, ``maxRootingDepth``,
+    # ``Soiltype`` ...). A long reference's own first row is used where one is
+    # configured; this fills the rest. Left empty they are written as the
+    # missing sentinel, which SIMPLACE cannot run on -- so a solution declaring
+    # them needs an entry here.
+    long_constants: dict[str, object] = Field(default_factory=dict)
 
     # --- Initial mineral N from the SoilGrids total-N layer -------------------
     # SoilGrids ``nitrogen`` is *total* (largely organic) N, while SIMPLACE's
@@ -314,8 +442,10 @@ class PipelineConfig(BaseModel):
     time: TimeConfig
     paths: PathsConfig
     reference: ReferenceConfig = Field(default_factory=ReferenceConfig)
+    export: ExportConfig = Field(default_factory=ExportConfig)
     climate: ClimateConfig = Field(default_factory=ClimateConfig)
     soil: SoilConfig = Field(default_factory=SoilConfig)
+    site: SiteConfig = Field(default_factory=SiteConfig)
     npk: NPKConfig = Field(default_factory=NPKConfig)
     irrigation: IrrigationConfig = Field(default_factory=IrrigationConfig)
     missing_value: float = -99.0
@@ -356,6 +486,34 @@ class PipelineConfig(BaseModel):
                     "npk.source: npkgrids requires paths.npk_root to point at "
                     "the NPKGRIDS netCDF directory"
                 )
+        return self
+
+    @model_validator(mode="after")
+    def _check_site(self) -> "PipelineConfig":
+        """The site stage needs both of its inputs; the export needs the stage."""
+        if self.flags.export_simplace_site and not self.flags.run_site_processing:
+            raise ValueError(
+                "flags.export_simplace_site requires flags.run_site_processing "
+                "(site.csv is written from that stage's calendar and altitude)"
+            )
+        if not self.flags.run_site_processing:
+            return self
+
+        missing = [
+            name
+            for name, value in (
+                ("calendar_root", self.paths.calendar_root),
+                ("dem_path", self.paths.dem_path),
+            )
+            if value is None
+        ]
+        if missing:
+            raise ValueError(
+                "flags.run_site_processing requires "
+                + " and ".join(f"paths.{name}" for name in missing)
+                + ". paths.co2_file stays optional -- without it the built-in "
+                "global-mean CO2 table is written and labelled a fallback."
+            )
         return self
 
     @model_validator(mode="after")

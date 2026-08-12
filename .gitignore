@@ -9,7 +9,9 @@ dist/
 .ruff_cache/
 
 # Docs
-site/
+# mkdocs' build output, anchored to the repo root: an unanchored `site/` also
+# matches src/data4simplace/site/, silently excluding that package from git.
+/site/
 .ipynb_checkpoints/
 
 # Pipeline outputs
@@ -27,4 +29,4 @@ outputs_demo/
 
 # Notebook-generated figures, tables and NetCDF
 notebooks/outputs/
-evaluation/outputs/
+cropmodelling4eu/evaluation/outputs/

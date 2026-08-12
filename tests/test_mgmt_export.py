@@ -347,3 +347,126 @@ def test_export_writes_the_virr_column(tmp_path, mgmt_config, reference_dir, npk
     # The reference's own columns are preserved, in order, with vIRR appended.
     assert list(written.columns) == reference_columns + ["vIRR"]
     assert set(written["vIRR"].unique()) <= {0, 1}
+
+
+# --------------------------------------------------------------------------- #
+# Planting window columns
+# --------------------------------------------------------------------------- #
+def _site(config, start, end, sowing=None):
+    """A site dataset on the fixture's 2x2 grid, in the calendar's own fields."""
+    grid = TargetGrid.from_config(config.grid)
+    coords = {"lat": grid.lat_centers, "lon": grid.lon_centers}
+    dims = ("lat", "lon")
+    data = {
+        "sowing_start_doy": (dims, np.asarray(start, dtype="float64")),
+        "sowing_end_doy": (dims, np.asarray(end, dtype="float64")),
+    }
+    if sowing is not None:
+        data["sowing_doy"] = (dims, np.asarray(sowing, dtype="float64"))
+    return xr.Dataset(data, coords=coords)
+
+
+def _window(config, start, end, sowing=None):
+    from data4simplace.site import SowingWindow
+
+    return SowingWindow.from_site(_site(config, start, end, sowing), config)
+
+
+def test_the_window_repeats_the_cells_thresholds_across_its_events(
+    mgmt_config, reference_dir, npk_dataset
+):
+    config = mgmt_config()
+    exporter = ManagementExporter(config, reference_dir / "fertilizer_winter_wheat.csv")
+    window = _window(config, [[250, 260], [270, 280]], [[300, 300], [300, 300]])
+
+    frame = exporter.build_frame(npk_dataset, _cells(config), window=window)
+
+    per_cell = frame.groupby("location")[
+        ["vSowWindowStartDOY", "vSowWindowEndDOY"]
+    ].agg(["nunique", "first"])
+    assert (per_cell.xs("nunique", level=1, axis=1) == 1).all().all()
+    # Three of the fixture's four cells; the fourth has no NPKGRIDS rate and so
+    # is absent from the schedule entirely -- and therefore carries no window.
+    # A rule-based solution must keep a project-file fallback for those cells.
+    assert sorted(per_cell[("vSowWindowStartDOY", "first")]) == [250, 260, 270]
+    assert set(per_cell[("vSowWindowEndDOY", "first")]) == {300}
+
+
+def test_the_window_is_appended_after_virr_not_before_it(
+    tmp_path, mgmt_config, reference_dir, npk_dataset
+):
+    """SIMPLACE binds CSV columns by position, so the order is the contract."""
+    config = mgmt_config(simplace_crop="winter_wheat")
+    reference_columns = list(
+        pd.read_csv(reference_dir / "fertilizer_winter_wheat.csv").columns
+    )
+    exporter = ManagementExporter(config, reference_dir / "fertilizer_winter_wheat.csv")
+    out = exporter.export(
+        npk_dataset,
+        _cells(config),
+        tmp_path / "out",
+        irrigation=_classification(config, [[1, 0], [0, 1]]),
+        window=_window(config, [[250, 250], [250, 250]], [[300, 300], [300, 300]]),
+    )
+    assert list(pd.read_csv(out).columns) == reference_columns + [
+        "vIRR", "vSowWindowStartDOY", "vSowWindowEndDOY",
+    ]
+
+
+def test_without_a_window_the_schedule_is_unchanged(
+    mgmt_config, reference_dir, npk_dataset
+):
+    config = mgmt_config()
+    exporter = ManagementExporter(config, reference_dir / "fertilizer_winter_wheat.csv")
+    frame = exporter.build_frame(npk_dataset, _cells(config))
+    assert "vSowWindowStartDOY" not in frame.columns
+
+
+def test_the_window_column_names_are_configurable(
+    mgmt_config, reference_dir, npk_dataset
+):
+    config = mgmt_config()
+    config.site.window_start_column = "sow_from"
+    config.site.window_end_column = "sow_to"
+    exporter = ManagementExporter(config, reference_dir / "fertilizer_winter_wheat.csv")
+    frame = exporter.build_frame(
+        npk_dataset,
+        _cells(config),
+        window=_window(config, [[250, 250], [250, 250]], [[300, 300], [300, 300]]),
+    )
+    assert {"sow_from", "sow_to"} <= set(frame.columns)
+    assert "vSowWindowStartDOY" not in frame.columns
+
+
+def test_a_cell_without_a_published_window_is_centred_on_its_sowing_date(mgmt_config):
+    """A date but no window must still sow, and the fallback must be symmetric."""
+    config = mgmt_config()
+    window = _window(
+        config,
+        [[np.nan, np.nan], [np.nan, np.nan]],
+        [[np.nan, np.nan], [np.nan, np.nan]],
+        sowing=[[270, 270], [270, 270]],
+    )
+    start, end = window.columns(_cells(config))
+    half = config.site.window_min_days
+    assert set(start) == {270 - half} and set(end) == {270 + half}
+    assert window.n_from_product == 0
+
+
+def test_a_window_crossing_new_year_is_not_written_inverted(mgmt_config):
+    """`DOY >= start and DOY <= end` is false all year for an inverted pair."""
+    config = mgmt_config()
+    window = _window(config, [[330, 330], [330, 330]], [[20, 20], [20, 20]])
+    start, end = window.columns(_cells(config))
+    assert (start <= end).all()
+    assert (end <= 365).all()
+    # 330 -> 20 is a 55-day window; it keeps its length, moved off the year end.
+    assert set(end - start) == {55}
+
+
+def test_a_degenerate_window_is_widened_to_the_minimum(mgmt_config):
+    """A zero-length window turns a rule back into the fixed date it replaced."""
+    config = mgmt_config()
+    window = _window(config, [[250, 250], [250, 250]], [[250, 250], [250, 250]])
+    start, end = window.columns(_cells(config))
+    assert set(end - start) == {config.site.window_min_days}

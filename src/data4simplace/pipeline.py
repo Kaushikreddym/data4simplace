@@ -19,7 +19,10 @@ import xarray as xr
 from data4simplace.climate import MSWXHandler
 from data4simplace.config import PipelineConfig
 from data4simplace.exporters import (
+    LongManagementExporter,
+    LongSoilExporter,
     ManagementExporter,
+    SiteExporter,
     SoilExporter,
     TopSoilExporter,
     WeatherExporter,
@@ -27,6 +30,13 @@ from data4simplace.exporters import (
 from data4simplace.grid import TargetGrid
 from data4simplace.management import IrrigationClassification, IrrigationClassifier
 from data4simplace.npk import NPKHandler
+from data4simplace.site import (
+    SiteHandler,
+    SowingWindow,
+    fill_calendar_gaps,
+    load_co2_series,
+    write_co2_series,
+)
 from data4simplace.soil import SoilGridsHandler
 from data4simplace.soil.multiclass import PrimaryClassStatistics, TopClassAggregation
 from data4simplace.spatial import apply_cell_mask, export_cell_mask, keep_cells
@@ -41,6 +51,7 @@ class PipelineResult:
     climate: Optional[xr.Dataset] = None
     soil: Optional[xr.Dataset] = None
     hydraulic: Optional[xr.Dataset] = None
+    site: Optional[xr.Dataset] = None
     npk: Optional[xr.Dataset] = None
     irrigation: Optional[IrrigationClassification] = None
     soil_statistics: Optional["PrimaryClassStatistics"] = None
@@ -61,6 +72,17 @@ class Pipeline:
     def __init__(self, config: PipelineConfig) -> None:
         self._config = config
         self._grid = TargetGrid.from_config(config.grid)
+
+    def _simulated_years(self) -> list[int]:
+        """Calendar years the run's time window spans, for the CO2 series.
+
+        A winter crop is sown the year before it is harvested, so the window is
+        widened by one year at each end rather than cut to the weather record --
+        a season that straddles New Year needs the CO2 of both its years.
+        """
+        start = int(str(self._config.time.start)[:4])
+        end = int(str(self._config.time.end)[:4])
+        return list(range(start - 1, end + 2))
 
     def run(self) -> PipelineResult:
         """Execute all enabled stages and return the produced artifacts."""
@@ -88,6 +110,14 @@ class Pipeline:
                     "class field; no statistics written",
                     self._config.soil.dominant_mode,
                 )
+
+        if flags.run_site_processing:
+            logger.info(
+                "Stage: site processing (calendar=%s, dem=%s)",
+                self._config.site.calendar_source,
+                self._config.paths.dem_path,
+            )
+            result.site = SiteHandler(self._config).load()
 
         if flags.run_npk_processing:
             logger.info(
@@ -124,6 +154,13 @@ class Pipeline:
             result.soil = apply_cell_mask(result.soil, mask)
         if result.hydraulic is not None:
             result.hydraulic = apply_cell_mask(result.hydraulic, mask)
+        if result.site is not None:
+            # Filled before masking and bounded by the same mask: the search
+            # source is any covered cell, but the search target is only cells
+            # that will be exported, so no calendar is carried out to sea.
+            if self._config.site.fill_calendar_gaps:
+                result.site = fill_calendar_gaps(result.site, within=mask)
+            result.site = apply_cell_mask(result.site, mask)
         if result.npk is not None:
             result.npk = apply_cell_mask(result.npk, mask)
         if result.top_classes is not None:
@@ -163,12 +200,36 @@ class Pipeline:
             if result.soil is None:
                 logger.warning("export_simplace_soil set but no soil data; skipping")
             else:
-                exporter = SoilExporter(self._config, self._config.reference.soil_dir)
-                result.written.append(
-                    exporter.export(
-                        result.soil, result.cell_table, out_dir, hydraulic=result.hydraulic
+                export = self._config.export
+                if export.writes("soil", "wide"):
+                    result.written.append(
+                        SoilExporter(self._config, self._config.reference.soil_dir).export(
+                            result.soil, result.cell_table, out_dir,
+                            hydraulic=result.hydraulic,
+                        )
                     )
+                if export.writes("soil", "long"):
+                    result.written.append(
+                        LongSoilExporter(
+                            self._config, self._config.reference.soil_dir
+                        ).export(
+                            result.soil, result.cell_table, out_dir,
+                            hydraulic=result.hydraulic,
+                        )
+                    )
+
+        if flags.export_simplace_site:
+            if result.site is None:
+                logger.warning("export_simplace_site set but no site data; skipping")
+            else:
+                exporter = SiteExporter(self._config)
+                result.written.append(
+                    exporter.export(result.site, result.cell_table, out_dir)
                 )
+                series, source = load_co2_series(
+                    self._config.paths.co2_file, self._simulated_years()
+                )
+                result.written.append(write_co2_series(series, source, out_dir))
 
         if flags.export_top3_soil_csvs:
             if result.top_classes is None:
@@ -204,17 +265,38 @@ class Pipeline:
             if result.npk is None:
                 logger.warning("export_simplace_management set but no NPK data; skipping")
             else:
-                exporter = ManagementExporter(
-                    self._config, self._config.reference.management_file
+                export = self._config.export
+                reference = self._config.reference.management_file
+                # The window is what a rule-based solution reads instead of a
+                # sowing date; without the site stage there is no calendar to
+                # derive one from and the solution keeps its own default.
+                window = (
+                    SowingWindow.from_site(result.site, self._config)
+                    if result.site is not None
+                    and self._config.site.write_management_window
+                    else None
                 )
-                result.written.append(
-                    exporter.export(
-                        result.npk,
-                        result.cell_table,
-                        out_dir,
-                        irrigation=result.irrigation,
+                if window is None and self._config.site.write_management_window:
+                    logger.warning(
+                        "site.write_management_window is set but the site stage "
+                        "did not run, so the schedule carries no planting "
+                        "window and a rule-based solution will sow every cell "
+                        "in the same window"
                     )
-                )
+                for layout, cls in (
+                    ("wide", ManagementExporter),
+                    ("long", LongManagementExporter),
+                ):
+                    if export.writes("management", layout):
+                        result.written.append(
+                            cls(self._config, reference).export(
+                                result.npk,
+                                result.cell_table,
+                                out_dir,
+                                irrigation=result.irrigation,
+                                window=window,
+                            )
+                        )
 
         logger.info("Pipeline complete: %d output file(s)", len(result.written))
         return result

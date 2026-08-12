@@ -1,0 +1,107 @@
+# =============================================================================
+# cropmodelling4eu — run configuration
+# =============================================================================
+# One config drives both models, because the parts they share — which export,
+# which cells, which seasons — are the parts that decide whether their results
+# are comparable. Validated by cropmodelling4eu.config.RunConfig (pydantic).
+# =============================================================================
+
+run_name: winter_wheat_2000_2024
+
+paths:
+  # A finished data4simplace export: weather/, soil/, site/, management/.
+  export_dir: "/data01/FDS/muduchuru/Data/SIMPLACE/europe_torchcrop"
+  # This package's own outputs; each run gets <output_dir>/<run_name>/.
+  output_dir: "/data01/FDS/muduchuru/Data/SIMPLACE/cropmodelling4eu"
+  # fertilizer_composition.xml — not part of the export, it lives next to the
+  # SIMPLACE reference the exporter was built from. Needed to read a wide
+  # schedule's product amounts as nutrients; a long schedule needs none.
+  composition_file: "/beegfs/muduchuru/simplace/Brandenburg_1KM_winter_wheat/data/management/fertilizer_composition.xml"
+
+# --- The export's target grid, which defines SimplaceID ----------------------
+# Ids are 1-based, row-major from the NW corner, so decoding one into a lon/lat
+# needs exactly the bounds the export was written with. Prefer
+# RunConfig.from_export(), which reads these back out of the export's own
+# _work/config_run.yaml so a run cannot decode against the wrong grid.
+grid:
+  resolution_deg: 0.1
+  min_lon: -17.0
+  max_lon: 52.0
+  min_lat: 34.0
+  max_lat: 72.0
+
+# --- Which harvest years to simulate -----------------------------------------
+# A harvest year names the season, not the calendar year the crop grows in: a
+# winter crop sown in September of Y-1 is harvested in Y, so the earliest
+# runnable year is one past the weather record's first (1979 -> 1980).
+season:
+  start_year: 2000
+  end_year: 2024
+  crop: wheat
+
+# --- torchcrop (differentiable LINTUL-5) -------------------------------------
+torchcrop:
+  # 1 potential | 2 water-limited | 3 water+N | 4 water+NPK.
+  # 3 is the default because no European soil P or K layer exists — iopt=4
+  # would run on torchcrop's built-in defaults, not on data.
+  iopt: 3
+  # Cells per model call. LINTUL-5 loops over days in Python, so per-cell cost
+  # collapses as the batch grows: measured 40 ms/cell-year at 128, 9.4 at 1024,
+  # 5.2 at 2048. The ceiling is memory (ModelOutput retains every per-day
+  # state), not the cell count; 2048 peaks at ~1.7 GB.
+  batch_size: 2048
+  # Weather reads are gzip-bound and release the GIL, so threads scale.
+  io_workers: 16
+  # The model works on [B]-shaped tensors — too small to repay many intra-op
+  # threads. The cores are better spent on io_workers.
+  torch_threads: 4
+  device: cpu
+  rootzone_m: 1.0
+  profile_bottom_m: 2.0
+  spinup_months: 6
+  min_days_after_sowing: 365
+
+# --- SIMPLACE (Singularity) ---------------------------------------------------
+simplace:
+  # A working SIMPLACE project: its solution/, project/ and data/. The XML is
+  # rewritten into the run workspace, never edited in place.
+  template_dir: "/data01/FDS/muduchuru/codes/SIMPLACE/Brandenburg_1KM_winter_wheat"
+  # Named explicitly: the folder holds more than one *.sol.xml, and a build that
+  # picked one silently would run the wrong science.
+  #
+  # These two are this repo's copies, not the template's own. They are the
+  # template's solution and project with the EU SUSTAg v2 sowing rules in place
+  # of its fixed vIDPL=250, and the two window columns added to the project
+  # header so the rules read the cell's own planting window. The template dir is
+  # still the Brandenburg project: everything else -- crop, soil, C/N, the
+  # linked data/ tree -- comes from there unchanged.
+  #
+  # To reproduce the constant-sowing-date runs, point both back at
+  # "solution/solution.sol.xml" and "project/project.proj.xml".
+  solution_file: "/data01/FDS/muduchuru/codes/GITHUB/data4simplace/cropmodelling4eu/templates/brandenburg/solution/brandenburg_rulesow.sol.xml"
+  project_file: "/data01/FDS/muduchuru/codes/GITHUB/data4simplace/cropmodelling4eu/templates/brandenburg/project/brandenburg_rulesow.proj.xml"
+  singularity_image: "/beegfs/common/singularity/simplace/simplace_5.0-3897.sif"
+  start_date: "1979-01-01"
+  end_date: "2024-12-31"
+  iopt: 3
+
+  # WHICH UNITS THE SOLUTION READS. Leaving this null is not a neutral default:
+  # the export writes radiation in W/m2 where this solution declares kJ/m2/d, so
+  # an unreconciled run completes normally and yields ~0.04 t/ha instead of ~7.
+  weather_contract: brandenburg
+  # `transform` scales the column inside the solution's own SQL transformer and
+  # leaves the weather symlinked; `files` writes converted copies (~15 GB for
+  # Europe, ~1.5 h). Verified identical to 6 dp on 52 cell-years -- see
+  # SIMPLACE.md.
+  weather_conversion: transform
+  io_workers: 32
+  # Lines of the project CSV per array task — the SIMPLACE sharding axis
+  # (`simplace run -l=START-END`).
+  #
+  # Measured, not guessed: a cell costs ~72 s over this 1979-2024 window (5 German
+  # cells in 6 m 26 s), so 500 is a ~10 h task under a 12 h wall clock, and 68 685
+  # cells become 138 tasks. Oversizing it is the one thing the generated run
+  # scripts handle badly — a task the scheduler kills leaves no completion stamp,
+  # so `submit.sh --retry` restarts that range from its first line and it never
+  # finishes. Shorten the window and this can grow proportionally.
+  lines_per_task: 500

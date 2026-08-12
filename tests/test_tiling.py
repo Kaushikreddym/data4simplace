@@ -145,9 +145,12 @@ def test_weather_export_uses_global_identity(tmp_path):
         "grow": [5, 5], "gcol": [5, 6], "lat": [0.55, 0.55], "lon": [0.55, 0.65],
     })
     WeatherExporter(cfg, None).export(climate, ct, tmp_path)
-    names = {p.name for p in (tmp_path / "weather").glob("*.csv.gz")}
-    assert names == {"daily_mean_RES1_C5R5.csv.gz", "daily_mean_RES1_C6R5.csv.gz"}
-    df = pd.read_csv(tmp_path / "weather" / "daily_mean_RES1_C5R5.csv.gz", sep="\t")
+    # Nested one directory per *global* grid row, which is what the solution's
+    # ${vRow} filename pattern reads.
+    written = {p.relative_to(tmp_path / "weather").as_posix()
+               for p in (tmp_path / "weather").rglob("*.csv.gz")}
+    assert written == {"5/daily_mean_RES1_C5R5.csv.gz", "5/daily_mean_RES1_C6R5.csv.gz"}
+    df = pd.read_csv(tmp_path / "weather" / "5" / "daily_mean_RES1_C5R5.csv.gz", sep="\t")
     assert df["Gridcell"].iloc[0] == "C_5:R_5"
 
 
@@ -179,7 +182,8 @@ def test_tiled_weather_matches_single_run(tmp_path):
         tile_deg=0.2)
 
     def load(d):
-        return {p.name: pd.read_csv(p, sep="\t") for p in (d / "weather").glob("*.csv.gz")}
+        return {p.name: pd.read_csv(p, sep="\t")
+                for p in (d / "weather").rglob("*.csv.gz")}
 
     s, t = load(single_dir), load(tiled_dir)
     assert set(s) == set(t) and len(s) > 1  # same files, actually tiled (>1 tile)
