@@ -69,13 +69,33 @@ yield the export does not describe. Site is deliberately *not* in the
 intersection: a cell missing from `site.csv` takes the documented fallback
 rather than dropping out.
 
-## Running torchcrop
+## Running both models
+
+```bash
+# Chained: SIMPLACE first, torchcrop on its simulated sowing dates
+./submit/submit_cropmodelling.sh --dry-run    # print the plan, submit nothing
+./submit/submit_cropmodelling.sh              # simplace array -> handoff -> torchcrop
+./submit/submit_cropmodelling.sh --status     # what each of the three stages has finished
+./submit/submit_cropmodelling.sh --retry      # re-run what failed, in order
+./submit/submit_cropmodelling.sh --smoke      # 30 German cells, both models here
+```
+
+Chaining matters because SIMPLACE's sowing date is a *result*: the rule-based
+solution sows on the first day inside the planting window on which a weather
+rule fires. torchcrop latches one day-of-year, so run alone it takes the
+export's proposed date and the two models grow different seasons. On the smoke
+cells the handoff moves torchcrop's sowing from DOY 290 to SIMPLACE's 273-289,
+which is the difference between comparing two models and comparing two
+calendars.
+
+## Running torchcrop alone
 
 ```bash
 ./submit/submit_torchcrop.sh --dry-run    # show the plan, submit nothing
 ./submit/submit_torchcrop.sh              # shard array + combine + maps
 ./submit/torchcrop_status.sh              # progress, queue, failed shards
 ./submit/submit_torchcrop.sh --retry      # resubmit only the missing shards
+./submit/submit_torchcrop.sh --smoke      # 30 German cells here, then evaluate
 ```
 
 See [TORCHCROP.md](TORCHCROP.md) for the sharding, batching and I/O design, and
@@ -113,10 +133,12 @@ kJ m⁻² d⁻¹, which costs a factor of ~77 and is not yet fixed.
 
 A 30-cell Germany smoke test runs both models over the same cells and
 compares them with CyBench yields and PEP725 phenology — see
-[VALIDATION.md](VALIDATION.md). Headline: SIMPLACE is unbiased against the
-national statistics (−0.12 t/ha) and predicts heading and harvest to within
-a day; torchcrop's published configuration yields 3.6x low, which the port
-reproduces bit-for-bit and therefore did not cause.
+[VALIDATION.md](VALIDATION.md). Headline: SIMPLACE is close to unbiased against
+the national statistics (−0.53 t/ha on the 2026-08-13 re-run); torchcrop's
+published configuration yields low, which the port reproduces bit-for-bit and
+therefore did not cause. SIMPLACE's heading and harvest dates were unbiased to
+within a day on the previous export and are ~20 d late on the current one —
+see the note at the top of VALIDATION.md before quoting either.
 
 ## Layout
 

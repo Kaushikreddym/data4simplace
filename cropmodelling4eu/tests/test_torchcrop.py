@@ -20,7 +20,9 @@ from cropmodelling4eu.torchcrop.run import (  # noqa: E402
     build_soil_params,
     fertilizer_from_dvs,
     group_by_sowing,
+    run_cells,
     run_shard,
+    sowing_plan,
 )
 
 from .conftest import TEST_CELLS  # noqa: E402
@@ -57,6 +59,29 @@ def test_shard_groups_match_the_site_table(run_config):
     ids = bundle.ids
     groups = group_by_sowing(ids, bundle.site.sowing_doy(ids))
     assert sorted(groups) == [280, 295]
+
+
+def test_sowing_table_groups_by_year_not_by_doy():
+    """A simulated-sowing table must not fragment a year by per-cell date --
+    that fragmentation (one batch per (year, doy)) is exactly the slowdown
+    this grouping is meant to avoid."""
+    ids = np.array([1, 2, 3, 4])
+    sowing = pd.DataFrame(
+        {
+            "SimplaceID": [1, 2, 3, 4, 1, 2, 3, 4],
+            "year": [2000, 2000, 2000, 2000, 2001, 2001, 2001, 2001],
+            # Every cell disagrees with every other -- four groups under the
+            # old (year, doy) grouping, one under the new (year) grouping.
+            "sowing_doy": [270, 275, 280, 285, 268, 271, 279, 290],
+        }
+    )
+    plan = sowing_plan(ids, [2000, 2001], np.full(4, 270), sowing)
+
+    assert len(plan) == 2
+    for years, group, doy in plan:
+        assert len(years) == 1
+        assert sorted(group.tolist()) == [1, 2, 3, 4]
+        assert doy.size == 4
 
 
 # --------------------------------------------------------------------------- #
@@ -183,3 +208,99 @@ def test_shard_is_idempotent(tmp_path, run_config):
     mtime = first.stat().st_mtime_ns
     again = run_shard(run_config, shard=0, n_shards=1, out_dir=tmp_path)
     assert again == first and again.stat().st_mtime_ns == mtime
+
+
+@pytest.mark.slow
+def test_run_shard_daily_writes_a_matching_trajectory_file(tmp_path, run_config):
+    """--daily writes a second Parquet beside the summary, same cells and
+    seasons, one row per (cell, day, variable) for exactly the requested set."""
+    out = run_shard(run_config, shard=0, n_shards=1, out_dir=tmp_path, daily=True)
+    daily_path = tmp_path / "torchcrop_daily_shard_000.parquet"
+    assert daily_path.is_file()
+
+    summary = pd.read_parquet(out)
+    daily = pd.read_parquet(daily_path)
+    assert set(daily["variable"].unique()) == {"LAI", "AGB", "NNI", "TRANRF"}
+    assert set(daily["SimplaceID"]) <= set(summary["SimplaceID"])
+    assert set(daily["year"]) <= set(summary["year"])
+    assert daily["value"].notna().all()
+
+
+@pytest.mark.slow
+def test_run_shard_daily_is_idempotent_with_the_summary(tmp_path, run_config):
+    """A shard already done (both files present) is not re-run even with
+    --daily; a summary-only shard from an earlier run is topped up rather
+    than silently treated as complete."""
+    run_shard(run_config, shard=0, n_shards=1, out_dir=tmp_path)
+    daily_path = tmp_path / "torchcrop_daily_shard_000.parquet"
+    assert not daily_path.exists()
+
+    run_shard(run_config, shard=0, n_shards=1, out_dir=tmp_path, daily=True)
+    assert daily_path.is_file()
+
+
+@pytest.mark.slow
+def test_run_cells_both_matches_separate_summary_and_daily_calls(run_config):
+    """mode="both" shares one _simulate call per batch (see run_shard's own
+    daily=True path) -- it must still reproduce exactly what mode="summary"
+    and mode="daily" give when run separately, the two-pass smoke test used
+    before run_cells_torchcrop.py --daily-out existed."""
+    ids = np.array(TEST_CELLS)
+
+    summary, daily = run_cells(run_config, ids, [2000], mode="both")
+    summary_only = run_cells(run_config, ids, [2000], mode="summary")
+    daily_only = run_cells(run_config, ids, [2000], mode="daily")
+
+    pd.testing.assert_frame_equal(
+        summary.sort_values("SimplaceID").reset_index(drop=True),
+        summary_only.sort_values("SimplaceID").reset_index(drop=True),
+    )
+    pd.testing.assert_frame_equal(
+        daily.sort_values(["SimplaceID", "date", "variable"]).reset_index(drop=True),
+        daily_only.sort_values(["SimplaceID", "date", "variable"]).reset_index(drop=True),
+    )
+
+
+@pytest.mark.slow
+def test_merged_sowing_batch_matches_singleton_runs(run_config):
+    """Cells sowing on different simulated dates in the same year now share a
+    batch (see sowing_plan): each must still latch on its *own* idpl inside
+    the shared, earliest-anchored window and reproduce exactly what running
+    it alone -- one cell, its own window -- would give. This is the
+    correctness check for widening batches beyond a single sowing date."""
+    ids = np.array(TEST_CELLS)
+    sowing = pd.DataFrame(
+        {"SimplaceID": ids, "year": 2000, "sowing_doy": [270, 278, 288, 296]}
+    )
+
+    merged = run_cells(run_config, ids, [2000], sowing=sowing)
+    singles = pd.concat(
+        [
+            run_cells(run_config, np.array([sid]), [2000], sowing=sowing)
+            for sid in ids
+        ],
+        ignore_index=True,
+    )
+
+    merged = merged.sort_values("SimplaceID").reset_index(drop=True)
+    singles = singles.sort_values("SimplaceID").reset_index(drop=True)
+    assert merged["SimplaceID"].tolist() == singles["SimplaceID"].tolist()
+    # sowing_doy/days_to_maturity/max_lai are exact -- integers or a single
+    # forward-Euler max, with no cross-cell reduction to reorder. The
+    # continuous stress means (tranrf_mean, nni_mean) accumulate over ~200
+    # daily steps, so a batch-of-4 vs. batch-of-1 op can round differently in
+    # float32; a real windowing/idpl bug would show up as a wrong sowing day
+    # or a several-percent yield/stress shift, not float32 noise, so a loose
+    # tolerance still catches it.
+    for column in ("sowing_doy", "days_to_maturity", "max_lai"):
+        np.testing.assert_allclose(
+            merged[column].to_numpy(dtype=float),
+            singles[column].to_numpy(dtype=float),
+            rtol=1e-5, atol=1e-6, err_msg=column,
+        )
+    for column in ("yield_g_m2", "tranrf_mean", "nni_mean"):
+        np.testing.assert_allclose(
+            merged[column].to_numpy(dtype=float),
+            singles[column].to_numpy(dtype=float),
+            rtol=1e-3, atol=1e-4, err_msg=column,
+        )

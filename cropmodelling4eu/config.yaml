@@ -10,7 +10,7 @@ run_name: winter_wheat_2000_2024
 
 paths:
   # A finished data4simplace export: weather/, soil/, site/, management/.
-  export_dir: "/data01/FDS/muduchuru/Data/SIMPLACE/europe_torchcrop"
+  export_dir: "/data01/FDS/muduchuru/Data/SIMPLACE/EU"
   # This package's own outputs; each run gets <output_dir>/<run_name>/.
   output_dir: "/data01/FDS/muduchuru/Data/SIMPLACE/cropmodelling4eu"
   # fertilizer_composition.xml — not part of the export, it lives next to the
@@ -36,7 +36,7 @@ grid:
 # runnable year is one past the weather record's first (1979 -> 1980).
 season:
   start_year: 2000
-  end_year: 2024
+  end_year: 2002
   crop: wheat
 
 # --- torchcrop (differentiable LINTUL-5) -------------------------------------
@@ -44,7 +44,7 @@ torchcrop:
   # 1 potential | 2 water-limited | 3 water+N | 4 water+NPK.
   # 3 is the default because no European soil P or K layer exists — iopt=4
   # would run on torchcrop's built-in defaults, not on data.
-  iopt: 3
+  iopt: 1
   # Cells per model call. LINTUL-5 loops over days in Python, so per-cell cost
   # collapses as the batch grows: measured 40 ms/cell-year at 128, 9.4 at 1024,
   # 5.2 at 2048. The ceiling is memory (ModelOutput retains every per-day
@@ -58,7 +58,7 @@ torchcrop:
   device: cpu
   rootzone_m: 1.0
   profile_bottom_m: 2.0
-  spinup_months: 6
+  spinup_months: 0
   min_days_after_sowing: 365
 
 # --- SIMPLACE (Singularity) ---------------------------------------------------
@@ -83,7 +83,7 @@ simplace:
   singularity_image: "/beegfs/common/singularity/simplace/simplace_5.0-3897.sif"
   start_date: "1979-01-01"
   end_date: "2024-12-31"
-  iopt: 3
+  iopt: 1
 
   # WHICH UNITS THE SOLUTION READS. Leaving this null is not a neutral default:
   # the export writes radiation in W/m2 where this solution declares kJ/m2/d, so

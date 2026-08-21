@@ -17,6 +17,8 @@ here. Two compare against **CyBench** at country level
 :mod:`aggregate`   Weighted (and circular) aggregation to country level
 :mod:`grid`        Binning the 10 km run onto a 0.5° reference grid
 :mod:`metrics`     RMSE, MAE, Bias, MAPE, R², Pearson r — linear and circular
+:mod:`germany`     The Germany smoke test: both models against CyBench/PEP725
+:mod:`stresstest`  SIMPLACE against torchcrop with every input matched
 :mod:`plots`       Publication figures and styled tables
 :mod:`style`       One palette, one set of mark specs, two modes
 =================  ==========================================================
@@ -36,6 +38,7 @@ from . import (
     plots,
     regions,
     sage,
+    stresstest,
     style,
     torchcrop,
 )
@@ -46,11 +49,13 @@ __all__ = [
     "cybench",
     "doy",
     "gdhy",
+    "germany",
     "grid",
     "metrics",
     "plots",
     "regions",
     "sage",
+    "stresstest",
     "style",
     "torchcrop",
 ]

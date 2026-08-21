@@ -139,6 +139,30 @@ class SolutionDocument:
             )
         return changed
 
+    def set_input_source(self, input_id: str, source: str) -> int:
+        """Repoint every ``<input id=input_id>``'s ``source`` in place.
+
+        Unlike :meth:`set_variables`, this rewires a component's wiring
+        rather than a value — e.g. switching ``iTRANRF`` from
+        ``LintulWaterStress.TRANRF`` (computed) to a constant ``<var>`` such
+        as ``vTRANRF`` for a potential-production run, matching the
+        already-present but disabled alternative some solutions ship
+        (``<!--input id="iTRANRF" source="vTRANRF" /-->``). Returns the
+        number of ``<input>`` elements changed.
+        """
+        elements = self.root.findall(f".//input[@id='{input_id}']")
+        if not elements:
+            logger.warning(
+                "Solution %s has no <input id=%r> to repoint at %r",
+                self.path.name, input_id, source,
+            )
+        changed = 0
+        for element in elements:
+            if element.get("source") != source:
+                element.set("source", source)
+                changed += 1
+        return changed
+
     def scale_transform(self, transform_id: str, factors: dict[str, float]) -> str:
         """Multiply columns by a constant inside a transform's SQL statement.
 

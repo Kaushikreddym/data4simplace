@@ -5,14 +5,28 @@ NUTS-3 regions), winter wheat, harvest years 2000–2010. Both models run the
 **same cells** from the same export, so they differ only in the model.
 
 ```bash
-python scripts/select_german_cells.py --config run.yaml --n-cells 30 --out cells.csv
-python scripts/run_cells_torchcrop.py --config run.yaml --cells cells.csv --out tc.parquet
-python scripts/run_cells_simplace.py  --config run.yaml --cells cells.csv --out sp.parquet
+./submit/submit_simplace.sh  --smoke          # cells, config, SIMPLACE run, collect
+./submit/submit_torchcrop.sh --smoke          # the same cells through torchcrop
 python scripts/validate_germany.py --cells cells.csv --torchcrop tc.parquet \
     --simplace sp.parquet --out-dir validation/
 ```
 
+Both `--smoke` flags derive one config and share one cell list, so the models
+cannot drift onto different cells or seasons. The steps they wrap
+(`select_german_cells.py`, `run_cells_torchcrop.py`, `run_cells_simplace.py`)
+are still there to be run individually.
+
 Artefacts: `/data01/FDS/muduchuru/Data/SIMPLACE/cropmodelling4eu/de_smoke/`.
+
+> **The tables below predate the 2026-08-13 re-run on the `SIMPLACE/EU` export**
+> (the `europe_torchcrop` export they were produced from no longer exists). On
+> the new export, which supplies a real per-cell SAGE sowing calendar in place
+> of the DOY 270 fallback, the same 30 cells and seasons give:
+> torchcrop 3.22 t/ha (bias −3.93, was −5.17) and SIMPLACE 6.63 t/ha
+> (bias −0.53, was −0.12); SIMPLACE's heading and harvest, unbiased to within a
+> day before, are now **+21.8 d and +19.3 d late** while torchcrop's soft dough
+> improved to −2.8 d. The phenology shift is unexplained and is the first thing
+> to look at before quoting either table.
 
 ## Yield vs CyBench (NUTS-3 statistics, t/ha)
 

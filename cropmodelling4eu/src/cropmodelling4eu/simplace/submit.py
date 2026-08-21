@@ -172,6 +172,12 @@ export SP_CPUS="${{SP_CPUS:-{resources.cpus}}}"
 export SP_MEM="${{SP_MEM:-{resources.memory}}}"
 export SP_TIME="${{SP_TIME:-{resources.time_limit}}}"
 export SP_MAX_CONCURRENT="${{SP_MAX_CONCURRENT:-{resources.max_concurrent}}}"
+# SIMPLACE's own `-l=START-END` runs in one thread of one JVM, so SP_CPUS alone
+# buys nothing past the first core. run_task.sh fans a task's own line range
+# across this many concurrent singularity/JVM invocations instead -- the same
+# pattern SP_MAX_CONCURRENT already uses across array tasks, just within one.
+# 1 (default) is unchanged behaviour: one JVM per task.
+export SP_CORES_PER_TASK="${{SP_CORES_PER_TASK:-1}}"
 
 # --- Derived ------------------------------------------------------------------
 export SP_N_TASKS=$(( (SP_N_LINES + SP_LINES_PER_TASK - 1) / SP_LINES_PER_TASK ))
@@ -309,20 +315,48 @@ STAMP="${SP_STATE_DIR}/task_${FIRST}-${LAST}.done"
 # standing, or --retry would consider the range finished.
 rm -f "${STAMP}"
 
-CMD=(singularity run -B "${SP_BINDS}" "${SP_IMAGE}"
-     /simplace/simplace run
-     "-s=${SP_SOLUTION}" "-p=${SP_PROJECT}" "-o=${SP_CONTAINER_OUT}"
-     -t=CLUSTER "-l=${FIRST}-${LAST}")
-[ "${DEBUG}" -eq 0 ] && CMD+=("-loglevel=${SP_LOGLEVEL}")
+# SIMPLACE's own `-l=START-END` is one thread in one JVM, so a single
+# invocation never touches more than one of the task's --cpus-per-task cores.
+# SP_CORES_PER_TASK (default 1, unchanged behaviour) splits FIRST-LAST into
+# that many contiguous sub-ranges and runs one singularity/JVM per sub-range
+# concurrently against the same SP_OUT_DIR/SP_LOG_DIR -- exactly what
+# SP_MAX_CONCURRENT already does across array tasks, just within one.
+N_WORKERS="${SP_CORES_PER_TASK:-1}"
+case "${N_WORKERS}" in ''|*[!0-9]*) N_WORKERS=1 ;; esac
+[ "${N_WORKERS}" -lt 1 ] && N_WORKERS=1
+TOTAL=$(( LAST - FIRST + 1 ))
+CHUNK=$(( (TOTAL + N_WORKERS - 1) / N_WORKERS ))
 
 echo "=================================================="
-echo "SIMPLACE ${SP_RUN_NAME}  lines ${FIRST}-${LAST}"
+echo "SIMPLACE ${SP_RUN_NAME}  lines ${FIRST}-${LAST}  (${N_WORKERS} worker(s))"
 echo "  node    : $(hostname)"
 echo "  job     : ${SLURM_JOB_ID:-none} ${SLURM_ARRAY_TASK_ID:+(task ${SLURM_ARRAY_TASK_ID})}"
 echo "  root    : ${SP_ROOT}"
 echo "  started : $(date -Is)"
 echo "=================================================="
-printf '%q ' "${CMD[@]}"; echo
+
+PIDS=()
+RANGES=()
+cursor="${FIRST}"
+while [ "${cursor}" -le "${LAST}" ]; do
+    w_first="${cursor}"
+    w_last=$(( w_first + CHUNK - 1 ))
+    [ "${w_last}" -gt "${LAST}" ] && w_last="${LAST}"
+    cursor=$(( w_last + 1 ))
+
+    WCMD=(singularity run -B "${SP_BINDS}" "${SP_IMAGE}"
+          /simplace/simplace run
+          "-s=${SP_SOLUTION}" "-p=${SP_PROJECT}" "-o=${SP_CONTAINER_OUT}"
+          -t=CLUSTER "-l=${w_first}-${w_last}")
+    [ "${DEBUG}" -eq 0 ] && WCMD+=("-loglevel=${SP_LOGLEVEL}")
+    printf '%q ' "${WCMD[@]}"; echo
+
+    [ "${DRY_RUN}" -eq 1 ] && continue
+
+    "${WCMD[@]}" > "${SP_LOG_DIR}/lines_${w_first}-${w_last}.out" 2>&1 &
+    PIDS+=($!)
+    RANGES+=("${w_first}-${w_last}")
+done
 
 if [ "${DRY_RUN}" -eq 1 ]; then
     echo "--dry-run: nothing executed."
@@ -330,16 +364,21 @@ if [ "${DRY_RUN}" -eq 1 ]; then
 fi
 
 START_S=$(date +%s)
-"${CMD[@]}"
-STATUS=$?
+STATUS=0
+FAILED=()
+for i in "${!PIDS[@]}"; do
+    wait "${PIDS[$i]}" || { STATUS=1; FAILED+=("${RANGES[$i]}"); }
+done
 ELAPSED=$(( $(date +%s) - START_S ))
 
 if [ ${STATUS} -eq 0 ]; then
     date -Is > "${STAMP}"
     echo "OK   lines ${FIRST}-${LAST} in $((ELAPSED / 60))m$((ELAPSED % 60))s"
 else
-    # No stamp, so the range stays in --retry's set.
-    echo "FAIL lines ${FIRST}-${LAST} exited ${STATUS} after $((ELAPSED / 60))m" >&2
+    # No stamp, so the range stays in --retry's set. Per-worker output is
+    # under SP_LOG_DIR/lines_<sub-range>.out.
+    echo "FAIL lines ${FIRST}-${LAST}: sub-range(s) ${FAILED[*]} exited nonzero" \
+         "after $((ELAPSED / 60))m; see ${SP_LOG_DIR}/lines_*.out" >&2
 fi
 exit ${STATUS}
 """
@@ -503,7 +542,8 @@ if [ -n "${MAX_ARRAY}" ] && [ "${SP_N_TASKS}" -gt "${MAX_ARRAY}" ]; then
 fi
 
 echo "  array        : ${ARRAY}%${SP_MAX_CONCURRENT}"
-echo "  resources    : ${SP_PARTITION}, ${SP_CPUS} cpus, ${SP_MEM}, ${SP_TIME}"
+echo "  resources    : ${SP_PARTITION}, ${SP_CPUS} cpus, ${SP_MEM}, ${SP_TIME}," \
+     "${SP_CORES_PER_TASK} core(s)/task"
 
 if [ "${DRY_RUN}" -eq 1 ]; then
     echo "--dry-run: nothing submitted."

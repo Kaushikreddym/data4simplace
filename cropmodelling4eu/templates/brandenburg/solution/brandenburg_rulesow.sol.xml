@@ -893,6 +893,18 @@
 				<mgm id="DoSow" datatype="BOOLEAN" default="false" rule="true"/>
 				 <mgm id="Crop" datatype="CHAR" unit="-" rule="${vCultivarGroup}" />
 			</action>
+			<!-- True on the simulation's own first day only, since neither
+			     DefaultManagement.DoInitialize nor HarvestManagement.DoInitialize
+			     (below and elsewhere in this solution) is actually defined by an
+			     active action, so every consumer wired to one of those had to fall
+			     back to DefaultManagement.DoSow instead. DoSow fires every sowing
+			     (annually), which is correct for Phenology but wrong for a
+			     continuous soil pool: SoilCNP re-added its initial C/N/P stock at
+			     every sowing, diverging about 15x over a 6-year run (see
+			     CheckResult.csv). This fires exactly once. -->
+			<action rule="${CURRENT.DATE} eq ${startdate}">
+				<mgm id="DoInitializeOnce" datatype="BOOLEAN" default="false" rule="true"/>
+			</action>
 			<!--<action rule="${spinupreset}">-->
 				<!--<mgm id="EventNr" datatype="INT" mode="RESET" default="1"/>-->
 			<!--</action>-->
@@ -1151,7 +1163,8 @@
 		<!-- #################################################################################################### -->
 		<simcomponent id="SlimWater" class="net.simplace.sim.components.soil.slim.SlimWater">
 <!-- 			<input id="iDoInitialize" source="HarvestManagement.DoInitialize"/> -->
-			<input id="iDoInitialize" source="DefaultManagement.DoSow"/>
+<!-- 			<input id="iDoInitialize" source="DefaultManagement.DoSow"/> -->
+			<input id="iDoInitialize" source="DefaultManagement.DoInitializeOnce"/>
 			<input id="cALFA" source="soil_transform.slimalfa"/>
 			<input id="cCalculateRunoffWater" source="slim.CalculateRunoffWater"/>
 			<input id="cDP" source="slim.DP"/>
@@ -1187,14 +1200,24 @@
 			<input id="iWithCrop" source="Phenology.WithCrop"/>
 		</simcomponent>
 		<!-- #################################################################################################### -->
-		<simcomponent id="LintulWaterStress" class="net.simplace.sim.components.models.lintul.LintulWaterStress">
+		<simcomponent id="LintulWaterStress" class="net.simplace.sim.components.models.lintul5.modular.WaterStress">
+			<!-- Was net.simplace.sim.components.models.lintul.LintulWaterStress, which
+			     has no cIOPT input at all and always computes TRANRF from the
+			     actual/potential transpiration ratio, so vIOPT=1 (potential run)
+			     never forced TRANRF=1. This component checks cIOPT<=1 and pins
+			     TRANRF to 1 in that case, matching what an IOPT=1 run is supposed
+			     to mean. -->
+			<input id="cIOPT" source="vIOPT"/>
+			<input id="iDoSow" source="DefaultManagement.DoSow"/>
+			<input id="iDoHarvest" source="HarvestManagement.DoHarvest"/>
 			<input id="iPotentialTranspiration" source="SlimWater.PotentialTranspiration"/>
 			<input id="iActualTranspiration" source="SlimWater.ActualTranspiration"/>
 		</simcomponent>
 		<!-- #################################################################################################### -->
 		<simcomponent id="NPKDemandSlimNP" class="net.simplace.sim.components.experimental.slim.NPKDemandSlimNP">
 <!-- 			<input id="iDoInitialize" source="HarvestManagement.DoInitialize"/> -->
-			<input id="iDoInitialize" source="DefaultManagement.DoSow"/>
+<!-- 			<input id="iDoInitialize" source="DefaultManagement.DoSow"/> -->
+			<input id="iDoInitialize" source="DefaultManagement.DoInitializeOnce"/>
 			<input id="cDVSI" source="crop.DVSI"/>
 			<input id="cTDWI" source="crop.TDWI"/>
 			
@@ -1492,7 +1515,8 @@
 		<!-- #################################################################################################### -->
 		<simcomponent id="SoilCNP" class="net.simplace.sim.components.soil.soilcn.SoilCNP">
 <!-- 			<input id="iDoInitialize" source="HarvestManagement.DoInitialize"/> -->
-			<input id="iDoInitialize" source="DefaultManagement.DoSow"/>
+<!-- 			<input id="iDoInitialize" source="DefaultManagement.DoSow"/> -->
+			<input id="iDoInitialize" source="DefaultManagement.DoInitializeOnce"/>
 			<input id="cLignfct" source="carbon_transform.Lignfct"/>
 			<input id="cBrabove" source="carbon_transform.Brabove"/>
 			<input id="cFmicrolab" source="carbon_transform.Fmicrolab"/>
@@ -1674,6 +1698,23 @@
 				<out id="STATE_ID" rule="vSTATE_ID" description="current model date" datatype="CHAR" unit="-"/>
 				<out id="DevStage" rule="Phenology.sDVS" description="development stage of crop (from 0 to 2)" datatype="DOUBLE" unit="http://www.wurvoc.org/vocabularies/om-1.8/one" format="%.6f"/>
 				<out id="LAI" rule="Biomass.sLAI" description="leaf area index  (leaf area per soil surface)" datatype="DOUBLE" format="%.6f"/>
+				<!-- Same rule as AGBiomass_t_ha below (MAX over the season), read
+				     daily instead: a growth curve, not just its endpoint. -->
+				<out id="AGB" rule="(${Biomass.sTAGB})*0.01" description="total above-ground living biomass" datatype="DOUBLE" unit="t/ha" format="%.6f"/>
+				<!-- sTAGB (above) is TAGBG + WLVD + WSTD, living plus dead leaf/stem
+				     litter, so it never falls even once senescence starts stripping
+				     leaves. sTAGBG is the living-only pool (WLVG+WST+WSO) Biomass.java
+				     already computes internally; exposing it gives a curve that
+				     actually declines post-anthesis, comparable to torchcrop's
+				     wlv+wst+wso (which excludes its own dead-leaf pool the same way). -->
+				<out id="AGB_living" rule="(${Biomass.sTAGBG})*0.01" description="above-ground living biomass (excludes senesced litter)" datatype="DOUBLE" unit="t/ha" format="%.6f"/>
+				<!-- The two stress indices daily, not only as the season average
+				     LintulYearly reports: a mean cannot say *when* the crop was
+				     short of water or nitrogen, which is the whole question in a
+				     drought year. Same rules as the yearly outputs below, so the
+				     yearly value stays the average of exactly this series. -->
+				<out id="TRANRF" rule="LintulWaterStress.TRANRF" description="transpiration reduction factor (1 = unstressed)" datatype="DOUBLE" unit="http://www.wurvoc.org/vocabularies/om-1.8/one" format="%.6f"/>
+				<out id="NNI" rule="NPKDemandSlimNP.NNI" description="nitrogen nutrition index (1 = unstressed)" datatype="DOUBLE" unit="http://www.wurvoc.org/vocabularies/om-1.8/one" format="%.6f"/>
 				<out id="DoSow" rule="DefaultManagement.DoSow" datatype="BOOLEAN" unit="-" />
 				<out id="NumberOfResets" rule="CountCropYear.NumberOfResets" datatype="INT" unit="-" />
 			</header>

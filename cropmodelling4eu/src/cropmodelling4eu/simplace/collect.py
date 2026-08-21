@@ -209,6 +209,42 @@ def to_grid(frame: pd.DataFrame, grid: GridConfig) -> xr.Dataset:
     return dataset
 
 
+#: Written beside the collected Parquet; the handoff to a torchcrop run that
+#: is to sow on SIMPLACE's dates rather than on the export's.
+SOWING_FILE = "sowing_from_simplace.csv"
+
+
+def sowing_table(frame: pd.DataFrame) -> pd.DataFrame:
+    """SIMPLACE's *simulated* sowing, as ``(SimplaceID, year, sowing_doy)``.
+
+    Under the rule-based solution the sowing date is an output — the first day
+    inside the planting window on which a weather rule fired — so handing it to
+    torchcrop removes the single largest difference between the two runs.
+    Cells that never sowed are absent rather than defaulted, so a consumer
+    either has SIMPLACE's date or knows it does not.
+
+    The exported ``sowing_doy`` is one day earlier than the day the crop
+    actually starts growing in SIMPLACE: ``brandenburg_rulesow.sol.xml``'s
+    component order makes ``DefaultManagement`` read the *previous* day's
+    ``SowingRule.DoSow``, a one-day latch documented in that solution file.
+    Measured on the German smoke test, torchcrop given the raw exported date
+    starts growing exactly one day ahead of SIMPLACE in 60/60 sampled
+    cell-years; adding a day here collapses that to ordinary day-to-day noise
+    (0 in 51/60, +-1 in the rest).
+    """
+    columns = ["SimplaceID", "year", "sowing_doy"]
+    if any(column not in frame.columns for column in columns):
+        raise KeyError(f"the collected run has no {columns}; it has {list(frame.columns)}")
+    return (
+        frame[columns]
+        .dropna()
+        .astype({"SimplaceID": "int64", "year": "int32", "sowing_doy": "int16"})
+        .assign(sowing_doy=lambda d: d["sowing_doy"] + 1)
+        .drop_duplicates(["SimplaceID", "year"])
+        .sort_values(["year", "SimplaceID"])
+    )
+
+
 def collect_run(
     out_dir: str | Path,
     target_dir: str | Path,
@@ -216,6 +252,9 @@ def collect_run(
     write_netcdf: bool = True,
 ) -> Path:
     """Collect a finished run into ``simplace_europe.parquet`` (+ NetCDF).
+
+    Also writes :data:`SOWING_FILE`, so a torchcrop run chained behind this one
+    has the sowing dates without needing to open the Parquet or know its schema.
 
     Returns
     -------
@@ -226,6 +265,13 @@ def collect_run(
     frame = to_run_schema(read_yearly(out_dir), grid)
     target_dir = Path(target_dir)
     target_dir.mkdir(parents=True, exist_ok=True)
+
+    sowing = sowing_table(frame)
+    sowing.to_csv(target_dir / SOWING_FILE, index=False)
+    logger.info(
+        "Wrote %s (%d cell-seasons, DOY %d-%d)", target_dir / SOWING_FILE,
+        len(sowing), sowing["sowing_doy"].min(), sowing["sowing_doy"].max(),
+    )
 
     parquet = target_dir / "simplace_europe.parquet"
     frame.to_parquet(parquet, index=False, compression="zstd")

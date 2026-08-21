@@ -1538,7 +1538,14 @@ germany_cells = [
 # Germany smoke test — SIMPLACE vs torchcrop vs observations
 
 ~30 cropland cells across Germany, each in a distinct CyBench NUTS-3 region,
-run by **both models over the same cells** so they differ only in the model.
+run by **both models over the same cells**, each swept over the same three
+`vIOPT`/`iopt` settings (1 potential, 2 water-limited, 3 water+N — 4 is
+dropped, since no European soil P or K layer exists). Every figure below
+therefore carries six series, and a same-IOPT pair (`simplace_iopt<n>` vs
+`torchcrop_iopt<n>`) differs only in the model. Colour alone does not stay
+legible at six overlapping lines, so every plot also varies marker and
+linestyle by series — the same combination in every figure, so a series is
+identifiable without re-reading each legend.
 
 Two references, and they are not the same kind of thing:
 
@@ -1553,10 +1560,18 @@ Neither pairing is exact, and the spread that comes from the mismatch is not
 model error. Produce the inputs with:
 
 ```bash
-./submit/submit_simplace.sh --smoke
-python scripts/run_cells_torchcrop.py --config <smoke.yaml> \\
-    --cells <de_cells.csv> --out <de_torchcrop.parquet>
+./submit/submit_cropmodelling.sh --smoke
 ```
+
+which, once per swept IOPT (`TC_SMOKE_IOPTS`, default `1 2 3`), builds and
+runs its own SIMPLACE solution — there is no CLI override for `vIOPT` the way
+torchcrop has `--iopt`, so unlike torchcrop this is a separate build per
+value — hands its simulated sowing dates to torchcrop at that same IOPT, and
+prepares `torchcrop/workspace/crop_wheat.yaml` — the crop parameters torchcrop
+actually ran, checkable directly against the SIMPLACE template's
+`data/crop/crop.xml`, `data/crop/seeds.xml` and `data/management/management.xml`
+(`torchcrop/workspace/crop_parameter_audit.csv` does that comparison already,
+parameter by parameter).
 """),
     code(SETUP),
     code('''
@@ -1564,10 +1579,20 @@ from cropmodelling4eu.evaluation import germany
 
 SMOKE = Path("/data01/FDS/muduchuru/Data/SIMPLACE/cropmodelling4eu/de_smoke")
 
+# Both models sweep all three usable IOPT settings over the same cells and
+# seasons -- submit_cropmodelling.sh --smoke builds one SIMPLACE run
+# (simplace_iopt<n>/) and one torchcrop run (de_torchcrop_iopt<n>.parquet)
+# per value. A same-IOPT pair then differs only in the model, and the spread
+# across IOPT on one side is the nutrient-limitation effect on its own, not a
+# confound with the model.
+IOPTS = [1, 2, 3]
+
 cells = pd.read_csv(SMOKE / "de_cells.csv")
 runs = germany.load_runs(
-    simplace=SMOKE / "simplace" / "simplace_europe.parquet",
-    torchcrop=SMOKE / "de_torchcrop.parquet",
+    **{f"simplace_iopt{i}": SMOKE / f"simplace_iopt{i}" / "simplace_europe.parquet"
+       for i in IOPTS},
+    **{f"torchcrop_iopt{i}": SMOKE / "torchcrop" / f"de_torchcrop_iopt{i}.parquet"
+       for i in IOPTS},
 )
 lo, hi = germany.common_window(runs)
 runs = {name: f[f["year"].between(lo, hi)] for name, f in runs.items()}
@@ -1577,7 +1602,22 @@ print(f"{len(cells)} cells, {cells['adm_id'].nunique()} NUTS-3 regions, "
       f"{cells['lat'].min():.2f}-{cells['lat'].max():.2f} N")
 print(f"common window: {lo}-{hi}")
 for name, frame in runs.items():
-    print(f"  {name:10s} {len(frame):5d} rows, {frame['SimplaceID'].nunique()} cells")
+    print(f"  {name:16s} {len(frame):5d} rows, {frame['SimplaceID'].nunique()} cells")
+'''),
+    md("""
+## 0. What torchcrop actually ran
+
+`torchcrop/workspace/` is written by `submit_cropmodelling.sh --smoke` before
+either model runs. `crop_<crop>.yaml` is not a description of the run's crop
+parameters, it is the file torchcrop loaded them from
+(`CropParameters(config_file=...)`) — open it beside the SIMPLACE template's
+`data/crop/crop.xml`, `data/crop/seeds.xml` and `data/management/management.xml`
+for the same comparison this cell prints.
+"""),
+    code('''
+audit = pd.read_csv(SMOKE / "torchcrop" / "workspace" / "crop_parameter_audit.csv")
+print(audit["status"].value_counts().to_string())
+display(audit[audit["status"] != "same"])
 '''),
     md("""
 ## 1. Where the cells are
@@ -1641,7 +1681,122 @@ fig, axes = germany.plot_phenology(phenology, palette=PALETTE)
 fig.savefig(config.FIGURE_DIR / "de_smoke_phenology.png", dpi=150, bbox_inches="tight")
 '''),
     md("""
-## 4. Reading it
+## 4. Inside two seasons: 2003 and 2005
+
+A season mean cannot say *when* a crop was short of water or nitrogen, and that
+is the whole question in a drought year: `TRANRF` averaging 0.6 is a season
+half-stressed throughout and a season shut down for six weeks in June, and
+those are different crops. So both models are read out **daily** over two
+contrasting seasons — **2003**, the European drought, and **2005**, an ordinary
+year beside it.
+
+Both series are now build artifacts read off disk, the same way the yields
+above are — neither is re-derived by this notebook:
+
+* **SIMPLACE** writes `out/daily/<id>_daily.csv` as it runs, once per swept
+  IOPT (`simplace_iopt<n>/out/daily/`, its own solution build per value).
+  `LAI`, `AGB`, `TRANRF` and `NNI` are in it only because the solution's
+  `Daily_crop_growth` output declares them — the same rules `LintulYearly`
+  averages or maxes over the season, so the yearly value is a summary of
+  exactly this series. A run from before that was added carries `LAI` alone,
+  and `load_simplace_daily` says so rather than dropping the rest silently.
+* **torchcrop** keeps every per-day state in memory, so `submit_cropmodelling.sh
+  --smoke` / `submit_torchcrop.sh --smoke` read the summary and the daily
+  trajectory off *one* simulation per swept IOPT (`run_cells_torchcrop.py
+  --daily-out`, `run_cells(..., mode="both")`) rather than running the cells
+  twice, and write `torchcrop/de_torchcrop_daily_iopt<1,2,3>.parquet`. These
+  trajectories are therefore not just comparable to but *literally* the same
+  simulations the yields above came from, on the same crop file and (in the
+  chained smoke test) the same SIMPLACE-simulated sowing dates, IOPT for
+  IOPT. `AGB` is `out.biomass`, converted from its native g/m² to t/ha
+  (×0.01) so it lands in the same unit as SIMPLACE's `AGBiomass_t_ha` with
+  nothing left for a reader to convert.
+
+Each file's own `model` column reads `simplace`/`torchcrop` regardless of
+IOPT — both are relabelled `{model}_iopt<n>` below, the same keys the summary
+`runs` dict above uses, so one series stays one series across every figure in
+this notebook. Rows are trimmed to the crop phase (`0 < DVS < 2`) on both
+sides, so the spin-up and the frozen days past maturity never reach a plot.
+"""),
+    code('''
+SEASONS = [2003, 2005]
+ids = cells["SimplaceID"].to_numpy()
+
+# One frame per swept IOPT on each side, relabelled so daily_envelope's
+# groupby("model") tells all six apart instead of averaging any of them
+# together.
+simplace_daily = [
+    germany.load_simplace_daily(SMOKE / f"simplace_iopt{i}" / "out", ids=ids,
+                                 years=SEASONS, model=f"simplace_iopt{i}")
+    for i in IOPTS
+]
+torchcrop_daily = []
+for i in IOPTS:
+    frame = pd.read_parquet(SMOKE / "torchcrop" / f"de_torchcrop_daily_iopt{i}.parquet")
+    frame = frame[frame["year"].isin(SEASONS)].assign(model=f"torchcrop_iopt{i}")
+    torchcrop_daily.append(frame)
+
+daily = pd.concat([*simplace_daily, *torchcrop_daily], ignore_index=True)
+
+print(f"{len(daily):,} rows, {daily['SimplaceID'].nunique()} cells, "
+      f"{daily['variable'].nunique()} variables")
+'''),
+    code('''
+# The season in one number per variable, so the curves below can be checked
+# against something: peak canopy, and how far each stress index fell.
+season = (
+    daily.groupby(["variable", "year", "model"])["value"]
+    .agg(mean="mean", peak="max", trough="min")
+    .round(3)
+    .unstack("model")
+)
+display(season)
+season.to_csv(config.TABLE_DIR / "de_smoke_daily_2003_2005.csv")
+'''),
+    code('''
+fig, axes = germany.plot_daily(daily, years=SEASONS, palette=PALETTE)
+fig.savefig(config.FIGURE_DIR / "de_smoke_daily_2003_2005.png", dpi=150,
+            bbox_inches="tight")
+'''),
+    md("""
+Reading the four rows:
+
+* **LAI** is the level check. Both models should build a canopy through spring
+  and lose it after anthesis; a peak that never reaches ~4-6 m² m⁻² over German
+  winter wheat is a growth problem, not a timing one.
+* **AGB** is the integral LAI drives — a canopy gap that looks small in LAI
+  compounds daily into a much larger gap in accumulated biomass, so this row is
+  usually the more legible of the two for "is one model just growing a smaller
+  crop". It should climb monotonically and flatten at maturity; a fall implies
+  a reported loss the daily series can date.
+* **TRANRF** is where 2003 has to show itself. A model that responds to water
+  drops here in the weeks around anthesis in 2003 and does not in 2005. A
+  *chronic* offset through winter is a different thing entirely — it is
+  transpiration being reduced when there is barely a canopy to transpire, which
+  is a bug in the water balance, not a drought.
+* **NNI** is gated on `iopt` in both models now, so the gating is a visible
+  curve rather than something to take on faith on one side and assumed on the
+  other: `iopt1`/`iopt2` never see a nitrogen limit (NNI pinned at 1 for
+  `iopt1`; `iopt2` is water-only, so its NNI series is also flat), on
+  `simplace` and `torchcrop` alike, and only the `iopt3` pair can crash
+  mid-season — a fall there says the fertilizer schedule ran out, not that
+  the weather was hostile. A crash on one side's `iopt3` and not the other's
+  is a genuine disagreement about the same setting, not a confound with which
+  IOPT each model happened to run.
+
+Two caveats on the x-axis. `das` is days after each model's **own** sowing —
+SIMPLACE sows on a rule and torchcrop latches the site table's DOY, so day 0 is
+not the same calendar day for both, and aggregating on the calendar date
+instead would smear a timing difference into an apparent level difference. The
+band is the interquartile range **across the 30 cells**, not an uncertainty:
+cells from the Rhine to Mecklenburg do not share a season, and one model's band
+being far wider than the other's is itself a result. The three series on each
+side share cells and seasons (and, for torchcrop, the same crop file) and
+differ only in `iopt`, so any spread within one side **is** the
+nutrient-limitation effect rather than a confound with something else.
+"""),
+    md("""
+## 5. Reading it
 
 A short checklist, because the two references fail in different directions:
 
@@ -1660,9 +1815,812 @@ A short checklist, because the two references fail in different directions:
 """),
 ]
 
+# --------------------------------------------------------------------------- #
+# Stress test: SIMPLACE vs torchcrop with every input matched
+# --------------------------------------------------------------------------- #
+
+stresstest_cells = [
+    md("""
+# Stress test — SIMPLACE against torchcrop, same crop, same day, no spin-up
+
+The smoke test asks *how close to observations* each model gets and accepts
+that they differ in every respect. This asks the narrower question that one
+cannot answer: **with every difference that is not the model itself removed, do
+the two agree?** The run is produced by
+[`submit/submit_stresstest.py`](../submit/submit_stresstest.py), which removes
+them one at a time:
+
+| Confound | How it is removed |
+|---|---|
+| Crop parameters | torchcrop is loaded from SIMPLACE's own `crop.xml` |
+| Sowing date | SIMPLACE runs first; torchcrop is latched to its **simulated** `PlantingDOY` |
+| Spin-up | Both start at sowing, from the export's initial soil water |
+| Irrigation | Removed from both — the solution has no irrigation module |
+| CO₂ | Held at 360 ppm, where the crop file's own response curve is 1.0 |
+| Fertilizer | Not adjusted — **checked**, in §3 |
+
+**There is no observation in this notebook.** Neither model is a reference, so
+every number below is a difference between two simulations of the same site and
+season, signed `torchcrop − simplace`. A disagreement says the two models are
+not the same model; it does not say which is right. For that, read
+[`germany_smoke_evaluation.ipynb`](germany_smoke_evaluation.ipynb).
+
+```bash
+./submit/submit_stresstest.py                 # both scenarios, both seasons
+./submit/submit_stresstest.py --dry-run       # audit the parameters, run nothing
+```
+"""),
+    md("## 0. Setup"),
+    code(SETUP),
+    code('''
+from cropmodelling4eu.evaluation import stresstest as st
+
+ROOT = st.DEFAULT_ROOT
+
+run = st.load_run(ROOT)
+paired = st.pair(run)
+provenance = st.load_provenance(ROOT)
+
+print(f"root      : {ROOT}")
+print(f"cells     : {run['SimplaceID'].nunique()}")
+print(f"seasons   : {sorted(run['year'].unique())}")
+print(f"scenarios : {sorted(run['scenario'].unique())}")
+print(f"paired    : {len(paired)} cell-seasons both models ran")
+'''),
+    md("""
+## 1. What this run actually removed
+
+Read from `torchcrop/config.yaml`, which is not a report: the script writes it,
+loads it back, and the `RunConfig` in it is what both halves were driven by. So
+this is the run's input, and editing it and re-running with `--reuse-simplace`
+re-runs the torchcrop half exactly as edited.
+"""),
+    code('''
+print(provenance.get("purpose", "no provenance block found"), "\\n")
+for name, note in provenance.get("removed_inputs", {}).items():
+    print(f"  {name:12s} {note}")
+print()
+for name, scenario in provenance.get("scenarios", {}).items():
+    print(f"  {name:12s} iopt={scenario['iopt']}  {scenario['note']}")
+'''),
+    md("""
+### The asymmetries the design could **not** remove
+
+These are recorded in the config rather than papered over, and both bound how
+far §4 can be read.
+"""),
+    code('''
+for note in provenance.get("known_asymmetries", []):
+    print("* " + note + "\\n")
+'''),
+    md("""
+## 2. Crop parameters — are the two models growing the same crop?
+
+The audit runs before anything else. With `--crop-params simplace` (the
+default) torchcrop is *built from* `crop.xml`, so the remaining differences are
+parameters SIMPLACE has no counterpart for, or a mapping that could not be
+made. Run with the shipped presets instead and 21 of 72 differ — including
+`TSUM1` (1623 vs 1050) — and no disagreement below is attributable to the model.
+"""),
+    code('''
+audit = st.load_audit(ROOT)
+print(audit["status"].value_counts().to_string())
+print(f"\\ntorchcrop crop parameters: {provenance.get('crop_parameters', {}).get('torchcrop_source')}")
+display(audit[audit["status"] != "same"][["parameter", "kind", "simplace", "torchcrop", "status"]])
+'''),
+    md("""
+## 3. Two checks that must pass before anything else is read
+
+**The sowing latch.** torchcrop is set to SIMPLACE's simulated `PlantingDOY`
+per cell and season. Any row here means it fell back to the export's calendar
+instead, and those cells are then two different seasons rather than two models.
+
+**The fertilizer.** Both read one schedule — the export's
+`fertilizer_<crop>.csv` — but by different routes: SIMPLACE takes product
+amounts and carrier contents from `fertilizer_composition.xml`, torchcrop
+converts them to nutrient rates before the run. Two conversions of one file is
+exactly where a silent factor hides.
+"""),
+    code('''
+mismatched = st.check_latches(paired)
+fertilizer = st.load_fertilizer_check(ROOT)
+
+print(f"sowing latch : {len(mismatched)} of {len(paired)} cell-seasons differ  "
+      f"({'PASS' if mismatched.empty else 'FAIL'})")
+print(f"fertilizer N : largest |difference| {fertilizer['difference'].abs().max():.2e} g N/m², "
+      f"mean applied {fertilizer['n_applied_g_m2_simplace'].mean():.2f} g N/m²  "
+      f"({'PASS' if fertilizer['difference'].abs().max() < 1e-3 else 'FAIL'})")
+display(mismatched.head())
+'''),
+    md("""
+## 4. Agreement, quantity by quantity
+
+Ordered from the result to the diagnostics that explain it. `bias` and `rmse`
+are in the quantity's own unit; `ratio` is `torchcrop / simplace` on the means,
+which is what travels between a 4 t/ha cell and a 9 t/ha one.
+
+`r` is not a skill score here. Both sides vary across cells and seasons for
+their own reasons, so a low `r` with a small bias means the two models disagree
+about *which* cells are good ones — often a more serious finding than a level
+offset, and invisible in the mean.
+"""),
+    code('''
+scores = st.agreement(paired)
+display(scores.round(3))
+scores.to_csv(config.TABLE_DIR / "stresstest_agreement.csv", index=False,
+              float_format="%.4f")
+
+for variable in st.COMPARED:
+    print(f"  {variable.label:14s} {variable.note}")
+'''),
+    code('''
+fig, axes = st.plot_agreement(paired, palette=PALETTE)
+fig.savefig(config.FIGURE_DIR / "stresstest_agreement.png", dpi=150, bbox_inches="tight")
+'''),
+    md("""
+## 5. Which cells disagree
+
+A scatter hides *which* cells the disagreement sits in; this does not. Read the
+shape, not the individual rules: a long rule on one cell with none on its
+neighbours is a site problem (a soil, a failed establishment), while a fan that
+widens with the SIMPLACE value is a systematic difference in the response.
+"""),
+    code('''
+fig, axes = st.plot_cell_pairs(paired, "yield_t_ha", palette=PALETTE)
+fig.savefig(config.FIGURE_DIR / "stresstest_cell_yields.png", dpi=150, bbox_inches="tight")
+'''),
+    code('''
+worst = (
+    paired.assign(ratio=paired["yield_ratio"])
+    .sort_values("ratio")
+    [["scenario", "SimplaceID", "year", "lon", "lat", "yield_t_ha_simplace",
+      "yield_t_ha_torchcrop", "ratio", "max_lai_simplace", "max_lai_torchcrop",
+      "tranrf_mean_simplace", "tranrf_mean_torchcrop"]]
+)
+print("The ten cell-seasons where torchcrop is furthest below SIMPLACE:")
+display(worst.head(10).round(2))
+paired.to_csv(config.TABLE_DIR / "stresstest_paired_cells.csv", index=False,
+              float_format="%.4f")
+'''),
+    md("""
+## 6. Where the divergence comes from
+
+The yield ratio against the difference in each state variable. Which one it
+tracks is the answer the tables above cannot give:
+
+* it falls with **Δ peak LAI** → a canopy that never built, so the difference is
+  in growth or establishment;
+* it falls with **Δ TRANRF** → the water balances closed the stomata at
+  different times, which is the bucket-vs-layered asymmetry the config records;
+* it falls with **Δ season length** → the phenology integrated different
+  temperatures despite the shared `TSUM1`;
+* it tracks **nothing** → partitioning, and the season means do not resolve it —
+  go to the daily trajectories in §7.
+"""),
+    code('''
+fig, axes = st.plot_divergence(paired, palette=PALETTE)
+fig.savefig(config.FIGURE_DIR / "stresstest_divergence.png", dpi=150, bbox_inches="tight")
+'''),
+    md("""
+## 7. Inside the season
+
+A season mean cannot say *when* the two models parted, and that is the whole
+question: `TRANRF` averaging 0.8 is a season mildly stressed throughout and a
+season shut down for three weeks in June, and those are different crops.
+
+Unlike the smoke test's version of this figure, `das` here is the **same
+calendar day in both models** — that is what the sowing latch of §3 buys. A
+horizontal offset between the curves is therefore a difference in development
+rate, not in the day the crop went in. The band is the interquartile range
+**across cells**, not an uncertainty; one model's band being far wider than the
+other's is itself a result.
+"""),
+    code('''
+SCENARIO = "limited"
+daily = st.load_daily(ROOT, scenarios=[SCENARIO])
+season = (
+    daily.groupby(["variable", "year", "model"])["value"]
+    .agg(mean="mean", peak="max", trough="min")
+    .round(3)
+    .unstack("model")
+)
+display(season)
+season.to_csv(config.TABLE_DIR / "stresstest_daily_season.csv")
+'''),
+    code('''
+fig, axes = st.plot_daily(daily, SCENARIO, palette=PALETTE)
+fig.savefig(config.FIGURE_DIR / "stresstest_daily.png", dpi=150, bbox_inches="tight")
+'''),
+    md("""
+## 8. The nutrient-limitation response
+
+`potential` (IOPT=1) minus `limited` (IOPT=3), taken **within** each model. The
+question is not whether the two agree in level — §4 answered that — but whether
+they respond to `iopt` by a similar amount.
+
+Two things to keep in mind. IOPT=1 is not potential production in either model:
+both apply water stress to growth unconditionally, so this is a
+nutrient-unlimited but still water-limited run on both sides. And a model that
+ran only one scenario is dropped from the figure with a warning rather than
+plotted against its own missing half.
+"""),
+    code('''
+effect = st.scenario_effect(run, "yield_t_ha")
+if effect.empty:
+    print("only one scenario is present in this run — nothing to compare")
+else:
+    display(
+        effect.groupby("model")[["effect", "effect_percent"]]
+        .describe().round(2).T
+    )
+    fig, axes = st.plot_scenario_effect(effect, palette=PALETTE)
+    fig.savefig(config.FIGURE_DIR / "stresstest_scenario_effect.png", dpi=150,
+                bbox_inches="tight")
+'''),
+    md("""
+## 9. Summary
+"""),
+    code('''
+overview = st.summary(paired)
+overview.to_frame().to_csv(config.TABLE_DIR / "stresstest_summary.csv")
+print(f"tables written to {config.TABLE_DIR}")
+print(f"figures written to {config.FIGURE_DIR}")
+overview.to_frame()
+'''),
+    md("""
+### Reading it
+
+* **The checks in §3 are pass/fail, not diagnostics.** A sowing latch mismatch
+  or a fertilizer difference above ~1e-3 g N/m² invalidates everything after
+  it; fix the run before reading §4.
+* **A level offset and a rank disagreement are different findings.** A ratio of
+  0.8 with `r ≈ 0.9` is one model consistently lower — a calibration
+  difference. A ratio near 1 with `r ≈ 0.1` is the two models disagreeing about
+  which cells are good, which no bias correction repairs.
+* **Follow the chain, not the yield.** Yield is the last quantity in it: peak
+  LAI explains biomass, biomass and partitioning explain yield, and §6 says
+  which link the run broke.
+* **Cells where torchcrop collapses to a fraction of SIMPLACE** (the last row of
+  the summary) are worth reading individually before any pooled statistic —
+  a handful of failed establishments moves a mean far more than a systematic
+  offset does.
+* **This notebook cannot say which model is right.** It says whether the two are
+  the same model given the same inputs, and where they stop being one.
+"""),
+]
+
+
+# --------------------------------------------------------------------------- #
+# Notebook 7 — full continental run, both models
+# --------------------------------------------------------------------------- #
+
+FULL_RUN_SETUP = '''
+import logging
+import sys
+from pathlib import Path
+
+# cropmodelling4eu is installed (pip install -e .), so the evaluation
+# library is imported like any other package rather than off sys.path.
+
+import numpy as np
+import pandas as pd
+
+from cropmodelling4eu.evaluation import aggregate, config, cybench, doy, fullrun, metrics, plots, regions, torchcrop
+from cropmodelling4eu.evaluation.style import use_style
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s",
+                    force=True)
+logging.getLogger("matplotlib").setLevel(logging.WARNING)
+
+PALETTE = use_style("light")
+config.ensure_output_dirs()
+
+pd.set_option("display.max_rows", 60)
+pd.set_option("display.width", 140)
+
+print(f"SIMPLACE run  : {config.SIMPLACE_PARQUET}",
+      "(found)" if config.SIMPLACE_PARQUET.is_file() else "(not finished yet)")
+print(f"TorchCrop run : {config.SIM_PARQUET}",
+      "(found)" if config.SIM_PARQUET.is_file() else "(not finished yet)")
+print(f"CyBench root  : {config.CYBENCH_ROOT}")
+print(f"Outputs       : {config.OUTPUT_DIR}")
+'''
+
+full_run_cells = [
+    md("""
+# Full continental run — SIMPLACE and TorchCrop, together
+
+**What this notebook does.** It reads each model's own `winter_wheat_2000_2024`
+production run exactly as
+[`submit/submit_cropmodelling.sh`](../submit/submit_cropmodelling.sh) writes
+it — `cm4eu simplace collect`'s `simplace_europe.parquet` and the shard
+combine's `torchcrop_europe.parquet` — compares both against the CyBench
+national yield and phenology statistics (§4-5), and then compares the two
+models directly against each other over the whole domain (§6).
+
+**How this differs from the other two-model notebooks.**
+`germany_smoke_evaluation.ipynb` matches 30 cells and hands SIMPLACE's own
+simulated sowing dates to torchcrop by construction; `stresstest_evaluation.ipynb`
+forces every non-model input equal (crop parameters, spin-up, irrigation,
+CO₂). Neither one is what ships. This notebook reads whatever each pipeline
+actually produced for the full run — a different sowing convention on each
+side unless the run was submitted through the chain (SIMPLACE's simulated
+dates handed to torchcrop), a different year range, a cell set that need not
+match exactly — because the question here is what the delivered output says,
+not an idealised comparison.
+
+**Either run can be missing, and the notebook says so rather than failing.**
+`fullrun.load_runs` skips a model with no Parquet yet and logs a warning; §2
+reports which models loaded. §4-5 run per model over whichever are present;
+§6, which needs both, prints a note and stops there if only one is.
+
+Four conventions carried over from the single-model notebooks:
+
+1. **Error is `simulated − observed`** against CyBench (§4-5); `torchcrop −
+   simplace` in the direct comparison (§6), where neither side is a
+   reference — see `evaluation.fullrun.pair_models`.
+2. **No moisture conversion.** Both models report grain dry matter; CyBench
+   reports market moisture (~13.5 %), so part of any negative bias against it
+   is that unit difference rather than model error.
+3. **The simulated national mean is unweighted** over cropland cells — the
+   export carries no per-cell wheat area to weight by.
+4. **Day-of-year statistics are circular** (`doy.circular_mean_doy`,
+   `doy.doy_difference`), for the reason `phenology_evaluation.ipynb`'s header
+   gives: Spain's regional `sos` runs from DOY 0.7 to 363.
+
+All reusable code is in
+[`../src/cropmodelling4eu/evaluation/`](../src/cropmodelling4eu/evaluation/);
+this notebook is the workflow only.
+"""),
+    md("## 0. Setup"),
+    code(FULL_RUN_SETUP),
+    md("""
+## 1. Scope — which countries are evaluable
+
+A country needs a CyBench yield file *and* CyBench polygons: the file supplies
+the reference, the polygons decide which 10 km cells belong to it.
+"""),
+    code(SCOPE),
+    md("""
+## 2. Load both runs
+
+One row per (cell, season) on each side. `fullrun.load_runs` reads each with
+its own model's rules — SIMPLACE's collector already writes the dates it
+simulated, torchcrop's `days_to_maturity` is turned into dates by
+`torchcrop.add_phenology_columns` — and tags every row with `model`. A model
+with no Parquet yet is skipped with a warning, not raised on.
+"""),
+    code('''
+runs = fullrun.load_runs()
+print(f"\\nmodels loaded: {', '.join(runs)}")
+for model, frame in runs.items():
+    print(f"{model:10s}: {len(frame):>9,} cell-seasons, "
+          f"{frame['SimplaceID'].nunique():>6,} cells, "
+          f"{frame['year'].min()}-{frame['year'].max()}")
+
+pd.concat(
+    {model: frame[["yield_t_ha", "days_to_maturity"]].describe()
+     for model, frame in runs.items()},
+    axis=1,
+)
+'''),
+    md("""
+## 3. Assign each 10 km cell to a country
+
+Built from the **union** of both models' cells: both pipelines read the same
+10 km export, so they share one grid, and one country join covers whichever
+model (or both) is present. Cells outside the CyBench footprint — the UK,
+Norway, Switzerland, the western Balkans, North Africa — are dropped from
+every model.
+"""),
+    code('''
+all_cells = torchcrop.simulation_cells(
+    pd.concat([frame[["SimplaceID", "lon", "lat"]] for frame in runs.values()],
+              ignore_index=True)
+)
+all_cells = regions.assign_cells_to_countries(
+    all_cells, COUNTRIES, cache=regions.default_cache_path(len(COUNTRIES))
+)
+print(f"{all_cells['country'].notna().sum():,} of {len(all_cells):,} cells "
+      f"inside the CyBench footprint ({all_cells['snapped'].sum():,} matched "
+      f"by the {config.SNAP_KM} km snap)")
+
+scoped = {}
+for model, frame in runs.items():
+    tagged = frame.merge(all_cells[["SimplaceID", "country", "snapped"]],
+                          on="SimplaceID", how="left")
+    scoped[model] = tagged[tagged["country"].notna()].copy()
+    print(f"{model:10s}: {len(scoped[model]):>9,} of {len(frame):>9,} "
+          f"cell-seasons kept")
+
+cells_per_country = (
+    all_cells.dropna(subset=["country"]).groupby("country").size()
+    .rename("cells").to_frame()
+)
+cells_per_country.T
+'''),
+    md("""
+## 4. National yield — both models against CyBench
+
+Same pipeline as `yield_evaluation.ipynb` §4-8, run once per loaded model. The
+CyBench side (§4.2) does not depend on the model, so it is aggregated once and
+paired against each.
+"""),
+    md("### 4.1 Aggregate each model to national means, and pair against CyBench"),
+    code('''
+obs = cybench.load_yield(COUNTRIES)
+obs_country = aggregate.aggregate_observed_yield(obs)
+print(obs_country["obs_method"].value_counts().to_string())
+
+yield_paired = []
+for model, frame in scoped.items():
+    sim_country = aggregate.aggregate_simulated(frame, {"yield_t_ha": False})
+    paired = aggregate.pair_observations(sim_country, obs_country, ["country", "year"])
+    paired["model"] = model
+    paired["residual"] = paired["yield_t_ha"] - paired["obs_yield"]
+    yield_paired.append(paired)
+yield_paired = pd.concat(yield_paired, ignore_index=True)
+
+print(f"\\n{len(yield_paired)} paired (model, country, year) rows across "
+      f"{yield_paired['country'].nunique()} countries")
+yield_paired.head()
+'''),
+    md("### 4.2 Pooled skill, both models"),
+    code('''
+yield_pooled = {
+    model: metrics.yield_metrics(block["obs_yield"], block["yield_t_ha"])
+    for model, block in yield_paired.groupby("model")
+}
+yield_pooled_table = pd.DataFrame(yield_pooled).T[list(metrics.YIELD_METRIC_ORDER)]
+yield_pooled_table.round(3)
+'''),
+    md("""
+### 4.3 Per-country skill, both models
+
+One RMSE/Bias/Pearson r table per model, side by side, so a country either
+model struggles with is visible at a glance rather than in two separate
+notebooks.
+"""),
+    code('''
+yield_by_country = {
+    model: metrics.metrics_by_group(block, "obs_yield", "yield_t_ha")
+    for model, block in yield_paired.groupby("model")
+}
+yield_comparison = pd.concat(
+    {model: table[["n", "bias", "rmse", "pearson_r"]]
+     for model, table in yield_by_country.items()},
+    axis=1,
+)
+yield_comparison.to_csv(
+    config.TABLE_DIR / "full_run_yield_metrics_by_country.csv", float_format="%.3f"
+)
+yield_comparison.round(2)
+'''),
+    md("### 4.4 Figures, one per model"),
+    code('''
+for model, block in yield_paired.groupby("model"):
+    fig = plots.scatter_one_to_one(
+        block, "obs_yield", "yield_t_ha", stats=yield_pooled[model],
+        title=f"{model}: national winter wheat yield, "
+              f"{block['year'].min()}-{block['year'].max()}",
+        xlabel="CyBench observed yield (t ha$^{-1}$)",
+        ylabel=f"{model} simulated yield (t ha$^{-1}$)",
+    )
+    plots.save(fig, f"full_run_01_yield_scatter_{model}")
+    display(fig)
+'''),
+    code('''
+for model, table in yield_by_country.items():
+    ranked = metrics.rank_countries(table, by="rmse")
+    fig = plots.bias_bars(
+        ranked, value_col="bias", error_col="rmse",
+        title=f"{model}: mean yield bias by country (simulated - observed)",
+        xlabel="Bias (t ha$^{-1}$)",
+    )
+    plots.save(fig, f"full_run_02_yield_bias_{model}")
+    display(fig)
+'''),
+    md("""
+### 4.5 Figures — spatial maps, both models
+
+Where §4.3 gives a per-country number, these put it on the map: the cell-level
+mean shows the field each national average is drawn from, and the choropleth
+repeats §4.3's bias per country in the shape a reader recognises faster than a
+table.
+"""),
+    code('''
+polygons = regions.load_country_polygons(COUNTRIES)
+
+for model, frame in scoped.items():
+    cell_mean = frame.groupby(["SimplaceID", "lon", "lat"], as_index=False)["yield_t_ha"].mean()
+    fig = plots.cell_map(
+        cell_mean, "yield_t_ha",
+        title=f"{model}: mean simulated winter wheat yield, "
+              f"{frame['year'].min()}-{frame['year'].max()}",
+        cbar_label="Yield (t ha$^{-1}$)",
+    )
+    plots.save(fig, f"full_run_06_yield_map_{model}")
+    display(fig)
+'''),
+    code('''
+for model, table in yield_by_country.items():
+    fig = plots.country_choropleth(
+        polygons, table["bias"],
+        title=f"{model}: mean yield bias by country (simulated - observed)",
+        cbar_label="Bias (t ha$^{-1}$)", diverging=True,
+    )
+    plots.save(fig, f"full_run_07_yield_bias_map_{model}")
+    display(fig)
+'''),
+    md("""
+## 5. Phenology — both models against CyBench
+
+Same three stages as `phenology_evaluation.ipynb` — sowing, maturity, harvest
+— for whichever models are loaded. Read `config.STAGES[*].caveat` before the
+sowing and harvest numbers: sowing is a weak pairing whenever a model's
+`sowing_doy` is a constant rather than a per-cell result, and harvest repeats
+maturity while `HARVEST_LAG_DAYS = 0`.
+"""),
+    code('''
+for stage in config.STAGES:
+    print(f"{stage.label:9s} <- {stage.sim_col:14s} vs CyBench '{stage.obs_col}'")
+    print(f"  {stage.caveat}\\n")
+'''),
+    md("### 5.1 Aggregate each model's stage dates, and pair against the CyBench calendar"),
+    code('''
+STAGE_COLS = {stage.sim_col: True for stage in config.STAGES}
+
+calendar = cybench.load_calendar(COUNTRIES)
+crop_mask = cybench.load_crop_mask(COUNTRIES)
+obs_calendar = aggregate.aggregate_observed_calendar(calendar, crop_mask)
+
+phen_paired = []
+for model, frame in scoped.items():
+    available = {c: circ for c, circ in STAGE_COLS.items() if c in frame.columns}
+    sim_country = aggregate.aggregate_simulated(frame, available)
+    paired = aggregate.pair_observations(sim_country, obs_calendar, ["country"])
+    paired["model"] = model
+    phen_paired.append(paired)
+phen_paired = pd.concat(phen_paired, ignore_index=True, sort=False)
+
+print(f"{len(phen_paired)} (model, country) rows across "
+      f"{phen_paired['country'].nunique()} countries")
+phen_paired.head()
+'''),
+    md("### 5.2 Pooled skill by stage, both models"),
+    code('''
+phen_pooled_rows = []
+for stage in config.STAGES:
+    if stage.sim_col not in phen_paired.columns:
+        continue
+    for model, block in phen_paired.groupby("model"):
+        row = metrics.phenology_metrics(block[stage.obs_col], block[stage.sim_col])
+        row.update(stage=stage.label, model=model)
+        phen_pooled_rows.append(row)
+
+phen_pooled_table = (
+    pd.DataFrame(phen_pooled_rows).set_index(["stage", "model"])
+    [list(metrics.PHENOLOGY_METRIC_ORDER)]
+)
+phen_pooled_table.round(1)
+'''),
+    md("""
+### 5.3 Maturity bias by country, both models
+
+Maturity is "the one clean pairing" (see the caveat printed in §5): both sides
+mean the same thing, so it is the stage where a per-country figure says
+something about the model rather than about a convention mismatch.
+"""),
+    code('''
+for model, block in phen_paired.groupby("model"):
+    stage_metrics = metrics.metrics_by_group(
+        block, "eos", "maturity_doy", metric_fn=metrics.phenology_metrics
+    )
+    ranked = metrics.rank_countries(stage_metrics, by="rmse")
+    fig = plots.bias_bars(
+        ranked, value_col="bias", error_col="rmse",
+        title=f"{model}: maturity bias by country (simulated - observed)",
+        xlabel="Bias (days; positive = simulated late)",
+    )
+    plots.save(fig, f"full_run_03_maturity_bias_{model}")
+    display(fig)
+'''),
+    md("""
+### 5.4 Figure — spatial maturity bias, both models
+
+The same country bias as §5.3, on the map — useful here because the sowing
+convention mismatch (the §5 caveat) is regional: southern European countries
+share an autumn-sowing convention with the model, so where the bias
+concentrates says more than the ranked bar chart does.
+"""),
+    code('''
+for model, block in phen_paired.groupby("model"):
+    stage_metrics = metrics.metrics_by_group(
+        block, "eos", "maturity_doy", metric_fn=metrics.phenology_metrics
+    )
+    fig = plots.country_choropleth(
+        polygons, stage_metrics["bias"],
+        title=f"{model}: mean maturity bias by country (simulated - observed)",
+        cbar_label="Bias (days; positive = simulated late)", diverging=True,
+    )
+    plots.save(fig, f"full_run_08_maturity_bias_map_{model}")
+    display(fig)
+'''),
+    md("""
+## 6. SIMPLACE against TorchCrop, directly
+
+**No observation in this section — every number is a difference between the
+two models**, signed `torchcrop − simplace` (`fullrun.pair_models`), the same
+convention `stresstest_evaluation.ipynb` uses and for the same reason: calling
+one side "simulated" and the other "observed" would claim a reference neither
+run supports. This section needs both models and is skipped otherwise.
+"""),
+    code('''
+BOTH_MODELS = len(runs) == 2
+if not BOTH_MODELS:
+    print("Only one model has a finished run -- skipping the direct comparison. "
+          "Re-run this notebook once the other has been collected.")
+else:
+    model_pairs = fullrun.pair_models(runs)
+    print(f"{len(model_pairs):,} (cell, year) pairs common to both runs "
+          f"(of {len(runs['simplace']):,} simplace, {len(runs['torchcrop']):,} torchcrop)")
+    model_pairs.head()
+'''),
+    md("""
+### 6.1 Do the two runs share a sowing date?
+
+Zero everywhere is what `submit_cropmodelling.sh`'s chained run is *for* —
+SIMPLACE's simulated date handed straight to torchcrop's shard array. Anything
+else means torchcrop sowed from its own convention instead (a per-cell site
+table date, or the DOY 270 constant for a run made before the site stage), and
+every later stage in this section is comparing two different seasons.
+"""),
+    code('''
+if BOTH_MODELS:
+    mismatch = (model_pairs["sowing_doy_delta"] != 0).mean()
+    print(f"{mismatch:.1%} of paired cell-years sow on a different day.")
+    display(model_pairs["sowing_doy_delta"].describe().to_frame())
+'''),
+    md("### 6.2 Agreement, pooled over every paired cell-season"),
+    code('''
+if BOTH_MODELS:
+    rows = []
+    for key, label, is_date in [
+        ("yield_t_ha", "Yield (t/ha)", False),
+        ("biomass_g_m2", "Biomass (g/m2)", False),
+        ("max_lai", "Peak LAI (m2/m2)", False),
+        ("maturity_doy", "Maturity (DOY)", True),
+    ]:
+        simplace_col, torchcrop_col = f"{key}_simplace", f"{key}_torchcrop"
+        if simplace_col not in model_pairs:
+            continue
+        fn = metrics.phenology_metrics if is_date else metrics.yield_metrics
+        rows.append(fn(model_pairs[simplace_col], model_pairs[torchcrop_col]) | {"variable": label})
+    agreement = pd.DataFrame(rows).set_index("variable")
+    agreement.to_csv(config.TABLE_DIR / "full_run_model_agreement.csv", float_format="%.3f")
+    agreement.round(3)
+'''),
+    md("""
+### 6.3 Figure — yield agreement
+
+The 1:1 line is the only reference drawn: there is no observation to regress
+on here, so a fitted line would suggest a skill this run cannot measure.
+"""),
+    code('''
+if BOTH_MODELS:
+    stats = metrics.yield_metrics(
+        model_pairs["yield_t_ha_simplace"], model_pairs["yield_t_ha_torchcrop"]
+    )
+    fig = plots.scatter_one_to_one(
+        model_pairs, "yield_t_ha_simplace", "yield_t_ha_torchcrop", stats=stats,
+        title="Yield: torchcrop against SIMPLACE, same cell and season",
+        xlabel="SIMPLACE yield (t ha$^{-1}$)",
+        ylabel="TorchCrop yield (t ha$^{-1}$)",
+    )
+    plots.save(fig, "full_run_04_model_agreement_yield")
+    display(fig)
+'''),
+    md("""
+### 6.4 Figure — maturity agreement
+"""),
+    code('''
+if BOTH_MODELS and "maturity_doy_simplace" in model_pairs:
+    stats = metrics.phenology_metrics(
+        model_pairs["maturity_doy_simplace"], model_pairs["maturity_doy_torchcrop"]
+    )
+    fig = plots.scatter_one_to_one(
+        model_pairs, "maturity_doy_simplace", "maturity_doy_torchcrop",
+        stats=stats, circular=True,
+        title="Maturity: torchcrop against SIMPLACE, same cell and season",
+        xlabel="SIMPLACE maturity (DOY)",
+        ylabel="TorchCrop maturity (DOY)",
+    )
+    plots.save(fig, "full_run_05_model_agreement_maturity")
+    display(fig)
+'''),
+    md("""
+### 6.5 Figure — spatial map of model disagreement
+
+Signed `torchcrop - simplace` per cell, mean over the paired years — the
+spatial counterpart of §6.2's pooled numbers, and the only way to see whether
+the disagreement is a uniform offset or concentrated in particular regions.
+The §6.1 sowing mismatch, in particular, need not affect every cell the same
+way.
+"""),
+    code('''
+if BOTH_MODELS:
+    cell_delta = model_pairs.groupby(
+        ["SimplaceID", "lon", "lat"], as_index=False
+    )[["yield_t_ha_delta", "maturity_doy_delta"]].mean()
+
+    fig = plots.cell_map(
+        cell_delta, "yield_t_ha_delta",
+        cmap=plots.DIVERGING_CMAP, norm=plots.diverging_norm(cell_delta["yield_t_ha_delta"]),
+        title="Yield disagreement: torchcrop - simplace, mean over paired years",
+        cbar_label="Yield delta (t ha$^{-1}$)",
+    )
+    plots.save(fig, "full_run_09_model_agreement_yield_map")
+    display(fig)
+'''),
+    code('''
+if BOTH_MODELS and "maturity_doy_delta" in model_pairs:
+    fig = plots.cell_map(
+        cell_delta, "maturity_doy_delta",
+        cmap=plots.DIVERGING_CMAP, norm=plots.diverging_norm(cell_delta["maturity_doy_delta"]),
+        title="Maturity disagreement: torchcrop - simplace, mean over paired years",
+        cbar_label="Maturity delta (days)",
+    )
+    plots.save(fig, "full_run_10_model_agreement_maturity_map")
+    display(fig)
+'''),
+    md("""
+## 7. Summary
+"""),
+    code('''
+yield_paired.to_csv(config.TABLE_DIR / "full_run_yield_paired.csv",
+                    index=False, float_format="%.4f")
+phen_paired.to_csv(config.TABLE_DIR / "full_run_phenology_paired.csv",
+                   index=False, float_format="%.4f")
+if BOTH_MODELS:
+    model_pairs.to_csv(config.TABLE_DIR / "full_run_model_pairs.csv",
+                       index=False, float_format="%.4f")
+print(f"tables written to {config.TABLE_DIR}")
+print(f"figures written to {config.FIGURE_DIR}")
+
+summary = pd.DataFrame({
+    "yield RMSE (t/ha)": {m: round(v["rmse"], 2) for m, v in yield_pooled.items()},
+    "yield Bias (t/ha)": {m: round(v["bias"], 2) for m, v in yield_pooled.items()},
+    "yield Pearson r": {m: round(v["pearson_r"], 2) for m, v in yield_pooled.items()},
+})
+summary
+'''),
+    md("""
+### What this notebook can and cannot say
+
+* **§4-5 score each model against an external reference**, exactly as the
+  single-model notebooks do — a country either model gets wrong is a genuine
+  finding there.
+* **§6 cannot say which model is right.** It says whether the two production
+  runs agree, and §6.1 says how much of any disagreement is simply a different
+  sowing convention rather than a model difference — read it before the rest
+  of the section.
+* **This is the delivered pipeline, not a controlled experiment.** Unlike
+  `stresstest_evaluation.ipynb`, nothing here has been forced equal, so a
+  disagreement in §6 can come from the sowing date, the crop parameters, the
+  year range, or the model physics — this notebook does not separate them.
+  `stresstest_evaluation.ipynb` is where that separation is done.
+* **Re-run once both arrays finish.** `submit/submit_cropmodelling.sh --status`
+  reports what each stage has completed; §2's model list is this notebook's
+  own record of what it actually saw.
+"""),
+]
+
+
 if __name__ == "__main__":
     write("yield_evaluation.ipynb", yield_cells)
     write("phenology_evaluation.ipynb", phenology_cells)
     write("gdhy_yield_evaluation.ipynb", gdhy_cells)
     write("sage_calendar_evaluation.ipynb", sage_cells)
     write("germany_smoke_evaluation.ipynb", germany_cells)
+    write("stresstest_evaluation.ipynb", stresstest_cells)
+    write("full_run_evaluation.ipynb", full_run_cells)

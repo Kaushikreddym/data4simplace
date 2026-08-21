@@ -48,6 +48,8 @@ __all__ = [
     "SCHENGEN_NON_EU",
     "SIM_PARQUET",
     "SIM_SOWING_DOY",
+    "SIMPLACE_PARQUET",
+    "SIMPLACE_RUN_DIR",
     "SNAP_KM",
     "STAGES",
     "TABLE_DIR",
@@ -83,6 +85,25 @@ TORCHCROP_RUN_DIR: Final[Path] = _env_path(
 #: regrid round-trip that would blur cells across national borders.
 SIM_PARQUET: Final[Path] = _env_path(
     "SIM_PARQUET", str(TORCHCROP_RUN_DIR / "torchcrop_europe.parquet")
+)
+
+#: A finished SIMPLACE run directory, written by ``cm4eu simplace collect``
+#: (see ``submit/submit_cropmodelling.sh``). Sibling of TORCHCROP_RUN_DIR, kept
+#: separate rather than derived from it: the two pipelines write to different
+#: roots (``.../cropmodelling4eu/<run>/simplace`` against
+#: ``.../torchcrop/<run>``), and a run is routinely evaluated with one side
+#: finished before the other.
+SIMPLACE_RUN_DIR: Final[Path] = _env_path(
+    "SIMPLACE_RUN_DIR",
+    "/data01/FDS/muduchuru/Data/SIMPLACE/cropmodelling4eu/winter_wheat_2000_2024/simplace",
+)
+
+#: One row per (cell, season), written by ``cm4eu simplace collect``. Unlike
+#: :data:`SIM_PARQUET` this already carries the dates SIMPLACE simulated
+#: (``sowing_doy``, ``maturity_doy``) rather than a latch to be derived --
+#: see :mod:`.fullrun`.
+SIMPLACE_PARQUET: Final[Path] = _env_path(
+    "SIMPLACE_PARQUET", str(SIMPLACE_RUN_DIR / "simplace_europe.parquet")
 )
 
 CYBENCH_ROOT: Final[Path] = _env_path(

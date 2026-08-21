@@ -36,6 +36,30 @@ tc_banner "TORCHCROP SHARD ${SHARD} / ${TC_N_SHARDS}"
 cd "${TC_PROJECT_DIR}" || exit 1
 mkdir -p "${TC_SHARD_DIR}"
 
+CROP_ARG=()
+if [ -n "${TC_CROP_FILE:-}" ] && [ -f "${TC_CROP_FILE}" ]; then
+    CROP_ARG=(--crop-file "${TC_CROP_FILE}")
+    echo "Crop params  : ${TC_CROP_FILE}"
+fi
+
+SOWING_ARG=()
+if [ -n "${TC_SOWING_FILE:-}" ]; then
+    [ -f "${TC_SOWING_FILE}" ] || {
+        echo "ERROR: TC_SOWING_FILE=${TC_SOWING_FILE} does not exist. The" >&2
+        echo "       SIMPLACE run it comes from has not been collected." >&2
+        exit 1
+    }
+    SOWING_ARG=(--sowing-file "${TC_SOWING_FILE}")
+    echo "Sowing dates : ${TC_SOWING_FILE} (SIMPLACE-simulated)"
+fi
+
+DAILY_ARG=()
+if [ "${TC_DAILY:-0}" -eq 1 ]; then
+    # shellcheck disable=SC2206
+    DAILY_ARG=(--daily --daily-variables ${TC_DAILY_VARIABLES})
+    echo "Daily output : torchcrop_daily_shard_<n>.parquet (${TC_DAILY_VARIABLES})"
+fi
+
 srun --cpu-bind=none python -m cropmodelling4eu.torchcrop.run \
     --shard "${SHARD}" \
     --n-shards "${TC_N_SHARDS}" \
@@ -49,7 +73,10 @@ srun --cpu-bind=none python -m cropmodelling4eu.torchcrop.run \
     --batch-size "${TC_BATCH_SIZE}" \
     --io-workers "${TC_IO_WORKERS}" \
     --torch-threads "${TC_TORCH_THREADS}" \
-    --device cpu
+    --device cpu \
+    ${CROP_ARG[@]:+"${CROP_ARG[@]}"} \
+    ${SOWING_ARG[@]:+"${SOWING_ARG[@]}"} \
+    ${DAILY_ARG[@]:+"${DAILY_ARG[@]}"}
 STATUS=$?
 
 echo ""

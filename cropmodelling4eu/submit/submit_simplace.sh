@@ -56,27 +56,29 @@ cd "${SP_PROJECT_DIR}" || exit 1
 CELLS_ARG=()
 if [ "${SMOKE}" -eq 1 ]; then
     mkdir -p "${SP_SMOKE_DIR}"
-    SP_RUN_DIR="${SP_SMOKE_DIR}/simplace"
-    SP_CONFIG="${SP_SMOKE_DIR}/smoke.yaml"
     CELLS="${SP_SMOKE_DIR}/de_cells.csv"
+    # SP_IOPT set (an IOPT sweep) -> its own run directory and config, since a
+    # solution's vIOPT has no CLI override and each value is therefore a
+    # separate build. Empty -> the single-run layout unchanged from before the
+    # sweep existed.
+    if [ -n "${SP_IOPT}" ]; then
+        SP_RUN_DIR="${SP_SMOKE_DIR}/simplace_iopt${SP_IOPT}"
+        SP_CONFIG="${SP_SMOKE_DIR}/smoke_iopt${SP_IOPT}.yaml"
+    else
+        SP_RUN_DIR="${SP_SMOKE_DIR}/simplace"
+        SP_CONFIG="${SP_SMOKE_DIR}/smoke.yaml"
+    fi
 
     # Derived from the main config, so the smoke test cannot drift away from
-    # the run it is meant to be a smoke test of.
-    python - "${SP_PROJECT_DIR}/config.yaml" "${SP_CONFIG}" \
-        "${SP_SMOKE_START}" "${SP_SMOKE_END}" <<'PY' || exit 1
-import sys, yaml
-src, dst, start, end = sys.argv[1:5]
-cfg = yaml.safe_load(open(src))
-cfg["run_name"] = "de_smoke"
-cfg["season"] |= {"start_year": int(start), "end_year": int(end)}
-# A season needs the year before it, and SIMPLACE's own window must cover both.
-cfg["simplace"] |= {
-    "start_date": f"{cfg['season']['start_year'] - 2}-01-01",
-    "end_date": f"{cfg['season']['end_year'] + 1}-12-31",
-    "lines_per_task": 10_000,
-}
-yaml.safe_dump(cfg, open(dst, "w"), sort_keys=False)
-PY
+    # the run it is meant to be a smoke test of. Shared with
+    # submit_torchcrop.sh --smoke, which writes this same file: the two models
+    # must get the same cells and the same seasons to be comparable.
+    IOPT_ARG=()
+    [ -n "${SP_IOPT}" ] && IOPT_ARG=(--iopt "${SP_IOPT}")
+    python scripts/make_smoke_config.py --config "${SP_PROJECT_DIR}/config.yaml" \
+        --out "${SP_CONFIG}" \
+        --start-year "${SP_SMOKE_START}" --end-year "${SP_SMOKE_END}" \
+        ${IOPT_ARG[@]:+"${IOPT_ARG[@]}"} || exit 1
 
     if [ ! -f "${CELLS}" ]; then
         echo "Selecting ${SP_SMOKE_CELLS} German cells (one per NUTS-3 region)..."
@@ -135,6 +137,17 @@ fi
 "${BUILT_DIR}/submit.sh" ${PASS_THROUGH[@]:+"${PASS_THROUGH[@]}"} || exit 1
 cm4eu simplace collect --config "${SP_CONFIG}" --out-dir "${BUILT_DIR}" || exit 1
 
+TC_OUT="${SP_SMOKE_DIR}/de_torchcrop${SP_IOPT:+_iopt${SP_IOPT}}.parquet"
+IOPT_LINE=""
+IOPT_CLI="--iopt ${SP_IOPT}"
+if [ -n "${SP_IOPT}" ]; then
+    IOPT_LINE="  iopt     : ${SP_IOPT} (this build only -- run again with a "
+    IOPT_LINE+="different SP_IOPT to sweep)
+"
+else
+    IOPT_CLI=""
+fi
+
 cat <<EOF
 
 ==================================================
@@ -143,13 +156,13 @@ SMOKE TEST READY TO EVALUATE
   cells    : ${CELLS}
   simplace : ${BUILT_DIR}/simplace_europe.parquet
   seasons  : ${SP_SMOKE_START}-${SP_SMOKE_END}
-
+${IOPT_LINE}
 Score it against CyBench yields and PEP725 phenology:
 
   python scripts/run_cells_torchcrop.py --config ${SP_CONFIG} \
-      --cells ${CELLS} --out ${SP_SMOKE_DIR}/de_torchcrop.parquet
+      --cells ${CELLS} ${IOPT_CLI} --out ${TC_OUT}
   python scripts/validate_germany.py --cells ${CELLS} \
-      --torchcrop ${SP_SMOKE_DIR}/de_torchcrop.parquet \
+      --torchcrop ${TC_OUT} \
       --simplace ${BUILT_DIR}/simplace_europe.parquet \
       --out-dir ${SP_SMOKE_DIR}/validation
 

@@ -11,9 +11,22 @@ evaluation/
 ├── phenology_evaluation.ipynb      # stage dates vs CyBench: RMSE, MAE, Bias, Pearson r
 ├── gdhy_yield_evaluation.ipynb     # yield vs GDHY, per 0.5° cell
 ├── sage_calendar_evaluation.ipynb  # sowing/maturity vs SAGE, per 0.5° cell
-├── _build_notebooks.py             # regenerates all four notebooks from cell lists
+├── germany_smoke_evaluation.ipynb  # ~30 German cells, both models vs CyBench + PEP725
+├── stresstest_evaluation.ipynb     # SIMPLACE vs torchcrop with every input matched
+├── _build_notebooks.py             # regenerates every notebook from cell lists
 └── outputs/                        # figures/, tables/, cache/ (git-ignored)
 ```
+
+The last two evaluate **two models**, not one, and they ask different questions
+of the same pair. `germany_smoke_evaluation.ipynb` asks how close to
+observations each gets, and accepts that they differ in every respect.
+`stresstest_evaluation.ipynb` reads the run
+[`submit/submit_stresstest.py`](../submit/submit_stresstest.py) produces, in
+which every difference that is not the model itself has been removed — crop
+parameters, sowing date, spin-up, irrigation, CO₂ — so it can ask whether the
+two then agree. **It contains no observation**: every number in it is signed
+`torchcrop − simplace`, and a disagreement says the two are not the same model,
+never which one is right.
 
 ## Why four notebooks, not two
 
@@ -184,7 +197,7 @@ CyBench, cell-year or cell for GDHY/SAGE) as CSV.
 
 ## Regenerating the notebooks
 
-All four notebooks are built from cell lists in `_build_notebooks.py`, so
+Every notebook is built from a cell list in `_build_notebooks.py`, so
 prose and code changes are reviewable as a normal diff. **Rebuilding replaces
 every cell's outputs with empty ones** — it does not merely append cells — so
 re-execute afterwards or the notebooks on disk will carry no figures:
@@ -212,6 +225,8 @@ from cropmodelling4eu.evaluation import config, metrics, plots
 | `cybench.py` | CyBench reference loaders (yield, calendar, crop mask) |
 | `gdhy.py` | GDHY gridded-yield loader |
 | `sage.py` | SAGE crop-calendar loader |
+| `germany.py` | The Germany smoke test: run loaders, PEP725 matching, its figures |
+| `stresstest.py` | The stress-test run: loaders, model-vs-model pairing, its figures |
 | `regions.py` | Country geometry, cell-to-country assignment |
 | `grid.py` | Binning the 10 km run onto the 0.5° reference grid, gridded pairing |
 | `aggregate.py` | Weighted and circular aggregation to country level, pairing |

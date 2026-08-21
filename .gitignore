@@ -30,3 +30,6 @@ outputs_demo/
 # Notebook-generated figures, tables and NetCDF
 notebooks/outputs/
 cropmodelling4eu/evaluation/outputs/
+cropmodelling4eu/simplace
+cropmodelling4eu/outputs/
+CLAUDE.md

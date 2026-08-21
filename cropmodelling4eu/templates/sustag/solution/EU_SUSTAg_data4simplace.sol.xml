@@ -28,10 +28,16 @@ column is entirely the -99.9 sentinel falls back to the FAO-56 default 2.0 m/s
 -- which every export written to date does. Check that column before trusting
 an ET0 result; see the CASE in `weather_conv`.
 
-The fertilizer resource still keys on gcm_rcp/period/CO2_level/Rate, which the
-export's schedule does not supply. Until that dialect exists the simmodel skip
-guard below skips every day SILENTLY. That is the one remaining blocker to a
-run.
+The fertilizer resource now reads simplace.export_dir's own
+`management/fertilizer_winter_wheat.csv` -- the Brandenburg dialect
+(location, FertilizerScenario, crop, Event, Type, DVS, Amount, product grams
+per carrier), which the export already writes with no extra config -- instead
+of the source solution's gcm_rcp/period/CO2_level/Rate keys, which an
+observational MSWX run has no scenario axis to supply. `inorganicfertilizerparameters`
+is keyed on the event's own `Type` (PK, KAS, ...) rather than a fixed
+`vFertilizertype`, and reads `fertilizer_composition.xml` from
+`simplace.paths.composition_file` -- both exactly as the Brandenburg solution's
+own `management2`/`fertilizerparameters` pair already work.
 
 === Usage ===
   simplace.solution_file: this file
@@ -58,6 +64,10 @@ WIKI_END</description>
     <var id="vAltitude" datatype="DOUBLE">252.0</var>
     <var id="vALFA" datatype="DOUBLEARRAY">{0.95,0.95,0.95,0.95,0.95,0.95,0.95,0.95,0.95,0.95,0.95,0.95,0.95,0.95,0.95,0.95,0.95,0.95,0.95,0.95,0.95,0.95,0.95,0.95,0.95,0.95,0.95,0.95,0.95,0.95,0.95,0.95,0.95}</var>
     <var id="vENZ" datatype="INT">4</var>
+    <!-- The Brandenburg-dialect schedule (fertilizer_winter_wheat.csv) uses
+         the same one-scenario-for-every-cell convention as the source
+         solution's own fertilizer file: every row's FertilizerScenario is 2. -->
+    <var id="vFertilizerScenario" datatype="INT">2</var>
     <var id="vFertilizertype" datatype="CHAR">CAPRI</var>
     <var id="vfw" datatype="DOUBLE">1.0</var>
     <var id="vIOPT" datatype="INT">3</var>
@@ -139,9 +149,13 @@ WIKI_END</description>
       <poolsize>1</poolsize>
       <filename>${_WORKDIR_}/faye/Rotation_monocrop/data/management/management.xml</filename>
     </interface>
+    <!-- simplace.paths.composition_file, bound into the workspace at this
+         path exactly as the Brandenburg solution reads it; not part of the
+         export, since it is a static reference table (carrier compositions),
+         not a per-cell schedule. -->
     <interface id="fertilizercomposition" type="XML">
       <poolsize>1</poolsize>
-      <filename>${_WORKDIR_}/faye/Rotation_monocrop/data/management/fertilizer_composition.xml</filename>
+      <filename>${_WORKDIR_}/data/management/fertilizer_composition.xml</filename>
     </interface>
     <interface id="gcm_rcp_scenariofile" type="CSV">
      <poolsize>1</poolsize>
@@ -180,10 +194,15 @@ WIKI_END</description>
       <divider />
       <filename>${_WORKDIR_}/faye/Rotation_monocrop/data/soil_cn/Init.xml</filename>
     </interface>
+    <!-- The Brandenburg-dialect schedule data4simplace's default (wide)
+         export already writes, at simplace.export_dir/management/
+         fertilizer_winter_wheat.csv: no re-export needed, and not the
+         Rotation_monocrop reference copy or the long/scenario-keyed dialect.
+         See the fertilizer resource below for the columns this reads. -->
     <interface id="fertilizerfile" type="CSV">
       <poolsize>10</poolsize>
       <divider>,</divider>
-      <filename>${_WORKDIR_}/faye/Rotation_monocrop/data/management/fertilizer.csv</filename>
+      <filename>${_WORKDIR_}/data/management/fertilizer_winter_wheat.csv</filename>
     </interface>
     <interface id="residuefile" type="CSV">
       <poolsize>10</poolsize>
@@ -405,9 +424,15 @@ WIKI_END</description>
 	  </header>
 	</resource>
 
+	<!-- Keyed on the fertilizer resource's own per-event Type (its Brandenburg
+	     name for the carrier, e.g. PK, KAS), not the fixed vFertilizertype:
+	     the Brandenburg schedule mixes carriers within one schedule, so the
+	     composition lookup must follow whichever event just fired, exactly
+	     as the Brandenburg solution's own fertilizerparameters resource
+	     (keyed on management2.Type) does. -->
 	<resource id="inorganicfertilizerparameters" interface="fertilizercomposition" frequence="BOOLEAN" rule="DefaultManagement.DoUpdateInorganicFertilizerSettings" dbcache="FALSE">
 	  <header>
-		<res id="Fertilizertype" datatype="CHAR" key="vFertilizertype" />
+		<res id="Fertilizertype" datatype="CHAR" key="fertilizer.Type" />
 		<res id="Nitrate" datatype="DOUBLE" />
 		<res id="Ammonium" datatype="DOUBLE" />
 		<res id="Potassium" datatype="DOUBLE" />
@@ -418,17 +443,20 @@ WIKI_END</description>
 	  </header>
 	</resource>
 
+    <!-- The Brandenburg dialect, unchanged from how the Brandenburg solution
+         itself reads the very same fertilizer_winter_wheat.csv (its
+         "management2" resource): location, FertilizerScenario, crop, Event,
+         Type, DVS, Amount, product grams keyed on the cell + one flat
+         scenario (every row is FertilizerScenario=2) + the event number.
+         Only "Location" is spelled differently here (vLocationId, not
+         vLocationID) to match this solution's own per-cell variable. -->
     <resource id="fertilizer" interface="fertilizerfile" frequence="DAILY" rule="DefaultManagement.DoUpdateInorganicFertilizerSettings" dbcache="FALSE">
       <header>
-      	<res id="vLocationId" datatype="CHAR" unit="-" key="vLocationId" />
-      	<res id="ENZ" datatype="INT" key="vENZ" />
-      	<res id="Crop" datatype="CHAR" key="vCrop" />
-      	<res id="gcm_rcp" datatype="CHAR" key="gcm_rcp_scenario.Gcm_rcp" />
-      	<res id="period" datatype="INT" key="gcm_rcp_scenario.Period"/>
-      	<res id="CO2_level" datatype="CHAR" key="gcm_rcp_scenario.CO2_level" />
-      	 <res id="Rate" datatype="DOUBLE" key="vrate" />
-      	<res id="Irrigation" datatype="INT" key="vIRRIGATION"/>
-        <res id="Number" datatype="INT" unit="-" key="DefaultManagement.EventNr" />
+      	<res id="location" datatype="CHAR" key="vLocationId" />
+      	<res id="FertilizerScenario" datatype="INT" key="vFertilizerScenario" />
+      	<res id="crop" datatype="CHAR" />
+        <res id="Event" datatype="INT" unit="-" key="DefaultManagement.EventNr" />
+        <res id="Type" datatype="CHAR" />
         <res id="DVS" datatype="DOUBLE" unit=""  />
         <res id="Amount" datatype="DOUBLE" unit="" />
       </header>
@@ -1301,8 +1329,16 @@ WIKI_END</description>
       </action>
     </simcomponent>
 
-    <simcomponent id="LintulWaterStress" class="net.simplace.sim.components.models.lintul.LintulWaterStress">
-      <input id="cDroughtTolerance" source="vDroughtTolerance" />
+    <simcomponent id="LintulWaterStress" class="net.simplace.sim.components.models.lintul5.modular.WaterStress">
+      <!-- Was net.simplace.sim.components.models.lintul.LintulWaterStress, which
+           has no cIOPT input at all and always computes TRANRF from the
+           actual/potential transpiration ratio, so vIOPT=1 (potential run)
+           never forced TRANRF=1. This component checks cIOPT<=1 and pins
+           TRANRF to 1 in that case, matching what an IOPT=1 run is supposed
+           to mean. -->
+      <input id="cIOPT" source="vIOPT" />
+      <input id="iDoSow" source="DefaultManagement.DoSow" />
+      <input id="iDoHarvest" source="HarvestManagement.DoHarvest" />
       <input id="iPotentialTranspiration" source="CO2Tran.Transpiration" />
       <input id="iActualTranspiration" source="SlimWater.Transpiration" />
     </simcomponent>

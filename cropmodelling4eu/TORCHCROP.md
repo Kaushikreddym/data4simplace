@@ -13,11 +13,31 @@ list of inputs the export cannot supply are derived in
 
 ## Quick start
 
+Chained behind SIMPLACE, which is how the two are meant to be compared:
+
+```bash
+./submit/submit_cropmodelling.sh --dry-run    # print the plan, submit nothing
+./submit/submit_cropmodelling.sh              # simplace array -> handoff -> torchcrop
+./submit/submit_cropmodelling.sh --status     # what each of the three stages has finished
+./submit/submit_cropmodelling.sh --retry      # re-run what failed, in order
+./submit/submit_cropmodelling.sh --smoke      # 30 German cells, both models here
+```
+
+Chaining matters because SIMPLACE's sowing date is a *result*: the rule-based
+solution sows on the first day inside the planting window on which a weather
+rule fires. torchcrop latches one day-of-year, so run alone it takes the
+export's proposed date and the two models grow different seasons. On the smoke
+cells the handoff moves torchcrop's sowing from DOY 290 to SIMPLACE's 273-289,
+which is the difference between comparing two models and comparing two
+calendars.
+
+
 ```bash
 ./submit/submit_torchcrop.sh --dry-run    # show the plan, submit nothing
 ./submit/submit_torchcrop.sh              # shard array + combine + maps
 ./submit/torchcrop_status.sh              # progress, queue, failed shards
 ./submit/submit_torchcrop.sh --retry      # resubmit only the missing shards
+./submit/submit_torchcrop.sh --smoke      # 30 German cells here, then evaluate
 ./submit/submit_torchcrop.sh --maps-only  # re-render maps from existing shards
 ```
 
@@ -25,7 +45,7 @@ Defaults (all overridable, see [`torchcrop_env.sh`](torchcrop_env.sh)):
 
 | | |
 | --- | --- |
-| input | `/data01/FDS/muduchuru/Data/SIMPLACE/europe_torchcrop` |
+| input | `/data01/FDS/muduchuru/Data/SIMPLACE/EU` |
 | cells | weather ∩ soil ∩ management = **68 685** of 70 705 |
 | seasons | `TC_START_YEAR=2000` … `TC_END_YEAR=2024` (winter wheat, sown 1 Sep of Y−1) |
 | run mode | `TC_IOPT=3` — water + N limited |
@@ -40,6 +60,26 @@ TC_START_YEAR=1980 TC_TIME=12:00:00 ./submit/submit_torchcrop.sh   # all 45 seas
 TC_RUN_NAME=potential TC_IOPT=1 ./submit/submit_torchcrop.sh       # potential yield
 TC_RUN_NAME=test TC_END_YEAR=2001 ./submit/submit_torchcrop.sh     # 2 seasons
 ```
+
+## The working directory
+
+`<TC_OUT_DIR>/workspace/` is written before the array is submitted and holds
+what the run will *use*, not what it produced:
+
+| File | |
+| --- | --- |
+| `crop_<crop>.yaml` | The crop parameters, as a complete torchcrop preset. Loaded with `CropParameters(config_file=...)`, so it is the input — edit it and the next run uses the edit |
+| `config_run.yaml` | The resolved `RunConfig`: the grid, seasons and export the run decoded against |
+| `crop_parameter_audit.csv` | Every parameter beside SIMPLACE's `crop.xml`, with a verdict per row |
+
+It exists because torchcrop's parameters otherwise live inside the installed
+package, where "which crop did this run use?" can only be answered by
+re-deriving it. `TC_CROP_SOURCE` selects what goes in the file: `simplace`
+(the default, matching the smoke test) rebuilds it from the solution's own
+`crop.xml` plus the `NRF`/`PRF`/`KRF` recovery fractions of `management.xml`,
+so the production run and the smoke test are the same setup; `torchcrop`
+writes the bundled preset out unchanged instead, for a run that intentionally
+wants torchcrop's own calibration rather than SIMPLACE's.
 
 ## Sharding and batching
 

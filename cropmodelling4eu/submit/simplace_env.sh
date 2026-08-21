@@ -37,10 +37,22 @@ export SP_RUN_DIR="${SP_RUN_DIR:-}"
 # the only domain where both references are dense.
 export SP_SMOKE_CELLS="${SP_SMOKE_CELLS:-30}"
 export SP_SMOKE_DIR="${SP_SMOKE_DIR:-/data01/FDS/muduchuru/Data/SIMPLACE/cropmodelling4eu/de_smoke}"
-# Harvest years to score. The full window is wasted here: CyBench DE covers
-# 1999-2023 and PEP725's wheat records thin out sharply before 2000.
-export SP_SMOKE_START="${SP_SMOKE_START:-2000}"
-export SP_SMOKE_END="${SP_SMOKE_END:-2010}"
+# Harvest years to score: 2003, the European drought, and 2005, an ordinary
+# year beside it -- the contrast the daily LAI/AGB/NNI/TRANRF comparison in
+# germany_smoke_evaluation.ipynb is built around. SIMPLACE runs the window
+# continuously, so 2004 is produced too as a byproduct; it is reported but not
+# the point. Both inside CyBench DE's 1999-2023 coverage and past where
+# PEP725's wheat records thin out.
+export SP_SMOKE_START="${SP_SMOKE_START:-1989}"
+export SP_SMOKE_END="${SP_SMOKE_END:-2024}"
+# Empty -> the config's own simplace.iopt (1, potential production). Set to
+# sweep vIOPT: unlike torchcrop's --iopt there is no CLI override for a
+# solution's vIOPT, so a non-empty value here builds and runs a *separate*
+# solution under its own simplace_iopt<n>/ directory (see --smoke below)
+# rather than patching one run. submit_cropmodelling.sh --smoke sets this
+# once per value in TC_SMOKE_IOPTS to sweep both models together; set by hand
+# for a single other value, e.g. SP_IOPT=2 ./submit/submit_simplace.sh --smoke.
+export SP_IOPT="${SP_IOPT:-}"
 
 # --- Sharding ----------------------------------------------------------------
 # SIMPLACE selects work by project-file line range (`-l=START-END`), so the
@@ -51,10 +63,38 @@ export SP_LINES_PER_TASK="${SP_LINES_PER_TASK:-500}"
 
 # --- SLURM -------------------------------------------------------------------
 export SP_PARTITION="${SP_PARTITION:-compute}"
-export SP_CPUS="${SP_CPUS:-80}"
+# SIMPLACE's `-l=START-END` is one thread in one JVM, so SP_CPUS only buys
+# concurrency through SP_CORES_PER_TASK below -- sized to it (+1 for the
+# run_task.sh wrapper), not to the node, since a lone JVM asking for a whole
+# node schedules far behind smaller jobs on a busy fair-share cluster and
+# leaves every core past SP_CORES_PER_TASK idle regardless.
+export SP_CPUS="${SP_CPUS:-2}"
+# Each SIMPLACE JVM reports its own container as "RAM: 32.0 GB" regardless of
+# what SP_MEM actually is, and several concurrent JVMs each approaching that
+# is what OOM-killed SP_CORES_PER_TASK=6 at this same SP_MEM (sacct: MaxRSS
+# pinned at the 80G cap, exit 0:125, after ~18 min -- see run 782877). 80G
+# comfortably covers one JVM with a wide margin and is unchanged from what
+# already ran successfully at up to 6 concurrent JVMs.
 export SP_MEM="${SP_MEM:-80G}"
 export SP_TIME="${SP_TIME:-12:00:00}"
-export SP_MAX_CONCURRENT="${SP_MAX_CONCURRENT:-10}"
+export SP_MAX_CONCURRENT="${SP_MAX_CONCURRENT:-20}"
+# SIMPLACE's `-l=START-END` runs in one thread of one JVM, so SP_CPUS alone
+# leaves every core past the first idle. run_task.sh fans a task's own line
+# range across this many concurrent singularity/JVM invocations instead --
+# the same pattern SP_MAX_CONCURRENT already uses across array tasks, just
+# within one.
+#
+# 1 (default) is the proven-safe setting: one JVM per task cannot oversubscribe
+# against itself. Values above 1 multiply per-JVM memory (each JVM behaves as
+# though it has ~32 GB to itself, see the SP_MEM note above) faster than
+# SP_MEM scales with it -- 6 OOM-killed most tasks of a retry at this SP_MEM.
+# 2 completed cleanly (piloted on line range 2501-3000, job 785392: 48m33s,
+# peak 70 GB of the 80G budget) -- a viable speedup for a *future* run, not
+# applied here since the array already queued at 1. Raise it only with SP_MEM
+# raised to match, and only after piloting a single range with
+# `submit.sh --lines START-END` first -- a bad value fails an entire array's
+# worth of nodes, not one task.
+export SP_CORES_PER_TASK="${SP_CORES_PER_TASK:-1}"
 
 export HDF5_USE_FILE_LOCKING=FALSE      # BeeGFS + h5netcdf/netCDF4
 
@@ -91,6 +131,7 @@ sp_banner() {
     echo "  config      : ${SP_CONFIG}"
     echo "  run         : ${SP_RUN_NAME}"
     echo "  lines/task  : ${SP_LINES_PER_TASK}"
+    echo "  cores/task  : ${SP_CORES_PER_TASK}"
     echo "  started     : $(date -Is)"
     echo "=================================================="
 }
