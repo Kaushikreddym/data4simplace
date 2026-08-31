@@ -34,7 +34,7 @@ dependencies = [
 # torch is not a base dependency: the SIMPLACE side of the package runs a
 # Singularity container and needs none of it, and torch is a ~2 GB install.
 torchcrop = ["torch>=2.0"]
-evaluation = ["geopandas>=0.14", "cartopy>=0.22", "matplotlib>=3.8", "scipy>=1.10"]
+evaluation = ["geopandas>=0.14", "cartopy>=0.22", "matplotlib>=3.8", "scipy>=1.10", "colormaps>=0.4"]
 dev = [
     "pytest>=7.0",
     "pytest-cov>=4.0",

@@ -77,7 +77,7 @@ CROP: Final[str] = "wheat"
 #: A finished TorchCrop shard-combine (see ``submit/TORCHCROP.md``).
 TORCHCROP_RUN_DIR: Final[Path] = _env_path(
     "TORCHCROP_RUN_DIR",
-    "/data01/FDS/muduchuru/Data/SIMPLACE/torchcrop/winter_wheat_2000_2024",
+    "/data01/FDS/muduchuru/Data/SIMPLACE/cropmodelling4eu/winter_wheat_2000_2024/torchcrop",
 )
 
 #: One row per (cell, season). The gridded NetCDF twin is not used: the Parquet
@@ -88,11 +88,11 @@ SIM_PARQUET: Final[Path] = _env_path(
 )
 
 #: A finished SIMPLACE run directory, written by ``cm4eu simplace collect``
-#: (see ``submit/submit_cropmodelling.sh``). Sibling of TORCHCROP_RUN_DIR, kept
-#: separate rather than derived from it: the two pipelines write to different
-#: roots (``.../cropmodelling4eu/<run>/simplace`` against
-#: ``.../torchcrop/<run>``), and a run is routinely evaluated with one side
-#: finished before the other.
+#: (see ``submit/submit_cropmodelling.sh``). Sibling of TORCHCROP_RUN_DIR under
+#: the same ``.../cropmodelling4eu/<run>/`` root (``simplace/`` next to
+#: ``torchcrop/``), kept as its own variable rather than derived from
+#: TORCHCROP_RUN_DIR since a run is routinely evaluated with one side finished
+#: before the other.
 SIMPLACE_RUN_DIR: Final[Path] = _env_path(
     "SIMPLACE_RUN_DIR",
     "/data01/FDS/muduchuru/Data/SIMPLACE/cropmodelling4eu/winter_wheat_2000_2024/simplace",

@@ -36,7 +36,7 @@ grid:
 # runnable year is one past the weather record's first (1979 -> 1980).
 season:
   start_year: 2000
-  end_year: 2002
+  end_year: 2024
   crop: wheat
 
 # --- torchcrop (differentiable LINTUL-5) -------------------------------------
@@ -44,7 +44,7 @@ torchcrop:
   # 1 potential | 2 water-limited | 3 water+N | 4 water+NPK.
   # 3 is the default because no European soil P or K layer exists — iopt=4
   # would run on torchcrop's built-in defaults, not on data.
-  iopt: 1
+  iopt: 3
   # Cells per model call. LINTUL-5 loops over days in Python, so per-cell cost
   # collapses as the batch grows: measured 40 ms/cell-year at 128, 9.4 at 1024,
   # 5.2 at 2048. The ceiling is memory (ModelOutput retains every per-day
@@ -65,30 +65,33 @@ torchcrop:
 simplace:
   # A working SIMPLACE project: its solution/, project/ and data/. The XML is
   # rewritten into the run workspace, never edited in place.
-  template_dir: "/data01/FDS/muduchuru/codes/SIMPLACE/Brandenburg_1KM_winter_wheat"
+  template_dir: "/data01/FDS/muduchuru/Data/SIMPLACE/Rotation_monocrop"
   # Named explicitly: the folder holds more than one *.sol.xml, and a build that
   # picked one silently would run the wrong science.
   #
-  # These two are this repo's copies, not the template's own. They are the
-  # template's solution and project with the EU SUSTAg v2 sowing rules in place
-  # of its fixed vIDPL=250, and the two window columns added to the project
-  # header so the rules read the cell's own planting window. The template dir is
-  # still the Brandenburg project: everything else -- crop, soil, C/N, the
-  # linked data/ tree -- comes from there unchanged.
+  # EU_SUSTAg_data4simplace.sol.xml (see its own WIKI_START header) is
+  # EU_SUSTAg_macsurClimateRO_initialize_v2 adapted to read a data4simplace
+  # export directly -- no weather_contract conversion needed, the science is
+  # otherwise unchanged from the source solution.
   #
-  # To reproduce the constant-sowing-date runs, point both back at
-  # "solution/solution.sol.xml" and "project/project.proj.xml".
-  solution_file: "/data01/FDS/muduchuru/codes/GITHUB/data4simplace/cropmodelling4eu/templates/brandenburg/solution/brandenburg_rulesow.sol.xml"
-  project_file: "/data01/FDS/muduchuru/codes/GITHUB/data4simplace/cropmodelling4eu/templates/brandenburg/project/brandenburg_rulesow.proj.xml"
+  # project_file is this repo's own copy, not Rotation_monocrop's: none of
+  # its project.proj.xml files work as shipped (old cluster's projectid/
+  # simulationid keying, no vColumn/vRow -- every cell would silently read the
+  # same weather file -- and no sowing column at all). See the new file's own
+  # header for the full column-by-column rationale.
+  solution_file: "/data01/FDS/muduchuru/codes/GITHUB/data4simplace/cropmodelling4eu/templates/sustag/solution/EU_SUSTAg_data4simplace.sol.xml"
+  project_file: "/data01/FDS/muduchuru/codes/GITHUB/data4simplace/cropmodelling4eu/templates/sustag/project/EU_SUSTAg_data4simplace.proj.xml"
   singularity_image: "/beegfs/common/singularity/simplace/simplace_5.0-3897.sif"
   start_date: "1979-01-01"
   end_date: "2024-12-31"
-  iopt: 1
+  iopt: 3
 
-  # WHICH UNITS THE SOLUTION READS. Leaving this null is not a neutral default:
-  # the export writes radiation in W/m2 where this solution declares kJ/m2/d, so
-  # an unreconciled run completes normally and yields ~0.04 t/ha instead of ~7.
-  weather_contract: brandenburg
+  # WHICH UNITS THE SOLUTION READS. null here is deliberate for this solution:
+  # EU_SUSTAg_data4simplace.sol.xml declares its weather resource against the
+  # export's own columns directly (see its header), so no conversion is
+  # needed -- unlike brandenburg_rulesow.sol.xml, where null would silently
+  # run the export's W/m2 radiation against a kJ/m2/d declaration.
+  weather_contract: null
   # `transform` scales the column inside the solution's own SQL transformer and
   # leaves the weather symlinked; `files` writes converted copies (~15 GB for
   # Europe, ~1.5 h). Verified identical to 6 dp on 52 cell-years -- see

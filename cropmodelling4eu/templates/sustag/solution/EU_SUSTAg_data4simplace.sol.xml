@@ -136,18 +136,24 @@ WIKI_END</description>
       <divider />
       <filename>${_DATADIR_}/${vRow}/daily_mean_RES1_C${vColumn}R${vRow}.csv.gz</filename>
     </interface>
+    <!-- data4simplace's own soil_long.csv (reference.soil_file_long ->
+         SLIM_soil_EU_SUSTAg.csv), not the static reference file: the header
+         below was built from that file's own columns, so the dialect matches
+         column-for-column, but the depths are SoilGrids' native 6 horizons
+         per cell rather than the reference's 2. See workspace.py's
+         _populate_data, which links this file when the export has one. -->
     <interface id="soilfile" type="CSV">
       <poolsize>1</poolsize>
       <divider>,</divider>
-      <filename>${_WORKDIR_}/faye/Rotation_monocrop/data/soil/SLIM_soil_EU_SUSTAg.csv</filename>
+      <filename>${_WORKDIR_}/data/soil/soil_long.csv</filename>
     </interface>
     <interface id="cropfile" type="XML">
       <poolsize>1</poolsize>
-      <filename>${_WORKDIR_}/faye/Rotation_monocrop/data/crop/LINTUL5_crop.xml</filename>
+      <filename>${_WORKDIR_}/data/crop/LINTUL5_crop.xml</filename>
     </interface>
     <interface id="managementfile" type="XML">
       <poolsize>1</poolsize>
-      <filename>${_WORKDIR_}/faye/Rotation_monocrop/data/management/management.xml</filename>
+      <filename>${_WORKDIR_}/data/management/management.xml</filename>
     </interface>
     <!-- simplace.paths.composition_file, bound into the workspace at this
          path exactly as the Brandenburg solution reads it; not part of the
@@ -160,39 +166,39 @@ WIKI_END</description>
     <interface id="gcm_rcp_scenariofile" type="CSV">
      <poolsize>1</poolsize>
      <divider>,</divider>
-     <filename>${_WORKDIR_}/faye/Rotation_monocrop/data/project/ClimPerCO2.csv</filename>
+     <filename>${_WORKDIR_}/data/project/ClimPerCO2.csv</filename>
      </interface>
      <!-- tsum interface disabled: TSUM1/TSUM2 now come from the crop file, not the precalculated CSV -->
      <!-- <interface id="tsumfile" type="CSV">
      <poolsize>1</poolsize>
      <divider>,</divider>
-     <filename>${_WORKDIR_}/faye/Rotation_monocrop/data/project/Calculate_TSUM1_TSUM2_v2.csv.gz</filename>
+     <filename>${_WORKDIR_}/data/project/Calculate_TSUM1_TSUM2_v2.csv.gz</filename>
      </interface> -->
     <interface id="slimfile" type="XML">
       <poolsize>1</poolsize>
       <divider />
-      <filename>${_WORKDIR_}/faye/Rotation_monocrop/data/soil/SLIMProperties_1P.xml</filename>
+      <filename>${_WORKDIR_}/data/soil/SLIMProperties_1P.xml</filename>
     </interface>
 
     <interface id="carbonfile" type="XML">
       <poolsize>10</poolsize>
       <divider />
-      <filename>${_WORKDIR_}/faye/Rotation_monocrop/data/soil_cn/Carbon.xml</filename>
+      <filename>${_WORKDIR_}/data/soil_cn/Carbon.xml</filename>
     </interface>
     <interface id="nitrogenfile" type="XML">
       <poolsize>10</poolsize>
       <divider />
-      <filename>${_WORKDIR_}/faye/Rotation_monocrop/data/soil_cn/Nitrogen.xml</filename>
+      <filename>${_WORKDIR_}/data/soil_cn/Nitrogen.xml</filename>
     </interface>
     <interface id="soilcropfile" type="XML">
       <poolsize>10</poolsize>
       <divider />
-      <filename>${_WORKDIR_}/faye/Rotation_monocrop/data/soil_cn/SoilCropProperties.xml</filename>
+      <filename>${_WORKDIR_}/data/soil_cn/SoilCropProperties.xml</filename>
     </interface>
     <interface id="initfile" type="XML">
       <poolsize>10</poolsize>
       <divider />
-      <filename>${_WORKDIR_}/faye/Rotation_monocrop/data/soil_cn/Init.xml</filename>
+      <filename>${_WORKDIR_}/data/soil_cn/Init.xml</filename>
     </interface>
     <!-- The Brandenburg-dialect schedule data4simplace's default (wide)
          export already writes, at simplace.export_dir/management/
@@ -207,14 +213,20 @@ WIKI_END</description>
     <interface id="residuefile" type="CSV">
       <poolsize>10</poolsize>
       <divider>,</divider>
-      <filename>${_WORKDIR_}/faye/Rotation_monocrop/data/management/residues.csv</filename>
+      <filename>${_WORKDIR_}/data/management/residues.csv</filename>
     </interface>
         <!-- __________________________________O U T P U T S_____________________________________________________________________________-->
     <!-- outputs are defined in project file-->
+    <!-- Per-cell, not the reference's single pooled EU_SUSTAg_summary_80.csv:
+         cropmodelling4eu.simplace.collect.read_yearly requires exactly
+         <vLocationID>_yearly.csv (one file per cell, its own regex), the
+         same convention brandenburg_rulesow.sol.xml's lintul5yearly
+         interface already uses. The pooled filename produced real data but
+         collect could never find it: "No *_yearly.csv under <out>". -->
     <interface id="WLOutput" type="CSV">
       <poolsize>100</poolsize>
       <divider>,</divider>
-      <filename>${_OUTPUTDIR_}/faye/SUSTAg/EU_SUSTAg_summary_80.csv</filename>
+      <filename>${_OUTPUTDIR_}/yearly/${vLocationId}_yearly.csv</filename>
     </interface>
     <!-- Daily sowing-trigger debug output. Enable for a few test grids only (one row per day is very large over all Europe). -->
     <interface id="SowingDebugDaily" type="CSV">
@@ -248,7 +260,13 @@ WIKI_END</description>
          Ids that carry a raw unit say so, so nothing downstream can read
          W m-2 believing it is MJ m-2 d-1 — the failure that cost the
          Brandenburg run a factor of 77. `weather_conv` below does the sums. -->
-    <resource id="weather" interface="weatherfile" frequence="DAILY" dbcache="FALSE">
+    <!-- No dbcache="FALSE" here, unlike every other resource below: weather_conv
+         is a DefaultSQLStatementTransformer querying "FROM weather" as an
+         in-memory table, and dbcache="FALSE" is exactly what keeps a resource
+         out of that queryable cache (this failed with MissingSimResourceException,
+         "Table not found"). Brandenburg's own working weather_transform reads
+         the same way from a weather resource with no dbcache attribute at all. -->
+    <resource id="weather" interface="weatherfile" frequence="DAILY">
       <header>
         <res id="CURRENTDATE" datatype="DATE" key="CURRENT.DATE" />
         <res id="rain" unit="http://www.wurvoc.org/vocabularies/om-1.8/millimetre_per_day" datatype="DOUBLE" />
@@ -292,7 +310,11 @@ WIKI_END</description>
 
          SQL, not a rule transformer, because EXP() and CASE are needed and this
          is the same transformer class the Brandenburg run already relies on. -->
-    <transform id="weather_conv" frequence="DAILY" class="net.simplace.sim.transformers.DefaultSQLStatementTransformer">
+    <!-- resource="weather" documents its source explicitly, matching every
+         other transform below (soil_transform, diurnal, ToDiurnal, ...); the
+         actual "Table not found ... FROM weather" fix was the weather
+         resource's own dbcache="FALSE", removed above. -->
+    <transform id="weather_conv" resource="weather" frequence="DAILY" class="net.simplace.sim.transformers.DefaultSQLStatementTransformer">
       <header>
         <res id="CURRENTDATE" datatype="DATE" key="CURRENT.DATE" />
         <res id="tmin" unit="°C" datatype="DOUBLE" />
@@ -702,6 +724,19 @@ WIKI_END</description>
       <input id="LatitudeField">vLatitude</input>
       <input id="IdField">vLocationId</input>
     </transform>
+    <!-- layerthickness 0.1, not the reference's 0.05: SoilLayerTransformer
+         rebins soil_long.csv's 6 native SoilGrids depths (deepest 2.00 m)
+         into layers of this thickness, and net.simplace.sim.components.soil.
+         soilcn.SoilCN.intializePools reads that array's length as tNumLayers
+         with no bounds guard; at 0.05 (40 layers to 2.00 m) it threw
+         ArrayIndexOutOfBoundsException: Index 26 out of bounds for length 26
+         inside FWSimModel.init, for every cell, every task, deterministically
+         (verified: neither RootingDepth, the ONCE/YEARLY frequency, nor
+         startdate mattered; only the resulting layer count did, confirmed
+         by javap'ing SoilCN and testing layer counts directly against the
+         built workspace). Brandenburg's own soil_transform sets the same
+         0.05 with the same 2.00 m depth and never hits this, because it
+         wires SoilCNP (no tNumLayers, no such cap), not SoilCN. -->
     <transform id="soil_transform" resource="soil" frequence="YEARLY" class="net.simplace.sim.transformers.SoilLayerTransformer">
       <header>
         <res id="location" datatype="CHAR" key="vLocationId" />
@@ -732,7 +767,7 @@ WIKI_END</description>
         <res id="deltatheta" unit="-" datatype="DOUBLE" />
       </header>
       <input id="layercount" />
-      <input id="layerthickness">0.05</input>
+      <input id="layerthickness">0.1</input>
       <input id="depthfieldid">depth</input>
     </transform>
 
@@ -761,7 +796,7 @@ WIKI_END</description>
         <res id="MineralisationDepth" unit="" datatype="DOUBLE" />
       </header>
       <input id="layercount" />
-      <input id="layerthickness">0.05</input>
+      <input id="layerthickness">0.1</input>
       <input id="depthfieldid">depth</input>
     </transform>
 
@@ -781,7 +816,7 @@ WIKI_END</description>
         <res id="Ratemicrobup" unit="" datatype="DOUBLEARRAY" />
       </header>
       <input id="layercount" />
-      <input id="layerthickness">0.05</input>
+      <input id="layerthickness">0.1</input>
       <input id="depthfieldid">depth</input>
     </transform>
 
@@ -815,7 +850,7 @@ WIKI_END</description>
         <res id="YoungSOMCN" unit="" datatype="DOUBLE" />
       </header>
       <input id="layercount" />
-      <input id="layerthickness">0.05</input>
+      <input id="layerthickness">0.1</input>
       <input id="depthfieldid">depth</input>
     </transform>
 
@@ -1545,7 +1580,10 @@ WIKI_END</description>
     <simcomponent id="WindTranslation" class="net.simplace.sim.components.experimental.canopytemperature.WindTranslation">
       <input id="h_crop_WS" source="vHt_crop_WS" />
       <input id="horizontal_fetch_WS" source="vHorizontal_fetch_WS" />
-      <input id="z_WS" source="vZ_WS" />
+      <!-- No z_WS input: net.simplace.sim.components.experimental.canopytemperature.WindTranslation
+           has no such field (javap: h_crop_WS, horizontal_fetch_WS, z_crop,
+           h_crop_REGION, horizontal_fetch_crop, iWIND, h_crop, iDVS,
+           WIND_crop); this line failed linking with SimLinkInvalidException. -->
       <input id="z_crop" source="crop.vZ_crop" />
       <input id="h_crop_REGION" source="crop.vHt_crop_REGION" />
       <input id="horizontal_fetch_crop" source="vHorizontal_fetch_crop" />

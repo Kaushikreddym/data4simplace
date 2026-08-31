@@ -43,6 +43,16 @@ COLUMN_MAP: dict[str, tuple[str, float]] = {
     "AGBiomass_t_ha": ("biomass_g_m2", 100.0),
     "maxLAI": ("max_lai", 1.0),
     "DevStage": ("final_dvs", 1.0),
+    # EU_SUSTAg_data4simplace.sol.xml's own WLOutput columns. Unlike
+    # Brandenburg, these are already g/m2 (Yield_noHS/Biomass_noHS run
+    # 300-2500 -- t/ha at that magnitude would be an agronomic impossibility),
+    # so the factor is 1.0, not 100.0. Yield_HS_H_TCan is the heat-stress
+    # -adjusted figure, filling the same "adjusted" slot Brandenburg's
+    # translocated yield does, not a translocation adjustment.
+    "Yield_noHS": ("yield_g_m2", 1.0),
+    "Yield_HS_H_TCan": ("adjusted_yield_g_m2", 1.0),
+    "Biomass_noHS": ("biomass_g_m2", 1.0),
+    "LAImax": ("max_lai", 1.0),
     # Two spellings of the sowing date, and they do not mean the same thing.
     # Brandenburg's `PlantingDOY` echoes the constant `vIDPL`; the rule-based
     # SUSTAg solution writes the *realized* `SowingDate.SowingDOY`. A run that
@@ -149,6 +159,16 @@ def to_run_schema(frame: pd.DataFrame, grid: GridConfig) -> pd.DataFrame:
             "SIMPLACE output carries no %s; those columns are absent from the "
             "collected run", ", ".join(missing),
         )
+
+    if "maturity_doy" not in out.columns and "CURRENT.DATE" in frame.columns:
+        # EU_SUSTAg_data4simplace.sol.xml's WLOutputs fires
+        # rule="HarvestManagement.DoHarvest", so unlike Brandenburg (which
+        # writes an explicit MaturityDOY column) this row's own date *is* the
+        # maturity/harvest date -- there is just no separate DOY column
+        # naming it. LINTUL-5 models no drydown, so maturity == harvest here
+        # too, same as the comment below.
+        dates = pd.to_datetime(frame["CURRENT.DATE"], format="%d.%m.%Y", errors="coerce")
+        out["maturity_doy"] = dates.dt.dayofyear.astype("float64")
 
     lon, lat = id_to_lonlat(out["SimplaceID"].to_numpy(), grid)
     out["lon"] = lon.astype(np.float32)

@@ -85,8 +85,7 @@ reference:
   # columns, and columns SoilGrids cannot derive (alfa, n, ksat, RootingDepth,
   # ...) are carried over from the file's own first row so the output runs.
   # null -> the built-in EU SUSTAg spelling.
-  soil_file_long: null
-  # e.g. "/data01/FDS/muduchuru/Data/SIMPLACE/Rotation_monocrop/data/soil/SLIM_soil_EU_SUSTAg.csv"
+  soil_file_long: "/data01/FDS/muduchuru/Data/SIMPLACE/Rotation_monocrop/data/soil/SLIM_soil_EU_SUSTAg.csv"
   management_file_long: null
 
 # --- Export layout -----------------------------------------------------------

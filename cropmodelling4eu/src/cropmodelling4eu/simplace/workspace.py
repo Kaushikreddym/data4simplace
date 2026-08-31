@@ -81,11 +81,14 @@ logger = logging.getLogger(__name__)
 __all__ = ["Workspace", "build_workspace", "WEATHER_CONTRACTS"]
 
 #: Sub-directories of the template's ``data/`` linked verbatim: the model
-#: parameters the export has no opinion about.
-_LINKED_DATA_DIRS = ("crop", "slim", "soilcnp", "soil_cn")
+#: parameters the export has no opinion about. ``soil`` and ``project`` are the
+#: EU_SUSTAg template's own static reference tables (SLIMProperties_1P.xml,
+#: ClimPerCO2.csv, ...) -- distinct from the export's soil.csv/soil_long.csv,
+#: which are linked separately below and always take precedence on a name clash.
+_LINKED_DATA_DIRS = ("crop", "slim", "soilcnp", "soil_cn", "soil", "project")
 
 #: Files of ``data/management/`` taken from the template rather than the export.
-_LINKED_MANAGEMENT = ("management.xml", "fertilizer_composition.xml")
+_LINKED_MANAGEMENT = ("management.xml", "fertilizer_composition.xml", "residues.csv")
 
 #: ``simplace.weather_contract`` -> the conversion it names.
 WEATHER_CONTRACTS: dict[str, WeatherConversion] = {
@@ -271,6 +274,8 @@ def _populate_data(
             _link(source, management / name)
 
     _link(bundle.export_dir / "soil" / "soil.csv", work_data / "soil" / "soil.csv")
+    if (soil_long := bundle.export_dir / "soil" / "soil_long.csv").is_file():
+        _link(soil_long, work_data / "soil" / "soil_long.csv")
     if (site := bundle.export_dir / "site" / "site.csv").is_file():
         _link(site, work_data / "site" / "site.csv")
 

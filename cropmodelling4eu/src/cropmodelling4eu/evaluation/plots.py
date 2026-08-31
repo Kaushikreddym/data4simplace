@@ -28,7 +28,7 @@ import geopandas as gpd
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from matplotlib.colors import BoundaryNorm, ListedColormap
+from matplotlib.colors import BoundaryNorm, Colormap, ListedColormap, Normalize
 from matplotlib.figure import Figure
 from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
@@ -318,6 +318,9 @@ def scatter_density(
     figsize: tuple[float, float] = (5.0, 4.6),
     gridsize: int = 55,
     log_counts: bool = True,
+    cmap: str | Colormap | None = None,
+    vmin: float | None = None,
+    vmax: float | None = None,
     cbar_label: str = "Cell-years per bin",
 ) -> Figure:
     """Observed against simulated as a binned density, with the 1:1 line.
@@ -345,6 +348,13 @@ def scatter_density(
         log_counts: Colour on a log count scale. On by default: cell-year
             densities span three orders of magnitude, and a linear ramp would
             paint everything but the mode as empty.
+        cmap: Colormap instance or registered name. Defaults to
+            :data:`utils.style.SEQUENTIAL_CMAP`. Pick from the ``colormaps``
+            package for a task-appropriate ramp, e.g. ``colormaps.batlow``.
+        vmin: Minimum of the colour scale (post-log, when ``log_counts``).
+            ``None`` autoscales from the data.
+        vmax: Maximum of the colour scale, e.g. to share one scale across
+            several panels for a fair visual comparison.
         cbar_label: Colour-bar label.
 
     Returns:
@@ -361,8 +371,9 @@ def scatter_density(
     extent = (*ax.get_xlim(), *ax.get_ylim())
 
     hexes = ax.hexbin(
-        obs, sim, gridsize=gridsize, extent=extent, cmap=SEQUENTIAL_CMAP,
+        obs, sim, gridsize=gridsize, extent=extent, cmap=cmap or SEQUENTIAL_CMAP,
         bins="log" if log_counts else None, mincnt=1, linewidths=0.0, zorder=2,
+        vmin=vmin, vmax=vmax,
     )
 
     lo, hi = ax.get_xlim()
@@ -502,6 +513,7 @@ def bias_bars(
     figsize: tuple[float, float] | None = None,
     label_extremes: int = 3,
     drop_pooled: bool = True,
+    cmap: str | Colormap | None = None,
 ) -> Figure:
     """Country bias as a sorted horizontal bar chart.
 
@@ -525,6 +537,8 @@ def bias_bars(
         label_extremes: How many bars at each end carry a value label. Labelling
             every bar restates the axis and goes unread.
         drop_pooled: Drop the pooled ``ALL`` row, which is not a country.
+        cmap: Diverging colormap the under/over poles are sampled from.
+            Defaults to :data:`utils.style.DIVERGING_CMAP`.
 
     Returns:
         The figure.
@@ -538,7 +552,8 @@ def bias_bars(
     values = table[value_col].to_numpy(dtype=float)
     # The two poles of the diverging ramp, taken at a step that clears contrast
     # on both surfaces. Sign only — magnitude is the bar.
-    under, over = DIVERGING_CMAP(0.18), DIVERGING_CMAP(0.86)
+    ramp = cmap or DIVERGING_CMAP
+    under, over = ramp(0.18), ramp(0.86)
     colors = [over if v >= 0 else under for v in values]
     y = np.arange(len(table))
 
@@ -925,10 +940,14 @@ def country_choropleth(
     title: str = "",
     cbar_label: str = "",
     diverging: bool = True,
+    vmin: float | None = None,
     vmax: float | None = None,
+    cmap: str | Colormap | None = None,
     mode: str = "light",
     figsize: tuple[float, float] = (5.6, 6.0),
     annotate: bool = False,
+    mean_label: str | None = None,
+    ax: plt.Axes | None = None,
 ) -> Figure:
     """Fill each national footprint with a per-country value.
 
@@ -940,26 +959,50 @@ def country_choropleth(
         cbar_label: Colour-bar label, including units.
         diverging: ``True`` for a signed quantity (bias) — a zero-centred
             blue-to-red ramp. ``False`` for a magnitude — the single-hue ramp.
-        vmax: Symmetric limit for the diverging ramp.
+        vmin: Minimum of the colour scale. Ignored when ``diverging``, which is
+            always symmetric about zero; use ``vmax`` there instead.
+        vmax: Magnitude limit — the symmetric half-range when ``diverging``,
+            the plain upper bound otherwise. Pass a value shared across several
+            maps (e.g. one model each) so they read on the same scale.
+        cmap: Colormap instance or registered name. Defaults to
+            :data:`utils.style.DIVERGING_CMAP` or
+            :data:`utils.style.SEQUENTIAL_CMAP`. Pick from the ``colormaps``
+            package for a task-appropriate ramp, e.g. ``colormaps.vik``.
         mode: Style mode.
-        figsize: Figure size in inches.
+        figsize: Figure size in inches. Ignored when ``ax`` is given.
         annotate: Print the value on each country. Off by default; it collides
             badly in the Benelux and turns the map into a table.
+        mean_label: When set, prints a small corner text of the pooled mean of
+            ``values`` (a pooled ``"ALL"`` row, if present, is excluded first —
+            it is not a country) as ``"<mean_label> = <value>"``, e.g.
+            ``"Mean"`` for a magnitude or ``"Mean bias"`` for a signed one.
+            ``None`` draws nothing.
+        ax: Draw into this existing axes instead of creating a new figure —
+            how a notebook cell panels several choropleths into one figure
+            (create the axes with ``subplot_kw={"projection":
+            plots.EUROPE_PROJECTION}``).
 
     Returns:
-        The figure.
+        The figure ``ax`` belongs to.
     """
     p = palette(mode)
     frame = polygons.copy()
     frame["value"] = frame["country"].map(values)
 
-    fig, ax = plt.subplots(figsize=figsize,
-                           subplot_kw={"projection": EUROPE_PROJECTION})
+    own_fig = ax is None
+    if own_fig:
+        fig, ax = plt.subplots(figsize=figsize,
+                               subplot_kw={"projection": EUROPE_PROJECTION})
+    else:
+        fig = ax.figure
     _basemap(ax, p)
     ax.grid(False)
 
-    cmap = DIVERGING_CMAP if diverging else SEQUENTIAL_CMAP
-    norm = diverging_norm(frame["value"], vmax) if diverging else None
+    cmap = cmap or (DIVERGING_CMAP if diverging else SEQUENTIAL_CMAP)
+    norm = (
+        diverging_norm(frame["value"], vmax) if diverging
+        else Normalize(vmin=vmin, vmax=vmax)
+    )
 
     plotted = frame.to_crs(EUROPE_PROJECTION.proj4_init)
     plotted.plot(
@@ -980,8 +1023,20 @@ def country_choropleth(
                             ha="center", va="center", color=p["primary"],
                             fontsize=plt.rcParams["font.size"] - 2.5, zorder=5)
 
+    if mean_label is not None:
+        mean_value = float(values.drop("ALL", errors="ignore").mean())
+        if np.isfinite(mean_value):
+            ax.text(
+                0.03, 0.03, f"{mean_label} = {mean_value:.2f}",
+                transform=ax.transAxes, ha="left", va="bottom",
+                color=p["secondary"], fontsize=plt.rcParams["font.size"] - 1.5,
+                zorder=6, bbox={"facecolor": p["surface"], "edgecolor": "none",
+                                "alpha": 0.82, "pad": 2.5},
+            )
+
     ax.set_title(title, color=p["primary"])
-    fig.tight_layout()
+    if own_fig:
+        fig.tight_layout()
     return fig
 
 
@@ -990,7 +1045,7 @@ def cell_map(
     value_col: str,
     lon_col: str = "lon",
     lat_col: str = "lat",
-    cmap: str | ListedColormap | None = None,
+    cmap: str | Colormap | None = None,
     norm: BoundaryNorm | None = None,
     vmin: float | None = None,
     vmax: float | None = None,
@@ -1009,11 +1064,13 @@ def cell_map(
         lon_col: Longitude column name.
         lat_col: Latitude column name.
         cmap: Colormap instance or registered colormap name. Defaults to
-            :data:`utils.style.SEQUENTIAL_CMAP`.
+            :data:`utils.style.SEQUENTIAL_CMAP`. Pick from the ``colormaps``
+            package for a task-appropriate ramp, e.g. ``colormaps.batlow``.
         norm: Optional normalization instance (e.g., :class:`~matplotlib.colors.BoundaryNorm`).
             Ignored if ``vmin`` or ``vmax`` are explicitly passed alongside it.
-        vmin: Minimum value for color scaling.
-        vmax: Maximum value for color scaling.
+        vmin: Minimum value for color scaling. Pass a value shared across
+            several maps (e.g. one model each) so they read on the same scale.
+        vmax: Maximum value for color scaling, same rationale as ``vmin``.
         title: Axes title.
         cbar_label: Colorbar label including units.
         mode: Style mode.
@@ -1174,6 +1231,7 @@ def metric_table(
     columns: Sequence[str],
     precision: int = 2,
     gradient_on: Sequence[str] = ("bias",),
+    cmap: str | Colormap | None = None,
     caption: str = "",
     country_names: bool = True,
 ):
@@ -1189,6 +1247,8 @@ def metric_table(
         columns: Columns to show, in order.
         precision: Decimal places.
         gradient_on: Signed columns that get the zero-centred gradient.
+        cmap: Diverging colormap for the gradient. Defaults to
+            :data:`utils.style.DIVERGING_CMAP`.
         caption: Table caption.
         country_names: Prefix the index with the full country name.
 
@@ -1215,7 +1275,7 @@ def metric_table(
         if label in table.columns and table[label].notna().any():
             limit = float(np.nanmax(np.abs(table[label].to_numpy(dtype=float))))
             styler = styler.background_gradient(
-                cmap=DIVERGING_CMAP, subset=[label],
+                cmap=cmap or DIVERGING_CMAP, subset=[label],
                 vmin=-limit, vmax=limit,
             )
     return styler

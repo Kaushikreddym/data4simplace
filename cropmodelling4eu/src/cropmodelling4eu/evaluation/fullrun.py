@@ -59,8 +59,11 @@ def _load_simplace(path: Path, years: tuple[int, int] | None) -> pd.DataFrame:
     # LINTUL-5's harvest = maturity while HARVEST_LAG_DAYS = 0 (see
     # torchcrop.add_phenology_columns); SIMPLACE's rule-based solution models
     # no drydown either, so the same convention is applied for a like-for-like
-    # column on both sides.
-    frame["harvest_doy"] = frame["maturity_doy"]
+    # column on both sides. Conditional, not assumed: a solution whose output
+    # carries no maturity date at all (collect.to_run_schema warns when this
+    # happens) simply has no harvest_doy either, rather than a KeyError.
+    if "maturity_doy" in frame.columns:
+        frame["harvest_doy"] = frame["maturity_doy"]
     return frame
 
 
@@ -168,6 +171,17 @@ def pair_models(
 
     for col in shared:
         paired[f"{col}_delta"] = paired[f"{col}_torchcrop"] - paired[f"{col}_simplace"]
+    if "sowing_doy" in shared:
+        # simplace_europe.parquet's own sowing_doy is the raw value SIMPLACE
+        # recorded, one day earlier than the date the crop actually starts
+        # growing (see collect.sowing_table's docstring) -- sowing_from_
+        # simplace.csv corrects it by +1 before torchcrop ever sees it. A
+        # chained run therefore shows sowing_doy_delta == +1 everywhere, not
+        # 0; comparing torchcrop against the *corrected* date here (what it
+        # was actually handed) is what "sown the same day" means.
+        paired["sowing_doy_delta"] = (
+            paired["sowing_doy_torchcrop"] - (paired["sowing_doy_simplace"] + 1)
+        )
     if "yield_t_ha" in shared:
         paired["yield_ratio"] = (
             paired["yield_t_ha_torchcrop"]

@@ -68,7 +68,7 @@ export SP_PARTITION="${SP_PARTITION:-compute}"
 # run_task.sh wrapper), not to the node, since a lone JVM asking for a whole
 # node schedules far behind smaller jobs on a busy fair-share cluster and
 # leaves every core past SP_CORES_PER_TASK idle regardless.
-export SP_CPUS="${SP_CPUS:-2}"
+export SP_CPUS="${SP_CPUS:-3}"
 # Each SIMPLACE JVM reports its own container as "RAM: 32.0 GB" regardless of
 # what SP_MEM actually is, and several concurrent JVMs each approaching that
 # is what OOM-killed SP_CORES_PER_TASK=6 at this same SP_MEM (sacct: MaxRSS

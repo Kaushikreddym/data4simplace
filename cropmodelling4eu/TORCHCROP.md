@@ -52,7 +52,7 @@ Defaults (all overridable, see [`torchcrop_env.sh`](torchcrop_env.sh)):
 | shards | `TC_N_SHARDS=10` → ~6 900 cells each |
 | batching | `TC_BATCH_SIZE=2048` cells per model call, `TC_IO_WORKERS=16` |
 | resources | `compute`, 16 cpus, 16 G, 6 h per task, 10 concurrent |
-| output | `/data01/FDS/muduchuru/Data/SIMPLACE/torchcrop/<TC_RUN_NAME>` |
+| output | `/data01/FDS/muduchuru/Data/SIMPLACE/cropmodelling4eu/<TC_RUN_NAME>/torchcrop` |
 | env | conda `sdba` (holds `torch`, `torchcrop` and this package) |
 
 ```bash

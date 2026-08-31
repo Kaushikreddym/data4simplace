@@ -24,9 +24,10 @@ from __future__ import annotations
 from contextlib import contextmanager
 from typing import Iterator, Literal
 
+import colormaps
 import matplotlib as mpl
 import numpy as np
-from matplotlib.colors import LinearSegmentedColormap, TwoSlopeNorm
+from matplotlib.colors import TwoSlopeNorm
 
 __all__ = [
     "DIVERGING_CMAP",
@@ -78,23 +79,18 @@ MODES: dict[Mode, dict[str, str]] = {
     },
 }
 
-#: Single-hue blue ramp, light to dark: the sequential encoding for magnitude.
-_BLUE_STEPS: tuple[str, ...] = (
-    "#cde2fb", "#b7d3f6", "#9ec5f4", "#86b6ef", "#6da7ec", "#5598e7",
-    "#3987e5", "#2a78d6", "#256abf", "#1c5cab", "#184f95", "#104281", "#0d366b",
-)
+#: Perceptually uniform, colour-vision-deficiency-safe sequential ramp from
+#: Fabio Crameri's scientific colour maps (via the ``colormaps`` package): the
+#: encoding for magnitude. Multi-hue rather than single-hue blue, so a wide
+#: dynamic range (a continental yield field) stays resolvable where a
+#: single-hue ramp would compress into indistinguishable dark blues.
+SEQUENTIAL_CMAP = colormaps.batlow
 
-SEQUENTIAL_CMAP = LinearSegmentedColormap.from_list("d4s_blue", _BLUE_STEPS, N=256)
-
-#: Blue to red through a neutral grey: the diverging encoding for a signed
-#: quantity. Grey at the midpoint is what makes zero read as "nothing"; a hue
-#: there would invent a third category.
-DIVERGING_CMAP = LinearSegmentedColormap.from_list(
-    "d4s_blue_red",
-    ["#0d366b", "#256abf", "#6da7ec", "#cde2fb", "#f0efec",
-     "#f7c9c9", "#e88b8b", "#d03b3b", "#8f1f1f"],
-    N=256,
-)
+#: Perceptually uniform diverging ramp, blue to red through a near-white
+#: midpoint: the encoding for a signed quantity. The midpoint reads as
+#: "nothing" the same way the project's former neutral grey did; a hue there
+#: would invent a third category.
+DIVERGING_CMAP = colormaps.vik
 
 
 def palette(mode: Mode = "light") -> dict[str, str]:

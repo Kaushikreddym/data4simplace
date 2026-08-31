@@ -65,7 +65,7 @@ can be overridden by an
 environment variable of the same name, so a different run needs no code change:
 
 ```bash
-TORCHCROP_RUN_DIR=/data01/FDS/muduchuru/Data/SIMPLACE/torchcrop/potential jupyter lab
+TORCHCROP_RUN_DIR=/data01/FDS/muduchuru/Data/SIMPLACE/cropmodelling4eu/potential/torchcrop jupyter lab
 ```
 
 ## Inputs

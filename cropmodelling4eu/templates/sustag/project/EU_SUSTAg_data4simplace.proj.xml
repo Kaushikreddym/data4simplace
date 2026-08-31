@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE projectdata PUBLIC "-//SIMPLACE/DTD PRJ 1.0//EN" "http://simplace.net/dtd/SimProject_4_1.dtd">
+
+<projectdata>
+  <description title="EU_SUSTAg project header for a data4simplace export" author="" qualitylevel="I">WIKI_START
+=== Purpose ===
+The project header this pairs with EU_SUSTAg_data4simplace.sol.xml. None of
+Rotation_monocrop/project/*.proj.xml work as shipped: they still key on the
+old cluster's projectid/simulationid pair with no vColumn/vRow (so every cell
+would silently read the same weather file -- see the solution's own header
+comment) and no sowing column at all (so every cell sows on the solution's one
+hard-coded default day, defeating the rule-based sowing this run exists to
+test). cm4eu overwrites the interface's filename below at build time; only the
+header's column list is read (cropmodelling4eu.simplace.project.project_columns).
+
+=== Data ===
+Every column here is filled straight from the export via
+cropmodelling4eu.simplace.project._BUILDERS -- vColumn/vRow (the weather
+file's row/column), vLatitude, vAltitude, vSowWindowStartDOY/
+vSowWindowLengthDays (the per-cell planting window; see CLAUDE.md's Planting
+Window section) and vIRRIGATION. No `constants` are needed: vCrop,
+vClimPerCO2_ID, vCO2, vCO2_level and vFertilizerScenario are left to the
+solution's own top-level var defaults (WW / C1 / 360 / elev / 2), which
+already match this export -- C1 is ClimPerCO2.csv's own ambient/no-scenario
+row (Period 0, gcm_rcp 0_0), correct for an observational MSWX run with no
+GCM/RCP axis, and every schedule row the export writes uses
+FertilizerScenario 2. vENZ (the SUSTAg EnS v8 environmental zone) has no
+data4simplace source, so it is also left to the solution's own default rather
+than written as a fabricated NA.
+
+=== Usage ===
+  simplace.project_file: this file
+WIKI_END</description>
+  <interfaces>
+    <interface id="projectdata" type="CSV">
+      <poolsize>200</poolsize>
+      <divider>,</divider>
+      <filename>${_WORKDIR_}/project/project_wheat.csv</filename>
+    </interface>
+  </interfaces>
+  <projects>
+    <resource id="proj" interface="projectdata">
+      <header>
+        <var id="projectid" datatype="CHAR" key="projectid" />
+        <var id="simulationid" datatype="CHAR" key="simulationid" />
+        <var id="vLocationId" datatype="CHAR" />
+        <var id="vColumn" datatype="INT" />
+        <var id="vRow" datatype="INT" />
+        <var id="vLatitude" datatype="DOUBLE" />
+        <var id="vAltitude" datatype="DOUBLE" />
+        <!-- The planting window, per cell, from the export's site.csv. Without
+             these two the solution falls back to its own vSowWindowStartDOY /
+             vSowWindowLengthDays defaults and every cell sows in the same
+             window; see build_project_frame's own warning for this case. -->
+        <var id="vSowWindowStartDOY" datatype="INT" />
+        <var id="vSowWindowLengthDays" datatype="INT" />
+        <var id="vIRRIGATION" datatype="INT" />
+      </header>
+    </resource>
+  </projects>
+</projectdata>

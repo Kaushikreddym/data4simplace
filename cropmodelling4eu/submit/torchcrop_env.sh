@@ -23,7 +23,10 @@ export TC_CONDA_ENV="${TC_CONDA_ENV:-sdba}"   # holds torch + the torchcrop inst
 # --- Input & output ----------------------------------------------------------
 export TC_DATA_DIR="${TC_DATA_DIR:-/data01/FDS/muduchuru/Data/SIMPLACE/EU}"
 export TC_RUN_NAME="${TC_RUN_NAME:-winter_wheat_2000_2024}"
-export TC_OUT_DIR="${TC_OUT_DIR:-/data01/FDS/muduchuru/Data/SIMPLACE/torchcrop/${TC_RUN_NAME}}"
+# Sibling of the SIMPLACE run's own <output_dir>/<run_name>/simplace (see
+# simplace_env.sh's resolve_run_dir), so one run directory holds both models'
+# outputs instead of scattering torchcrop under its own top-level path.
+export TC_OUT_DIR="${TC_OUT_DIR:-/data01/FDS/muduchuru/Data/SIMPLACE/cropmodelling4eu/${TC_RUN_NAME}/torchcrop}"
 export TC_SHARD_DIR="${TC_SHARD_DIR:-${TC_OUT_DIR}/shards}"
 export TC_LOG_DIR="${TC_LOG_DIR:-${TC_PROJECT_DIR}/submit/logs}"
 
@@ -83,7 +86,7 @@ export TC_IOPT="${TC_IOPT:-3}"
 # by default: the Europe run is already tiled for memory (see the run's own
 # notes), and the daily table is long-format, one row per (cell, day,
 # variable), so it is far larger than the summary.
-export TC_DAILY="${TC_DAILY:-0}"
+export TC_DAILY="${TC_DAILY:-1}"
 export TC_DAILY_VARIABLES="${TC_DAILY_VARIABLES:-LAI AGB NNI TRANRF}"
 
 # --- Working directory --------------------------------------------------------
