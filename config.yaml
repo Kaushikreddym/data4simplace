@@ -18,6 +18,11 @@ flags:
   # Classify each cell irrigated (1) / rainfed (0) from the crop's irrigated and
   # rainfed harvested area, and add the vIRR column to the management CSV.
   run_irrigation_classification: true
+  # Observed phenology from CLMS HRL Croplands: a *validation* dataset, written
+  # to validation/phenology/ rather than beside weather and soil. It is what a
+  # run is scored and calibrated against, not what a crop model consumes.
+  # Needs paths.clms_root and paths.cybench_polygon_root; self-skips without them.
+  run_phenology_processing: true
   apply_agricultural_mask: true     # Export only PROBA-V cropland cells
   write_soil_statistics: true       # Per-class NetCDF stats + class-share table
   export_simplace_weather: true     # SIMPLACE weather file export
@@ -73,6 +78,14 @@ paths:
   # Annual global CO2 as `year,ppm`. null -> the built-in global-mean table,
   # which site/co2.csv then labels a fallback in its header comment.
   co2_file: null
+  # CLMS HRL Croplands: inventory/ and tiles/<PRODUCT>/<year>/. The fetch needs a
+  # CDSE account -- anonymous S3 is refused. Keys live in a named boto3 profile
+  # (default `cdse`), never here, so this config carries no secret; check them
+  # with `python -m data4simplace.phenology.fetch` before submitting.
+  clms_root: "/data01/FDS/muduchuru/Data/Agri/CLMS"
+  # CyBench administrative polygons, <country>/<country>.shp. The support the
+  # phenology medians are reported on, and the key they join to CyBench yields by.
+  cybench_polygon_root: "/data01/FDS/muduchuru/Data/Agri/cybench/polygons"
   output_dir: "./output"
 
 # --- SIMPLACE reference files (source of truth for output structure) ---------
@@ -99,7 +112,14 @@ reference:
 #         second is nearly free and lets a wide-driven and a long-driven
 #         SIMPLACE run be compared on identical inputs.
 export:
-  layout: wide
+  # both, not wide: cropmodelling4eu's active solution
+  # (templates/sustag/solution/EU_SUSTAg_data4simplace.sol.xml) binds its
+  # soilfile interface to data/soil/soil_long.csv, and the EU run of
+  # 2026-09-02 was frozen with `wide`, so it produced no long file and the
+  # workspace build fails its resource validation. The long file is a second
+  # serialisation of the same computation, so writing both costs almost
+  # nothing and keeps the wide-driven Brandenburg solution runnable too.
+  layout: both
   soil_layout: null         # null -> export.layout
   management_layout: null   # null -> export.layout
 
@@ -165,6 +185,21 @@ npk:
 # vIRR = 1 where the irrigated share of the crop's harvested area,
 # A_ir / (A_ir + A_rf), exceeds `threshold`; 0 for rainfed cells and for cells
 # holding less than `min_crop_area_ha` of the crop. Written as a column in the
+# --- Observed phenology (validation dataset) ---------------------------------
+# CLMS covers 2017 onward. Eight years is ample for parameters that are
+# time-invariant; it only means the product cannot inform a pre-2017 anomaly.
+phenology:
+  years: [2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024]
+  # The 23 CyBench countries that ship polygons. CH, CY, IS, LI, LU, MT, NO and
+  # SI are in the target scope but publish none, so they cannot be reported on.
+  countries: ["AT", "BE", "BG", "CZ", "DE", "DK", "EE", "EL", "ES", "FI", "FR",
+              "HR", "HU", "IE", "IT", "LT", "LV", "NL", "PL", "PT", "RO", "SE", "SK"]
+  # Pixel stride for the cut-finding pass. Locating where two modes separate does
+  # not need every pixel, and the pass then costs a sixteenth of the reads.
+  cut_stride: 4
+  # Rows per accumulation block: bounds peak memory independently of tile size.
+  block_rows: 2048
+
 # management CSV (flags.run_irrigation_classification).
 irrigation:
   # merged -> ECIRA where it classifies the cell, MIRCA-OS elsewhere. ECIRA
@@ -252,7 +287,15 @@ soil:
   #               count to force them onto - that is the point of the layout.
   #   simplace -> remap onto the wide reference's layer bottoms, so the two
   #               files describe the same layering and compare directly.
-  long_depths: native
+  #   reference -> remap onto the depths the LONG reference file itself uses,
+  #               read from it. Required by the EU SUSTAg solution: its SLIM
+  #               profile is a two-layer bucket (0.2 m topsoil over subsoil to
+  #               1.3 m, named by soiltype `depth13`), and SoilCN indexes that
+  #               profile against the arrays this file supplies. Handing it
+  #               SoilGrids' six native horizons throws
+  #               ArrayIndexOutOfBoundsException in model init and every cell
+  #               produces no output while SIMPLACE still exits 0.
+  long_depths: reference
   # Initial mineral N for ammonium_*/nitrate_*. SoilGrids 'nitrogen' is total
   # (largely organic) N: the exporter turns it into a per-layer stock (kg N/ha)
   # with bulk density, takes this fraction as mineral and splits it by

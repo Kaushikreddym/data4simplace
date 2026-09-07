@@ -210,8 +210,105 @@ class CroplandWeights:
 # ---------------------------------------------------------------------------- #
 # Resolving the exported cell set
 # ---------------------------------------------------------------------------- #
+#: Candidate ``(delimiter, id column)`` pairs of an exported soil CSV. The wide
+#: file keys on ``location``; the long dialects declare their own key and
+#: divider, so they are read from the single definition in
+#: :mod:`data4simplace.exporters.layout` rather than restated here.
+def _soil_id_candidates() -> list[tuple[str, str]]:
+    """``(delimiter, key column)`` pairs an exported soil CSV may use."""
+    from data4simplace.exporters.layout import SOIL_DIALECTS
+
+    seen = {(",", "location")}
+    for dialect in SOIL_DIALECTS.values():
+        seen.add((dialect.delimiter, dialect.key_column))
+    return sorted(seen)
+
+
+def _read_soil_cell_ids(path: Path) -> np.ndarray | None:
+    """``SimplaceID``s of the rows of an exported soil CSV, or ``None``.
+
+    Reads the one identifier column, never the ~150 MB of profile values beside
+    it. Returns ``None`` when no candidate delimiter/key pair matches the
+    header, which is the honest outcome for a file written by a dialect this
+    build does not know.
+    """
+    header = path.open().readline()
+    for delimiter, key in _soil_id_candidates():
+        if key in header.rstrip("\r\n").split(delimiter):
+            ids = pd.read_csv(path, sep=delimiter, usecols=[key])[key]
+            return np.unique(ids.to_numpy(dtype=np.int64))
+    logger.warning("%s: no known id column in its header; ignored", path.name)
+    return None
+
+
+def exported_soil_cells(output_dir: Path, grid: TargetGrid) -> xr.DataArray | None:
+    """The cells an *already written* soil export covers, as a ``(lat, lon)`` mask.
+
+    The on-disk counterpart of :func:`~data4simplace.soil.classify.valid_soil_cells`,
+    for a run whose flags do not include the soil stage. ``SimplaceID`` is a
+    1-based row-major index over the whole target grid
+    (:meth:`~data4simplace.grid.TargetGrid.cell_table`), so the exported
+    identifiers unflatten straight back into a mask.
+
+    Parameters
+    ----------
+    output_dir:
+        A run's ``paths.output_dir``, holding ``soil/soil.csv`` and/or
+        ``soil/soil_long.csv``.
+    grid:
+        The target grid the mask is built on. Must be the grid the export was
+        written from.
+
+    Returns
+    -------
+    xarray.DataArray | None
+        The mask, or ``None`` when no readable soil export is present.
+
+    Raises
+    ------
+    ValueError
+        If an identifier falls outside the grid. That means the export was
+        written from a different grid definition, and every identifier in it is
+        then meaningless -- silently intersecting with a shifted cell set would
+        produce a plausible file describing the wrong places.
+    """
+    soil_dir = Path(output_dir) / "soil"
+    for name in ("soil.csv", "soil_long.csv"):
+        path = soil_dir / name
+        if not path.is_file():
+            continue
+        ids = _read_soil_cell_ids(path)
+        if ids is None or ids.size == 0:
+            continue
+
+        n_lat, n_lon = grid.shape
+        flat = np.zeros(n_lat * n_lon, dtype=bool)
+        index = ids - 1
+        if index.min() < 0 or index.max() >= flat.size:
+            raise ValueError(
+                f"{path} carries SimplaceID {ids.min()}-{ids.max()}, outside the "
+                f"{flat.size}-cell target grid: it was written from a different "
+                "grid definition"
+            )
+        flat[index] = True
+
+        logger.info(
+            "Exported cell set read from %s: %d cells", path, int(flat.sum())
+        )
+        return xr.DataArray(
+            flat.reshape(n_lat, n_lon),
+            dims=("lat", "lon"),
+            coords={"lat": grid.lat_centers, "lon": grid.lon_centers},
+            name="exported_soil_cells",
+        )
+    return None
+
+
 def export_cell_mask(
-    config: PipelineConfig, grid: TargetGrid, soil: xr.Dataset | None = None
+    config: PipelineConfig,
+    grid: TargetGrid,
+    soil: xr.Dataset | None = None,
+    soil_export_fallback: bool = True,
 ) -> xr.DataArray | None:
     """The cells a run exports, as a boolean ``(lat, lon)`` mask.
 
@@ -220,9 +317,20 @@ def export_cell_mask(
     * **Cropland** (``flags.apply_agricultural_mask``): the cell holds
       ``soil.min_cropland_pixels`` PROBA-V pixels at or above
       ``soil.cropland_min_fraction`` cover.
-    * **Valid soil** (whenever the soil stage ran): the cell carries soil values.
-      Weather and management files are pointless for a cell SIMPLACE has no soil
-      profile for, so the soil result is what defines the exported cell set.
+    * **Valid soil**: the cell carries soil values. Weather and management files
+      are pointless for a cell SIMPLACE has no soil profile for, so the soil
+      result is what defines the exported cell set.
+
+    The valid-soil condition is taken from ``soil`` when the soil stage ran, and
+    otherwise from the soil export already in ``paths.output_dir``. **A partial
+    run must not widen the cell set.** ``submit/management.sh`` runs the NPK and
+    management stages alone, with ``run_soil_processing`` off; without the
+    on-disk fallback that run keeps every cropland cell, and the schedule then
+    covers cells that have no soil profile and no site row -- which is exactly
+    what the 2026-09-02 EU run produced (72 290 scheduled locations against
+    70 705 exported ones). The contract that weather, soil, site and management
+    cover *the same* cells is resolved here, so it has to hold whichever stages
+    a given job runs.
 
     Parameters
     ----------
@@ -231,8 +339,13 @@ def export_cell_mask(
     grid:
         The target grid the mask is built on.
     soil:
-        The processed soil dataset, when the soil stage ran. ``None`` skips the
-        valid-soil condition (nothing is known about coverage).
+        The processed soil dataset, when the soil stage ran. ``None`` falls back
+        to the existing export, and to no soil filtering when there is none.
+    soil_export_fallback:
+        Allow that fallback. Only a caller holding the **whole** target grid may
+        use it: ``SimplaceID`` indexes the full grid, so the identifiers in an
+        export cannot be unflattened onto a sub-grid. ``data4simplace.tiling``
+        passes ``False`` for exactly that reason.
 
     Returns
     -------
@@ -251,11 +364,23 @@ def export_cell_mask(
                 "no cropland filtering"
             )
 
+    has_soil: xr.DataArray | None = None
     if soil is not None:
         has_soil = valid_soil_cells(soil)
         if has_soil is None:
             logger.warning("Soil dataset carries no lat/lon fields; no soil filtering")
-        elif mask is None:
+    elif soil_export_fallback:
+        has_soil = exported_soil_cells(config.paths.output_dir, grid)
+        if has_soil is None:
+            logger.warning(
+                "The soil stage did not run and %s holds no soil export: the "
+                "exported cell set is cropland only, so this run may cover cells "
+                "that have no soil profile",
+                config.paths.output_dir,
+            )
+
+    if has_soil is not None:
+        if mask is None:
             mask = has_soil
         else:
             # Both come from the same TargetGrid, but align defensively: an

@@ -170,14 +170,25 @@ def to_run_schema(frame: pd.DataFrame, grid: GridConfig) -> pd.DataFrame:
         dates = pd.to_datetime(frame["CURRENT.DATE"], format="%d.%m.%Y", errors="coerce")
         out["maturity_doy"] = dates.dt.dayofyear.astype("float64")
 
+    # A stage the crop never reached is written as 0 -- the Phenology
+    # component's initial value -- and 0 is not a day of the year. Left alone
+    # it would enter a circular mean as 31 December and drag the unit's date
+    # across New Year, which is exactly the failure the circular arithmetic
+    # exists to avoid. NaN is the honest value; every metric already drops it.
+    for column in ("sowing_doy", "emergence_doy", "anthesis_doy", "maturity_doy"):
+        if column in out.columns:
+            out[column] = out[column].where(out[column] > 0)
+
     lon, lat = id_to_lonlat(out["SimplaceID"].to_numpy(), grid)
     out["lon"] = lon.astype(np.float32)
     out["lat"] = lat.astype(np.float32)
 
-    if {"maturity_doy", "sowing_doy"} <= set(out.columns):
-        # Days from sowing to maturity, wrapped for a season crossing New Year.
-        span = out["maturity_doy"] - out["sowing_doy"]
-        out["days_to_maturity"] = span.where(span > 0, span + 365.0)
+    # Days from sowing to each stage, wrapped for a season crossing New Year.
+    for stage, target in (("maturity_doy", "days_to_maturity"),
+                          ("emergence_doy", "days_to_emergence")):
+        if {stage, "sowing_doy"} <= set(out.columns):
+            span = out[stage] - out["sowing_doy"]
+            out[target] = span.where(span > 0, span + 365.0)
 
     if "yield_g_m2" in out.columns:
         # Both models' schemas carry t/ha alongside g/m2, so a yield reads the

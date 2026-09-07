@@ -34,6 +34,9 @@ __all__ = [
     "SCALARS",
     "TABLES",
     "compare_crop_parameters",
+    "CROP_KEY_IDS",
+    "crop_block_key",
+    "simplace_table",
     "crop_parameters_from_simplace",
     "load_simplace_crop",
     "summarise",
@@ -43,6 +46,11 @@ __all__ = [
 SCALARS: dict[str, str] = {
     "TBASEM": "tbasem", "TEFFMX": "teffmx", "TSUMEM": "tsumem",
     "IDSL": "idsl", "TSUM1": "tsum1", "TSUM2": "tsum2", "DVSI": "dvsi",
+    # Vernalisation. Absent from Brandenburg's crop.xml, present in the EU
+    # SUSTAg one -- and inert unless carried across: torchcrop returns
+    # vernfac = 1 whenever versat == vbase, so idsl = 2 with these unmapped is
+    # a no-op that looks like a working configuration.
+    "VERSAT": "versat", "VBASE": "vbase",
     "TDWI": "tdwi", "RGRLAI": "rgrl", "LAICR": "laicr", "TBASE": "tbase",
     "SPA": "spa", "NSLA": "nsla", "NLAI": "nlai", "NLUE": "nlue",
     "RDRNS": "rdrns", "RDRL": "rdrl", "RDRSHM": "rdrshm", "DVSDLT": "dvsdlt",
@@ -76,6 +84,7 @@ RECOVERY_SECTION = "Nutrient recovery (SIMPLACE management.xml)"
 TABLES: dict[str, tuple[str, str]] = {
     "dtsmtb": ("TsumIncrementTableMeanTemp", "TsumIncrementTableRate"),
     "phottb": ("PhotoperiodTableHour", "PhotoperiodTableFactor"),
+    "vernrt": ("VernalisationTableMeanTemp", "VernalisationTableRate"),
     "slatb": ("SLATableDVS", "SLATableSLA"),
     "ssatb": ("SSATableDVS", "SSATableSSA"),
     "kdiftb": ("KDIFTableDVS", "KDIFTableK"),
@@ -113,23 +122,59 @@ SIMPLACE_ONLY = frozenset({
 })
 
 
+#: The id a ``<crop>`` block is keyed by. Both spellings occur in files this
+#: project reads: Brandenburg's ``crop.xml`` uses ``CropName`` with a long name
+#: (``winter_wheat``), the EU SUSTAg ``LINTUL5_crop.xml`` uses ``Crop`` with a
+#: four-letter code (``WW``). Neither file says which convention it follows, so
+#: both are tried.
+CROP_KEY_IDS: tuple[str, ...] = ("CropName", "Crop")
+
+
+def crop_block_key(block: ET.Element) -> str:
+    """The crop identifier a ``<crop>`` block declares, or ``""``."""
+    for key in CROP_KEY_IDS:
+        value = block.findtext(f"parameter[@id='{key}']")
+        if value and value.strip():
+            return value.strip()
+    return ""
+
+
 def load_simplace_crop(path: Path, crop_name: str | None = None) -> dict:
     """Parse a SIMPLACE parameter XML into ``{parameter id: float | list}``.
+
     Handles the two shapes these files take: one ``<crop>`` block per crop
-    (``crop.xml``, ``seeds.xml``), selected by ``crop_name``, and a single
-    unnamed block (``management.xml``). The element is named differently in
-    each, so the first block holding ``<parameter>`` children is taken when
-    there is no ``<crop>``.
+    (``crop.xml``, ``LINTUL5_crop.xml``, ``seeds.xml``), selected by
+    ``crop_name``, and a single unnamed block (``management.xml``). The element
+    is named differently in each, so the first block holding ``<parameter>``
+    children is taken when there is no ``<crop>``.
+
+    **A multi-crop file without a ``crop_name`` is an error, not a default.**
+    Falling back to the first block reads ``LINTUL5_crop.xml`` as *maize* and
+    then runs a wheat simulation on it — a silent, plausible-looking wrong
+    answer. A single-block file still needs no name.
+
+    Raises:
+        ValueError: If ``crop_name`` matches no block, or if the file holds
+            several blocks and no ``crop_name`` was given.
     """
     root = ET.parse(Path(path)).getroot()
     crops = root.findall("crop")
     if crops and crop_name is not None:
-        crops = [
-            c for c in crops
-            if (c.findtext("parameter[@id='CropName']") or "").strip() == crop_name
-        ]
-        if not crops:
-            raise ValueError(f"no crop {crop_name!r} in {path}")
+        matched = [c for c in crops if crop_block_key(c) == crop_name]
+        if not matched:
+            available = [crop_block_key(c) or "?" for c in crops]
+            raise ValueError(
+                f"no crop {crop_name!r} in {path}; it declares {available}"
+            )
+        crops = matched
+    elif len(crops) > 1:
+        raise ValueError(
+            f"{path} holds {len(crops)} crop blocks "
+            f"({[crop_block_key(c) or '?' for c in crops]}) and no crop was "
+            "named. Pass simplace_crop -- defaulting to the first block would "
+            "parameterise this run from whichever crop happens to be listed "
+            "first."
+        )
     if not crops:
         crops = [block for block in root if block.find("parameter") is not None]
     if not crops:
@@ -147,6 +192,41 @@ def load_simplace_crop(path: Path, crop_name: str | None = None) -> dict:
             except ValueError:
                 out[parameter.get("id")] = text
     return out
+
+
+def simplace_table(simplace: dict, tc_name: str) -> list[list[float]] | None:
+    """A torchcrop table read from whichever shape the SIMPLACE file uses.
+
+    Two conventions are in play and neither file declares which it follows:
+
+    * **Two parameters**, x and y in separate ids — ``SLATableDVS`` +
+      ``SLATableSLA``. Brandenburg's ``crop.xml``, and what :data:`TABLES` maps.
+    * **One parameter**, x and y interleaved in a single ``<value>`` list —
+      ``SLATB``. The EU SUSTAg ``LINTUL5_crop.xml``, whose ids are the
+      torchcrop table names uppercased.
+
+    Reading only the first shape leaves every table in a SUSTAg-sourced file
+    silently on torchcrop's bundled preset, which is the quiet half of a
+    harmonisation that looks like it worked.
+
+    Returns:
+        ``[[x, y], ...]``, or ``None`` when neither shape is present.
+    """
+    x_name, y_name = TABLES.get(tc_name, (None, None))
+    if x_name in simplace and y_name in simplace:
+        return [[float(x), float(y)]
+                for x, y in zip(simplace[x_name], simplace[y_name])]
+
+    flat = simplace.get(tc_name.upper())
+    if isinstance(flat, list) and flat:
+        if len(flat) % 2:
+            raise ValueError(
+                f"{tc_name.upper()} holds {len(flat)} values; an interleaved "
+                "(x, y) table must have an even count"
+            )
+        return [[float(flat[i]), float(flat[i + 1])]
+                for i in range(0, len(flat), 2)]
+    return None
 
 
 def _torchcrop_preset(crop_name: str) -> tuple[dict, dict]:
@@ -211,11 +291,8 @@ def compare_crop_parameters(
         rows.append({"parameter": f"{sp_name} / {tc_name}", "kind": "scalar",
                      "simplace": sp_value, "torchcrop": tc_value, "status": status})
 
-    for tc_name, (x_name, y_name) in TABLES.items():
-        sp_pairs = (
-            [list(pair) for pair in zip(simplace[x_name], simplace[y_name])]
-            if x_name in simplace and y_name in simplace else None
-        )
+    for tc_name in TABLES:
+        sp_pairs = simplace_table(simplace, tc_name)
         tc_pairs = [list(pair) for pair in tc_tables[tc_name]] if tc_name in tc_tables else None
         if sp_pairs is None and tc_pairs is None:
             continue
@@ -232,9 +309,11 @@ def compare_crop_parameters(
         rows.append({"parameter": tc_name, "kind": "table",
                      "simplace": sp_pairs, "torchcrop": tc_pairs, "status": status})
 
+    # Both table spellings count as mapped: the two-parameter ids of
+    # TABLES, and the single interleaved id (the torchcrop name uppercased).
     unmapped = set(simplace) - set(scalars) - SIMPLACE_ONLY - {
         name for pair in TABLES.values() for name in pair
-    }
+    } - {tc_name.upper() for tc_name in TABLES}
     if unmapped:
         logger.warning(
             "SIMPLACE crop file holds %d parameter(s) this comparison does not "
@@ -251,6 +330,7 @@ def write_crop_yaml(
     crop_name: str = "wheat",
     simplace_crop: str | None = None,
     management_xml: Path | None = None,
+    seeds_crop_name: str | None = None,
 ) -> Path:
     """Write SIMPLACE's crop as a torchcrop preset YAML, and return the path.
 
@@ -299,15 +379,52 @@ def write_crop_yaml(
             else:
                 provenance[tc_name] = f"torchcrop:{crop_name}"
         for tc_name in list(section.get("tables", {})):
-            x_name, y_name = TABLES.get(tc_name, (None, None))
-            if x_name in simplace and y_name in simplace:
-                section["tables"][tc_name] = [
-                    [float(x), float(y)]
-                    for x, y in zip(simplace[x_name], simplace[y_name])
-                ]
-                provenance[tc_name] = f"simplace:{x_name}/{y_name}"
+            values = simplace_table(simplace, tc_name)
+            if values is not None:
+                section["tables"][tc_name] = values
+                provenance[tc_name] = f"simplace:{tc_name.upper()}"
             else:
                 provenance[tc_name] = f"torchcrop:{crop_name}"
+
+    # Parameters SIMPLACE supplies, torchcrop has a field for, and the bundled
+    # preset has no slot for. Filling only the preset's own slots drops them
+    # silently -- and for the vernalisation block that is not a small loss: the
+    # SUSTAg crop runs IDSL = 2, and torchcrop returns vernfac = 1 whenever
+    # versat == vbase, so idsl = 2 with versat/vbase/vernrt missing is a no-op
+    # sitting next to a TSUM1 that was calibrated *with* vernalisation. The
+    # crop would run far too fast, and nothing in the file would say why.
+    from torchcrop.parameters.crop_params import CropParameters
+
+    fields = set(CropParameters(crop_name=crop_name).__dataclass_fields__)
+    written = {
+        name
+        for section in preset["sections"].values()
+        for group in ("scalars", "tables")
+        for name in section.get(group, {})
+    }
+    extra_scalars = {
+        tc: float(simplace[sp])
+        for sp, tc in SCALARS.items()
+        if tc not in written and tc in fields and sp in simplace
+    }
+    extra_tables = {}
+    for tc_name in TABLES:
+        if tc_name in written or tc_name not in fields:
+            continue
+        values = simplace_table(simplace, tc_name)
+        if values is not None:
+            extra_tables[tc_name] = values
+    if extra_scalars or extra_tables:
+        preset["sections"]["SIMPLACE (absent from the torchcrop preset)"] = {
+            "scalars": extra_scalars, "tables": extra_tables,
+        }
+        for tc_name in (*extra_scalars, *extra_tables):
+            provenance[tc_name] = f"simplace:{tc_name.upper()}"
+        logger.info(
+            "carried %d parameter(s) the bundled preset has no slot for: %s",
+            len(extra_scalars) + len(extra_tables),
+            sorted([*extra_scalars, *extra_tables]),
+        )
 
     # The recovery fractions come from a different SIMPLACE file and are in no
     # bundled preset, so they are added as their own section rather than
@@ -347,7 +464,23 @@ def write_crop_yaml(
     }
 
     if seeds_xml is not None and Path(seeds_xml).is_file():
-        seeds = load_simplace_crop(seeds_xml, simplace.get("CropName"))
+        # seeds.xml keys its blocks differently from the crop file -- long
+        # names (`winter_wheat`) where LINTUL5_crop.xml uses codes (`WW`) --
+        # so the crop block's own key cannot simply be reused. These values are
+        # recorded and never mapped, so failing to find the block must not stop
+        # a run: the note is provenance, not a parameter.
+        seeds_crop = simplace.get("CropName") or seeds_crop_name
+        try:
+            seeds = load_simplace_crop(seeds_xml, seeds_crop)
+        except ValueError as error:
+            logger.warning(
+                "not recording %s: %s", Path(seeds_xml).name, error
+            )
+            seeds = None
+    else:
+        seeds = None
+
+    if seeds is not None:
         preset["simplace_seeds"] = {
             "source_file": str(seeds_xml),
             "values": {k: v for k, v in seeds.items() if k != "CropName"},

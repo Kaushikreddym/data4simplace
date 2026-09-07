@@ -94,6 +94,8 @@ _STEM_UNIT_FACTOR = {
 _DEFAULT_LAYER_BOTTOMS_M = (0.1, 0.3, 0.5, 0.7, 1.0, 2.0)
 # Matches a per-layer column ``<stem>_<N>``.
 _LAYER_COL_RE = re.compile(r"^(?P<stem>.+)_(?P<n>\d+)$")
+#: Rows of the long reference scanned to recover its depth axis.
+_REFERENCE_DEPTH_SCAN_ROWS = 200
 
 
 def _parse_interval_cm(label: str) -> tuple[float, float]:
@@ -378,6 +380,73 @@ class SoilExporter(BaseExporter):
     # ------------------------------------------------------------------ #
     # Tidy profile table (the long layout's input)
     # ------------------------------------------------------------------ #
+    def reference_depth_bottoms_cm(self) -> list[float] | None:
+        """The layer bottoms the **long** reference file itself uses, in cm.
+
+        The depth axis is part of a solution's soil contract, not a free
+        choice: SIMPLACE's SLIM profile is a two-layer bucket whose layer count
+        and bottoms come from its ``soiltype`` (``depth13`` is 0.2 m of topsoil
+        over subsoil to 1.3 m), and ``SoilCN.intializePools`` indexes that
+        profile against the arrays this file supplies. Hand it SoilGrids' six
+        native horizons instead and it throws ArrayIndexOutOfBoundsException in
+        model init -- before a single day is simulated, with every cell
+        producing no output while SIMPLACE still exits 0.
+
+        Reading the reference rather than hard-coding ``(0.2, 1.3)`` follows the
+        same rule as the rest of this exporter: the reference file is the source
+        of truth for output structure.
+
+        Defined on :class:`SoilExporter` rather than on the long subclass
+        because :meth:`build_profile_table` -- its only caller -- runs on the
+        *wide* exporter: ``LongSoilExporter`` delegates the computation to
+        ``self._wide``. It therefore must not reach for the long dialect either,
+        so the delimiter is sniffed and the key is taken as the first column.
+
+        Returns
+        -------
+        list[float] | None
+            Ascending layer bottoms in cm, or ``None`` when no long reference is
+            configured or it carries no usable depth column.
+        """
+        reference = getattr(self._config.reference, "soil_file_long", None)
+        if reference is None:
+            return None
+        path = Path(reference)
+        if not path.is_file():
+            logger.warning("long reference %s is not a file; no depths read", path)
+            return None
+
+        try:
+            header = path.open().readline()
+            delimiter = ";" if header.count(";") > header.count(",") else ","
+            frame = pd.read_csv(
+                path, sep=delimiter, nrows=_REFERENCE_DEPTH_SCAN_ROWS
+            )
+        except (OSError, ValueError) as error:
+            logger.warning("cannot read depths from %s: %s", path, error)
+            return None
+
+        depth_column = next(
+            (c for c in frame.columns if str(c).strip().lower() == "depth"), None
+        )
+        if depth_column is None:
+            logger.warning("long reference %s carries no depth column", path)
+            return None
+
+        # One location's rows only, so a file listing several does not stack
+        # their layerings into a single profile.
+        key = frame.columns[0]
+        frame = frame[frame[key] == frame[key].iloc[0]]
+        depths = pd.to_numeric(frame[depth_column], errors="coerce").dropna()
+        bottoms = sorted({float(d) for d in depths})
+        if not bottoms:
+            return None
+        logger.info(
+            "long depth axis from %s: %s m", path.name, bottoms
+        )
+        # The reference writes metres; every interval here is in cm.
+        return [b * 100.0 for b in bottoms]
+
     def build_profile_table(
         self,
         soil: xr.Dataset,
@@ -398,7 +467,9 @@ class SoilExporter(BaseExporter):
         depths:
             ``native`` keeps SoilGrids' horizons (no depth remap at all);
             ``simplace`` remaps onto the wide reference's layer bottoms, so the
-            two files describe the same layering and can be compared directly.
+            two files describe the same layering and can be compared directly;
+            ``reference`` remaps onto the depths the **long** reference file
+            itself uses, read from it rather than assumed.
 
         Returns
         -------
@@ -410,12 +481,23 @@ class SoilExporter(BaseExporter):
         """
         if "depth" not in soil.dims:
             raise ValueError("Soil dataset must carry a 'depth' dimension")
-        if depths not in ("native", "simplace"):
-            raise ValueError(f"depths must be 'native' or 'simplace', got {depths!r}")
+        if depths not in ("native", "simplace", "reference"):
+            raise ValueError(
+                "depths must be 'native', 'simplace' or 'reference', "
+                f"got {depths!r}"
+            )
 
         src_intervals = [_parse_interval_cm(str(d)) for d in soil["depth"].values]
         if depths == "native":
             dst_intervals = list(src_intervals)
+        elif depths == "reference":
+            bottoms = self.reference_depth_bottoms_cm()
+            if bottoms is None:
+                raise ValueError(
+                    "depths='reference' needs reference.soil_file_long to carry "
+                    "a depth column; none was found"
+                )
+            dst_intervals = _bottoms_to_intervals_cm(bottoms)
         else:
             columns = self.spec.columns or self.fallback_spec().columns
             dst_intervals = _bottoms_to_intervals_cm(

@@ -11,10 +11,16 @@ every phenology result downstream:
 
 * ``yield_g_m2`` / ``yield_t_ha`` — grain dry matter at maturity.
 * ``days_to_maturity`` — days from the sowing latch to the first day at
-  ``DVS >= 2``. The only phenology the Parquet carries.
-* Sowing is a **constant input** (``TC_SOWING_DOY``, DOY 270), not an output.
-* Flowering and harvest are not in the file at all: ``run_batch`` discards the
-  DVS trajectory once it has placed the fertilizer schedule.
+  ``DVS >= 2``.
+* ``days_to_emergence`` — days from the sowing latch to the ``tsump = tsumem``
+  crossing, linearly interpolated so it is fractional and exact. Present only
+  in runs made after ``torchcrop/run.py`` gained ``crossing_day``; an older
+  Parquet has no emergence column and none is invented.
+* Sowing is an **input**, not an output: per-cell from ``site.csv`` where the
+  export has one, otherwise the ``TC_SOWING_DOY`` constant.
+* Flowering is not in the file: ``run_batch`` discards the DVS trajectory once
+  it has placed the fertilizer schedule. Harvest equals maturity — LINTUL-5
+  models no drydown.
 """
 
 from __future__ import annotations
@@ -30,6 +36,7 @@ from .doy import wrap_doy
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "OPTIONAL_PHENOLOGY_COLUMNS",
     "PHENOLOGY_COLUMNS",
     "add_phenology_columns",
     "load_simulation",
@@ -37,12 +44,18 @@ __all__ = [
 ]
 
 #: Columns :func:`add_phenology_columns` creates, in stage order.
+#: ``emergence_doy`` is conditional — it needs ``days_to_emergence``, which
+#: only runs made after the thermal-time crossing was added to the summary
+#: frame carry — so it is listed separately rather than promised here.
 PHENOLOGY_COLUMNS: tuple[str, ...] = (
     "sowing_doy",
     "maturity_doy",
     "harvest_doy",
     "season_length_days",
 )
+
+#: Added by :func:`add_phenology_columns` when the run supports it.
+OPTIONAL_PHENOLOGY_COLUMNS: tuple[str, ...] = ("emergence_doy",)
 
 
 def load_simulation(
@@ -168,6 +181,17 @@ def add_phenology_columns(
     # Kept linear on purpose: a season length is a duration, not a date, so it
     # must not be wrapped and must not use circular statistics.
     out["season_length_days"] = days + harvest_lag_days
+
+    # Emergence, where the run carries it. It is optional rather than required
+    # because it only exists in runs made after the thermal-time crossing was
+    # added to the summary frame; an older Parquet simply has no emergence
+    # column, which is the honest state rather than a derived guess.
+    if "days_to_emergence" in out.columns:
+        out["emergence_doy"] = wrap_doy(sown + out["days_to_emergence"].astype(float))
+    else:
+        logger.info(
+            "the run carries no days_to_emergence; emergence_doy is not derived"
+        )
 
     # A cell that never reached DVS = 2 has no maturity date. The run reports
     # that as NaN in days_to_maturity; keep it NaN rather than letting it

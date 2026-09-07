@@ -150,9 +150,60 @@ def test_profile_scalars_are_thickness_weighted(long_config, soil_dataset):
 
 def test_profile_table_rejects_an_unknown_depth_mode(long_config, soil_dataset):
     cells = _cells(long_config, soil_dataset)
-    with pytest.raises(ValueError, match="native.*simplace"):
+    with pytest.raises(ValueError, match="native.*simplace.*reference"):
         SoilExporter(long_config, reference_path=None).build_profile_table(
             soil_dataset, cells, depths="soilgrids"
+        )
+
+
+def test_reference_depth_mode_takes_the_axis_from_the_long_reference(
+    tmp_path, long_config, soil_dataset
+):
+    """The depth axis is a solution contract, not a free choice.
+
+    SIMPLACE's SLIM profile is a two-layer bucket; handing SoilCN six horizons
+    throws ArrayIndexOutOfBoundsException in model init, and every cell then
+    produces no output while SIMPLACE still exits 0.
+    """
+    reference = tmp_path / "SLIM_soil_ref.csv"
+    reference.write_text(
+        "location,Depth,LL,DUL\n"
+        "100_100,0.2,0.1,0.3\n"
+        "100_100,1.3,0.1,0.3\n"
+        "100_101,0.2,0.1,0.3\n"
+        "100_101,1.3,0.1,0.3\n"
+    )
+    long_config.reference.soil_file_long = reference
+    cells = _cells(long_config, soil_dataset)
+
+    exporter = SoilExporter(long_config, reference_path=None)
+    assert exporter.reference_depth_bottoms_cm() == [20.0, 130.0]
+
+    table = exporter.build_profile_table(soil_dataset, cells, depths="reference")
+    assert table["depth_bottom_cm"].iloc[:2].tolist() == [20.0, 130.0]
+    assert len(table) == len(cells) * 2
+
+
+def test_reference_depth_mode_lives_on_the_wide_exporter(long_config):
+    """LongSoilExporter delegates the computation to its wide instance.
+
+    The lookup therefore has to resolve on SoilExporter; defining it only on
+    the subclass raised AttributeError on every tile of a 112-tile array, after
+    each had already written its wide shard.
+    """
+    long_exporter = LongSoilExporter(long_config, reference_path=None)
+    assert hasattr(long_exporter._wide, "reference_depth_bottoms_cm")
+
+
+def test_reference_depth_mode_without_a_reference_is_an_error(
+    long_config, soil_dataset
+):
+    """Silently falling back would write a layering the solution cannot read."""
+    long_config.reference.soil_file_long = None
+    cells = _cells(long_config, soil_dataset)
+    with pytest.raises(ValueError, match="reference.soil_file_long"):
+        SoilExporter(long_config, reference_path=None).build_profile_table(
+            soil_dataset, cells, depths="reference"
         )
 
 

@@ -18,6 +18,7 @@ from cropmodelling4eu.export import resolve_export  # noqa: E402
 from cropmodelling4eu.torchcrop.run import (  # noqa: E402
     build_site_params,
     build_soil_params,
+    crossing_day,
     fertilizer_from_dvs,
     group_by_sowing,
     run_cells,
@@ -304,3 +305,150 @@ def test_merged_sowing_batch_matches_singleton_runs(run_config):
             singles[column].to_numpy(dtype=float),
             rtol=1e-3, atol=1e-4, err_msg=column,
         )
+
+
+# --------------------------------------------------------------------------- #
+# Emergence
+# --------------------------------------------------------------------------- #
+
+
+def test_crossing_day_interpolates_between_whole_days():
+    """The date is reported in days, so a whole-day argmax is a whole-day bias."""
+    x = torch.tensor([
+        [0.0, 10.0, 20.0, 30.0, 40.0],   # 25 falls midway between steps 2 and 3
+        [0.0, 30.0, 60.0, 90.0, 120.0],  # and 5/6 of the way through step 0
+        [0.0, 1.0, 2.0, 3.0, 4.0],       # never reaches 25
+    ])
+    day = crossing_day(x, 25.0)
+    assert day[0].item() == pytest.approx(2.5)
+    assert day[1].item() == pytest.approx(25.0 / 30.0)
+    # A row that never crosses has no crossing day. Clamping it to the last
+    # step would make "never emerged" indistinguishable from "emerged late".
+    assert torch.isnan(day[2])
+
+
+def test_crossing_day_is_differentiable_in_the_threshold():
+    """tsumem's only gradient path in stage 1 runs through here."""
+    x = torch.tensor([[0.0, 10.0, 20.0, 30.0, 40.0]])
+    thr = torch.tensor(25.0, requires_grad=True)
+    crossing_day(x, thr).sum().backward()
+    # d(day)/d(threshold) = 1 / (x1 - x0) = 1/10.
+    assert thr.grad.item() == pytest.approx(0.1)
+
+
+def test_crossing_day_handles_a_threshold_already_met_at_the_first_step():
+    x = torch.tensor([[50.0, 60.0, 70.0]])
+    assert crossing_day(x, 25.0).item() == pytest.approx(0.0)
+
+
+@pytest.mark.slow
+def test_run_writes_an_emergence_day_between_sowing_and_maturity(run_config):
+    """Emergence is dated on the thermal-time clock, not on DVS.
+
+    DVS is pinned at 0 until the crop emerges, so it carries no emergence
+    signal at all -- the check that matters is that the column exists, is
+    fractional (an argmax would make it integral), and lands inside the
+    season it belongs to.
+    """
+    frame = run_cells(run_config, np.array(TEST_CELLS), [2000])
+
+    assert "days_to_emergence" in frame.columns
+    emergence = frame["days_to_emergence"]
+    assert emergence.notna().all()
+    # Emergence follows sowing and precedes maturity, for every cell.
+    assert (emergence > 0).all()
+    assert (emergence < frame["days_to_maturity"]).all()
+    # Linear interpolation, not argmax: at least one cell lands off a whole day.
+    assert not np.allclose(emergence, emergence.round())
+
+
+# --------------------------------------------------------------------------- #
+# Which SIMPLACE crop the run is harmonised against
+# --------------------------------------------------------------------------- #
+
+
+def _multi_crop_xml(tmp_path):
+    """A LINTUL5_crop.xml-shaped file: several blocks, keyed `Crop`, tables
+    stored as one interleaved <value> list rather than as an x/y pair."""
+    path = tmp_path / "LINTUL5_crop.xml"
+    path.write_text(
+        "<crops>\n"
+        "  <crop>\n"
+        "    <parameter id='Crop'>MAIZ</parameter>\n"
+        "    <parameter id='TSUM1'>800.0</parameter>\n"
+        "    <parameter id='IDSL'>0</parameter>\n"
+        "  </crop>\n"
+        "  <crop>\n"
+        "    <parameter id='Crop'>WW</parameter>\n"
+        "    <parameter id='TSUM1'>1125.0</parameter>\n"
+        "    <parameter id='IDSL'>2</parameter>\n"
+        "    <parameter id='VERSAT'>70</parameter>\n"
+        "    <parameter id='VBASE'>14</parameter>\n"
+        "    <parameter id='PHOTTB'>\n"
+        "      <value>0</value><value>0.0</value>\n"
+        "      <value>17</value><value>1.0</value>\n"
+        "    </parameter>\n"
+        "  </crop>\n"
+        "</crops>\n"
+    )
+    return path
+
+
+def test_a_multi_crop_file_without_a_named_block_is_refused(tmp_path):
+    """Taking the first block reads LINTUL5_crop.xml as maize, and the wheat
+    run that follows looks entirely normal."""
+    from cropmodelling4eu.torchcrop.params import load_simplace_crop
+
+    with pytest.raises(ValueError, match="no crop was named"):
+        load_simplace_crop(_multi_crop_xml(tmp_path))
+
+
+def test_crop_block_is_selected_by_either_key_spelling(tmp_path):
+    """Brandenburg keys on CropName, EU SUSTAg on Crop; neither file says so."""
+    from cropmodelling4eu.torchcrop.params import load_simplace_crop
+
+    block = load_simplace_crop(_multi_crop_xml(tmp_path), "WW")
+    assert block["TSUM1"] == 1125.0
+    assert block["IDSL"] == 2.0
+
+
+def test_an_unknown_block_name_lists_what_the_file_holds(tmp_path):
+    from cropmodelling4eu.torchcrop.params import load_simplace_crop
+
+    with pytest.raises(ValueError, match=r"MAIZ.*WW"):
+        load_simplace_crop(_multi_crop_xml(tmp_path), "winter_wheat")
+
+
+def test_interleaved_tables_are_read_as_x_y_pairs(tmp_path):
+    """SUSTAg stores a table as one <value> list, Brandenburg as two params.
+    Reading only the latter leaves every SUSTAg table on torchcrop's preset."""
+    from cropmodelling4eu.torchcrop.params import load_simplace_crop, simplace_table
+
+    block = load_simplace_crop(_multi_crop_xml(tmp_path), "WW")
+    assert simplace_table(block, "phottb") == [[0.0, 0.0], [17.0, 1.0]]
+    # A table the file does not hold stays absent rather than becoming empty.
+    assert simplace_table(block, "slatb") is None
+
+
+def test_vernalisation_survives_a_preset_with_no_slot_for_it(tmp_path):
+    """idsl = 2 with versat == vbase is a no-op: torchcrop returns vernfac = 1.
+
+    The bundled wheat preset has no versat/vbase/vernrt entries, so filling
+    only its own slots would drop them and leave the crop running at idsl = 2
+    with a TSUM1 that was calibrated *with* vernalisation.
+    """
+    from torchcrop import CropParameters
+
+    from cropmodelling4eu.torchcrop.params import write_crop_yaml
+
+    out = write_crop_yaml(
+        tmp_path / "crop_wheat.yaml",
+        simplace_crop_xml=_multi_crop_xml(tmp_path),
+        crop_name="wheat",
+        simplace_crop="WW",
+    )
+    params = CropParameters(config_file=str(out))
+    assert float(params.idsl) == 2.0
+    assert float(params.versat) == 70.0
+    assert float(params.vbase) == 14.0
+    assert float(params.versat) != float(params.vbase)

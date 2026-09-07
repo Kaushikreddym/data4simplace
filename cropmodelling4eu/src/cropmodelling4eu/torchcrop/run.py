@@ -332,6 +332,40 @@ def _diagnostic_trajectory(output, name: str) -> torch.Tensor:
     return torch.stack([getattr(d, name) for d in output.diagnostics], dim=1)
 
 
+def crossing_day(x: torch.Tensor, threshold) -> torch.Tensor:
+    """Fractional day index at which ``x`` first reaches ``threshold``.
+
+    ``x`` is a ``[B, T]`` monotonically non-decreasing accumulator (``tsump``,
+    ``tsum``, ``dvs`` before maturity). The crossing is found by linear
+    interpolation between the last step below the threshold and the first at or
+    above it, which is exact and differentiable in both the trajectory and the
+    threshold — the construction torchcrop's own phenology-calibration example
+    uses.
+
+    Preferred over ``argmax``, which quantises to whole days and carries no
+    gradient, and over a sigmoid-sum date, which is exact only in the sharp
+    limit and biased at any finite sharpness. The quantity is reported in days,
+    so a smoothing bias is a bias in the answer.
+
+    Args:
+        x: ``[B, T]`` accumulator, non-decreasing along ``T``.
+        threshold: Scalar or ``[B]`` value to cross.
+
+    Returns:
+        ``[B]`` fractional step index, **NaN where the threshold is never
+        reached** — a row that never emerged has no emergence day, and a
+        clamped last-day answer would be indistinguishable from a real one.
+    """
+    thr = torch.as_tensor(threshold, dtype=x.dtype, device=x.device).expand(x.shape[0])
+    below = x < thr.unsqueeze(1)
+    t0 = (below.sum(dim=1) - 1).clamp(0, x.shape[1] - 2)
+    x0 = x.gather(1, t0.unsqueeze(1)).squeeze(1)
+    x1 = x.gather(1, (t0 + 1).unsqueeze(1)).squeeze(1)
+    frac = ((thr - x0) / (x1 - x0).clamp(min=1e-9)).clamp(0.0, 1.0)
+    day = t0.to(x.dtype) + frac
+    return day.where(~below.all(dim=1), torch.full_like(day, float("nan")))
+
+
 def _simulate(
     ids: np.ndarray,
     weather_np: np.ndarray,
@@ -387,8 +421,14 @@ def _simulate(
         out = model(weather, start_doy=start_doy, fertilizer=fertilizer)
 
     irrigated = soil_params.irri.cpu().numpy().astype(np.int8)
+    # The emergence threshold travels with the output because it is the only
+    # thing needed to date emergence and it must be the value this batch
+    # actually ran with -- `crop_params` may be the caller's workspace set
+    # rather than the crop name's defaults, so rebuilding it downstream would
+    # silently date emergence against a different tsumem.
+    tsumem = float(crop_params.tsumem)
     del model, soil_params, site_params, weather
-    return out, fertilizer, irrigated
+    return out, fertilizer, irrigated, tsumem
 
 
 def _summary_frame(
@@ -400,6 +440,7 @@ def _summary_frame(
     start_doy: int,
     sowing_doy: np.ndarray,
     bundle: ExportBundle,
+    tsumem: float,
 ) -> pd.DataFrame:
     """Per-cell summary of an already-simulated batch; see :func:`run_batch`.
 
@@ -435,6 +476,14 @@ def _summary_frame(
         mature.float().argmax(dim=1).cpu().numpy() - sow_index,
         np.nan,
     )
+    # Emergence is dated on the thermal-time clock, not on DVS: DVS is pinned
+    # at 0 until the crop emerges (`dvs_rate` is gated by `emerged`), so it
+    # carries no emergence signal, and its first non-zero step is one day late
+    # because the rate on day t produces the state on day t + 1.
+    # `tsump` is unaffected by `tsumem`, so this is the only column in the
+    # frame whose value depends on where that threshold sits.
+    tsump = torch.stack([s.tsump for s in out.states[1:]], dim=1)
+    days_to_emergence = crossing_day(tsump, tsumem).cpu().numpy() - sow_index
 
     frame = pd.DataFrame(
         {
@@ -448,6 +497,7 @@ def _summary_frame(
             "biomass_g_m2": out.biomass[:, -1].cpu().numpy(),
             "max_lai": out.lai.max(dim=1).values.cpu().numpy(),
             "final_dvs": out.dvs[:, -1].cpu().numpy(),
+            "days_to_emergence": days_to_emergence,
             "days_to_maturity": days_to_maturity,
             "n_applied_g_m2": applied[:, 0],
             "p_applied_g_m2": applied[:, 1],
@@ -486,11 +536,11 @@ def run_batch(
     over ``0 < DVS < 2`` — which also excludes the pre-sowing spin-up.
     """
     sowing_doy = np.asarray(sowing_doy)
-    out, fertilizer, irrigated = _simulate(
+    out, fertilizer, irrigated, tsumem = _simulate(
         ids, weather_np, year, start_doy, sowing_doy, bundle, device, crop_params
     )
     frame = _summary_frame(
-        ids, out, fertilizer, irrigated, year, start_doy, sowing_doy, bundle
+        ids, out, fertilizer, irrigated, year, start_doy, sowing_doy, bundle, tsumem
     )
     del out, fertilizer
     return frame
@@ -621,7 +671,7 @@ def daily_batch(
 ) -> pd.DataFrame:
     """Per-**day** trajectories for one batch and one season; see :func:`_daily_frame`."""
     sowing_doy = np.asarray(sowing_doy)
-    out, _fertilizer, _irrigated = _simulate(
+    out, _fertilizer, _irrigated, _tsumem = _simulate(
         ids, weather_np, year, start_doy, sowing_doy, bundle, device, crop_params
     )
     frame = _daily_frame(ids, out, year, start_doy, sowing_doy, bundle, variables)
@@ -711,13 +761,13 @@ def run_cells(
             )
             for year, (weather, start_doy) in blocks.items():
                 if mode == "both":
-                    out, fertilizer, irrigated = _simulate(
+                    out, fertilizer, irrigated, tsumem = _simulate(
                         batch, weather, year, start_doy, batch_doy, bundle,
                         device, crop_params,
                     )
                     frames.append(_summary_frame(
                         batch, out, fertilizer, irrigated, year, start_doy,
-                        batch_doy, bundle,
+                        batch_doy, bundle, tsumem,
                     ))
                     daily_frames.append(_daily_frame(
                         batch, out, year, start_doy, batch_doy, bundle, variables,
@@ -863,13 +913,13 @@ def run_shard(
 
             for year, (weather_np, start_doy) in blocks.items():
                 if daily:
-                    out, fertilizer, irrigated = _simulate(
+                    out, fertilizer, irrigated, tsumem = _simulate(
                         batch, weather_np, year, start_doy, batch_doy, bundle,
                         device, crop_params,
                     )
                     results.append(_summary_frame(
                         batch, out, fertilizer, irrigated, year, start_doy,
-                        batch_doy, bundle,
+                        batch_doy, bundle, tsumem,
                     ))
                     daily_results.append(_daily_frame(
                         batch, out, year, start_doy, batch_doy, bundle,

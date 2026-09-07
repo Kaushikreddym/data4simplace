@@ -21,8 +21,8 @@ export TC_PROJECT_DIR="${TC_PROJECT_DIR:-/data01/FDS/muduchuru/codes/GITHUB/data
 export TC_CONDA_ENV="${TC_CONDA_ENV:-sdba}"   # holds torch + the torchcrop install
 
 # --- Input & output ----------------------------------------------------------
-export TC_DATA_DIR="${TC_DATA_DIR:-/data01/FDS/muduchuru/Data/SIMPLACE/EU}"
-export TC_RUN_NAME="${TC_RUN_NAME:-winter_wheat_2000_2024}"
+export TC_DATA_DIR="${TC_DATA_DIR:-/data01/FDS/muduchuru/Data/SIMPLACE/EU_val}"
+export TC_RUN_NAME="${TC_RUN_NAME:-winter_wheat_2000_2024_euval}"
 # Sibling of the SIMPLACE run's own <output_dir>/<run_name>/simplace (see
 # simplace_env.sh's resolve_run_dir), so one run directory holds both models'
 # outputs instead of scattering torchcrop under its own top-level path.
@@ -110,6 +110,22 @@ export TC_CROP_SOURCE="${TC_CROP_SOURCE:-simplace}"
 # each can be overridden independently -- both default to `simplace` now.
 export TC_SMOKE_CROP_SOURCE="${TC_SMOKE_CROP_SOURCE:-simplace}"
 export TC_SIMPLACE_TEMPLATE="${TC_SIMPLACE_TEMPLATE:-/data01/FDS/muduchuru/codes/SIMPLACE/Brandenburg_1KM_winter_wheat}"
+# WHICH SIMPLACE crop file, and which crop inside it. These exist because the
+# template above is NOT the solution the production SIMPLACE run uses: that run
+# is EU SUSTAg, whose crop file is data/crop/LINTUL5_crop.xml with eight <crop>
+# blocks keyed MAIZ MAIF WW BARL RAPE POTA SUGB CC. Harmonising torchcrop
+# against Brandenburg's crop.xml instead gave the two models genuinely
+# different crops -- IDSL 0 vs 2 (no vernalisation vs vernalisation), TSUM1
+# 1623 vs 1125, RGRLAI 0.018 vs 0.00817 -- which made every model-to-model
+# comparison a comparison of two parameterisations rather than of two models.
+# Both empty by default, which keeps a standalone torchcrop run on the
+# Brandenburg template's single-block crop.xml (no crop name needed).
+# submit_cropmodelling.sh sets them together to the SIMPLACE run's own crop
+# file and block, because there the two models are meant to match.
+# They must be set as a pair: 'WW' does not exist in Brandenburg's file, and
+# LINTUL5_crop.xml has no 'winter_wheat'.
+export TC_CROP_XML="${TC_CROP_XML:-}"
+export TC_SIMPLACE_CROP="${TC_SIMPLACE_CROP:-}"
 
 # --- Sharding & batching -----------------------------------------------------
 # One SLURM array task per shard; cells are dealt round-robin so every shard

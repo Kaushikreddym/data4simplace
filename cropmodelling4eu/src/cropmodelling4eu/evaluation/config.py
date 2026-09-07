@@ -17,6 +17,12 @@ from typing import Final, NamedTuple
 
 __all__ = [
     "CALENDAR_STAGES",
+    "CLMS_CROP",
+    "CLMS_MIN_PIXELS",
+    "CLMS_MIN_SEASON_SHARE",
+    "CLMS_PHENOLOGY_DIR",
+    "CLMS_PHENOLOGY_FILES",
+    "CLMS_STAGES",
     "CYBENCH_CALENDAR_TEMPLATE",
     "CYBENCH_CROP_DIR",
     "CYBENCH_CROP_MASK_TEMPLATE",
@@ -27,6 +33,7 @@ __all__ = [
     "CACHE_DIR",
     "CROP",
     "CalendarStage",
+    "ClmsStage",
     "DAYS_IN_YEAR",
     "EU27",
     "EUROPE_BBOX",
@@ -126,6 +133,119 @@ CYBENCH_POLYGON_DIR: Final[Path] = _env_path(
 CYBENCH_YIELD_TEMPLATE: Final[str] = "yield_{crop}_{country}.csv"
 CYBENCH_CALENDAR_TEMPLATE: Final[str] = "crop_calendar_{crop}_{country}.csv"
 CYBENCH_CROP_MASK_TEMPLATE: Final[str] = "crop_mask_{crop}_{country}.csv"
+
+
+# --------------------------------------------------------------------------- #
+# CLMS HRL Croplands phenology — the per-year observed crop calendar
+# --------------------------------------------------------------------------- #
+#
+# Written by ``data4simplace``'s phenology stage from the 10 m CPMCE/CPMCH/CTY
+# rasters (see ``src/data4simplace/CLMS_DOWNLOAD.md``). Unlike CyBench's
+# ``crop_calendar``, which is one static ``sos``/``eos`` per unit, this carries
+# a **year** dimension, so a model's interannual phenology can be rewarded
+# rather than only penalised.
+
+CLMS_PHENOLOGY_DIR: Final[Path] = _env_path(
+    "CLMS_PHENOLOGY_DIR",
+    "/data01/FDS/muduchuru/Data/SIMPLACE/EU/validation/phenology",
+)
+
+#: ``phenology_adm.parquet`` keys on ``adm_id`` (the CyBench reporting units);
+#: ``phenology_grid.parquet`` keys on ``SimplaceID`` (the 10 km cells).
+CLMS_PHENOLOGY_FILES: Final[dict[str, str]] = {
+    "adm": "phenology_adm.parquet",
+    "grid": "phenology_grid.parquet",
+}
+
+#: ``CTY`` class 1110 is "wheat" with no winter/spring split; the reducer
+#: recovers it from the emergence year encoded in ``CPMCE``'s ``YYDOY`` and
+#: labels the two modes. ``wheat_winter`` is the half this run simulates.
+CLMS_CROP: Final[str] = "wheat_winter"
+
+#: Quality gates on a (unit, year) row, applied by
+#: :func:`~cropmodelling4eu.evaluation.clms.load_phenology`.
+#:
+#: ``CLMS_MIN_PIXELS`` is 10 m pixels, so 10 000 is 1 km² of winter wheat in
+#: the unit — below that the median of the pixel distribution is a handful of
+#: fields, not a unit statistic. ``CLMS_MIN_SEASON_SHARE`` is the winter share
+#: of the unit's wheat: where winter wheat is a small minority, the autumn/
+#: spring cut that produced the label rests on a thin mode.
+CLMS_MIN_PIXELS: Final[int] = 10_000
+CLMS_MIN_SEASON_SHARE: Final[float] = 0.2
+
+
+class ClmsStage(NamedTuple):
+    """One simulated column and the CLMS field it is compared against.
+
+    Attributes:
+        key: Identifier used in column names and file names.
+        label: Human-readable name for figure titles and tables.
+        sim_col: Column produced by the run schema.
+        obs_col: Column of the loaded CLMS table.
+        circular: Whether the quantity is a day-of-year (circular) or a
+            duration (linear). Durations must not use the shortest-path
+            circular difference — it folds a 250-day season under 182.5.
+        caveat: What the pairing does and does not mean.
+    """
+
+    key: str
+    label: str
+    sim_col: str
+    obs_col: str
+    circular: bool
+    caveat: str
+
+
+#: The CLMS pairings. Emergence is deliberately **not** a like-for-like row:
+#: neither production run emits an emergence date, so the only simulated column
+#: on that end of the season is the sowing date, and the pairing is reported as
+#: a lag rather than as a bias.
+CLMS_STAGES: Final[tuple[ClmsStage, ...]] = (
+    ClmsStage(
+        key="emergence",
+        label="Emergence",
+        sim_col="sowing_doy",
+        obs_col="obs_emergence_doy",
+        circular=True,
+        caveat=(
+            "NOT a like-for-like pairing. Neither run writes an emergence "
+            "date -- SIMPLACE's solution emits no EmergenceDOY and torchcrop's "
+            "schema has no emergence column -- so the simulated side is the "
+            "*sowing* date. Read the residual as the observed sowing-to-"
+            "emergence lag, which the model's tsumem is supposed to reproduce "
+            "and which is not scored anywhere else."
+        ),
+    ),
+    ClmsStage(
+        key="harvest",
+        label="Harvest",
+        sim_col="maturity_doy",
+        obs_col="obs_harvest_doy",
+        circular=True,
+        caveat=(
+            "The clean pairing, with one level caveat. SIMPLACE's "
+            "maturity_doy is the date of its own HarvestManagement.DoHarvest "
+            "row and torchcrop's harvest_doy equals maturity (no drydown), so "
+            "both sides mean 'the day the crop came off'. CPMCH, however, sits "
+            "about a month earlier than every other harvest reference on disk "
+            "-- see the offset check in the notebook before reading the bias "
+            "as model error."
+        ),
+    ),
+    ClmsStage(
+        key="season_length",
+        label="Season length",
+        sim_col="season_length_days",
+        obs_col="obs_season_length_days",
+        circular=False,
+        caveat=(
+            "Endpoints differ on both ends: the simulated season runs sowing "
+            "-> maturity, the observed one emergence -> harvest. The bias is "
+            "therefore the sum of the emergence-lag row and the harvest row, "
+            "and the notebook checks that it closes."
+        ),
+    ),
+)
 
 
 # --------------------------------------------------------------------------- #

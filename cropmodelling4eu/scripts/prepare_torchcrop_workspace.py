@@ -25,6 +25,12 @@ def main() -> int:
     parser.add_argument("--crop-xml", type=Path,
                         help="SIMPLACE crop.xml; needed for --crop-source simplace "
                              "and for the audit either way")
+    parser.add_argument("--simplace-crop",
+                        help="the <crop> block to read from --crop-xml, by its "
+                             "CropName or Crop id (e.g. 'WW'). Required when "
+                             "the file holds more than one crop")
+    parser.add_argument("--seeds-crop",
+                        help="the <crop> block to read from --seeds-xml. It keys on\n                             long names (winter_wheat) where the crop file uses\n                             codes (WW), so it is named separately")
     parser.add_argument("--seeds-xml", type=Path)
     parser.add_argument("--management-xml", type=Path)
     args = parser.parse_args()
@@ -34,6 +40,8 @@ def main() -> int:
     workspace = prepare_workspace(
         config, args.out_dir, args.crop_source,
         args.crop_xml, args.seeds_xml, args.management_xml,
+        simplace_crop=args.simplace_crop,
+        seeds_crop=args.seeds_crop,
     )
     print(workspace.crop_file)
     return 0

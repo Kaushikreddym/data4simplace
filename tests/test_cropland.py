@@ -15,6 +15,7 @@ from data4simplace.spatial import (
     CroplandWeights,
     apply_cell_mask,
     export_cell_mask,
+    exported_soil_cells,
     keep_cells,
 )
 
@@ -330,6 +331,63 @@ def test_export_cell_mask_uses_cropland_alone_without_a_soil_stage(tmp_path):
 
     mask = export_cell_mask(cfg, TargetGrid.from_config(cfg.grid), soil=None)
     np.testing.assert_array_equal(mask.values, [[True, False], [False, False]])
+
+
+def _write_soil_csv(cfg: PipelineConfig, ids: list[int], name: str = "soil.csv") -> None:
+    """A minimal exported soil CSV carrying only the identifier column."""
+    soil_dir = cfg.paths.output_dir / "soil"
+    soil_dir.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame({"location": ids, "clay_1": [20.0] * len(ids)}).to_csv(
+        soil_dir / name, index=False
+    )
+
+
+@pytest.mark.parametrize("name", ["soil.csv", "soil_long.csv"])
+def test_export_cell_mask_falls_back_to_an_existing_soil_export(tmp_path, name):
+    """A stage-less run must not widen the cell set (submit/management.sh)."""
+    path = _cover_tif(tmp_path, _quadrants((0.9, 0.9, 0.9, 0.9)))
+    cfg = _config(tmp_path, path, cropland_min_fraction=0.8)
+    _write_soil_csv(cfg, [1, 4], name=name)
+
+    mask = export_cell_mask(cfg, TargetGrid.from_config(cfg.grid), soil=None)
+    np.testing.assert_array_equal(mask.values, [[True, False], [False, True]])
+
+
+def test_export_cell_mask_prefers_the_live_soil_stage_over_the_export(tmp_path):
+    """The dataset in hand wins: an export in the same directory is the *previous* run."""
+    path = _cover_tif(tmp_path, _quadrants((0.9, 0.9, 0.9, 0.9)))
+    cfg = _config(tmp_path, path, cropland_min_fraction=0.8)
+    _write_soil_csv(cfg, [1, 2, 3, 4])
+    soil = _soil_2x2(np.array([[True, False], [False, False]]))
+
+    mask = export_cell_mask(cfg, TargetGrid.from_config(cfg.grid), soil)
+    np.testing.assert_array_equal(mask.values, [[True, False], [False, False]])
+
+
+def test_export_cell_mask_fallback_can_be_refused(tmp_path):
+    """What data4simplace.tiling passes: its grid is a tile, not the whole grid."""
+    path = _cover_tif(tmp_path, _quadrants((0.9, 0.9, 0.9, 0.9)))
+    cfg = _config(tmp_path, path, cropland_min_fraction=0.8)
+    _write_soil_csv(cfg, [1, 4])
+
+    mask = export_cell_mask(
+        cfg, TargetGrid.from_config(cfg.grid), soil=None, soil_export_fallback=False
+    )
+    assert int(mask.values.sum()) == 4
+
+
+def test_exported_soil_cells_rejects_ids_from_another_grid(tmp_path):
+    """An out-of-range id means a different grid definition, not a bigger export."""
+    cfg = _config(tmp_path)
+    _write_soil_csv(cfg, [1, 99_999])
+
+    with pytest.raises(ValueError, match="different grid definition"):
+        exported_soil_cells(cfg.paths.output_dir, TargetGrid.from_config(cfg.grid))
+
+
+def test_exported_soil_cells_is_none_without_an_export(tmp_path):
+    cfg = _config(tmp_path)
+    assert exported_soil_cells(cfg.paths.output_dir, TargetGrid.from_config(cfg.grid)) is None
 
 
 def test_export_cell_mask_is_none_when_neither_condition_applies(tmp_path):

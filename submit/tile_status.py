@@ -73,7 +73,11 @@ def main(argv: list[str] | None = None) -> int:
         print("unfinished   : none")
 
     out = Path(config.paths.output_dir)
-    weather = len(list((out / "weather").glob("*.csv.gz")))
+    # rglob, not glob: the weather export nests one directory per grid row
+    # (weather/148/daily_mean_RES1_C263R148.csv.gz), so a top-level glob finds
+    # nothing and reports 0 for a complete 70 705-file export -- which reads as a
+    # failed run rather than a miscount.
+    weather = len(list((out / "weather").rglob("*.csv.gz")))
     shards = len(list((out / "soil" / "_shards").glob("tile_*.csv")))
     print(f"weather files: {weather}")
     print(f"soil shards  : {shards}")

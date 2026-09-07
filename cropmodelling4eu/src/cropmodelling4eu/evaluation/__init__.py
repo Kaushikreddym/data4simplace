@@ -11,6 +11,7 @@ here. Two compare against **CyBench** at country level
 :mod:`doy`         Circular day-of-year arithmetic
 :mod:`torchcrop`   Loader for the combined TorchCrop run
 :mod:`cybench`     Loaders for the CyBench yield, calendar and crop-mask CSVs
+:mod:`clms`        Loader for the CLMS HRL Croplands per-year observed phenology
 :mod:`gdhy`        Loader for the GDHY 0.5° gridded yield product
 :mod:`sage`        Loader for the SAGE 0.5° crop calendar
 :mod:`regions`     Country geometry and the cell to country assignment
@@ -28,6 +29,7 @@ from __future__ import annotations
 
 from . import (
     aggregate,
+    clms,
     config,
     cybench,
     germany,
@@ -45,6 +47,7 @@ from . import (
 
 __all__ = [
     "aggregate",
+    "clms",
     "config",
     "cybench",
     "doy",

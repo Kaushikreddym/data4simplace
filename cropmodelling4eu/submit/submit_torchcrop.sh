@@ -110,10 +110,16 @@ if [ "${SMOKE}" -eq 1 ]; then
     fi
 
     TC_TEMPLATE_DATA="${TC_SIMPLACE_TEMPLATE}/data"
+# TC_CROP_XML overrides the template's own crop.xml -- see torchcrop_env.sh.
+TC_CROP_XML_PATH="${TC_CROP_XML:-${TC_TEMPLATE_DATA}/crop/crop.xml}"
+TC_CROP_BLOCK_ARG=()
+[ -n "${TC_SIMPLACE_CROP:-}" ] && TC_CROP_BLOCK_ARG=(--simplace-crop "${TC_SIMPLACE_CROP}")
     python scripts/prepare_torchcrop_workspace.py --config "${SMOKE_CONFIG}" \
         --out-dir "${SMOKE_TC_DIR}" --crop-source "${TC_SMOKE_CROP_SOURCE}" \
-        --crop-xml "${TC_TEMPLATE_DATA}/crop/crop.xml" \
+        --crop-xml "${TC_CROP_XML_PATH}" \
+        ${TC_CROP_BLOCK_ARG[@]:+"${TC_CROP_BLOCK_ARG[@]}"} \
         --seeds-xml "${TC_TEMPLATE_DATA}/crop/seeds.xml" \
+        --seeds-crop "${TC_SEEDS_CROP:-winter_wheat}" \
         --management-xml "${TC_TEMPLATE_DATA}/management/management.xml" \
         > /dev/null || exit 1
 
@@ -252,10 +258,16 @@ mkdir -p "${TC_LOG_DIR}" "${TC_SHARD_DIR}" "${TC_OUT_DIR}"
 # tasks read has to exist first, and a mistake in it then fails in seconds
 # rather than in every array task.
 TC_TEMPLATE_DATA="${TC_SIMPLACE_TEMPLATE}/data"
+# TC_CROP_XML overrides the template's own crop.xml -- see torchcrop_env.sh.
+TC_CROP_XML_PATH="${TC_CROP_XML:-${TC_TEMPLATE_DATA}/crop/crop.xml}"
+TC_CROP_BLOCK_ARG=()
+[ -n "${TC_SIMPLACE_CROP:-}" ] && TC_CROP_BLOCK_ARG=(--simplace-crop "${TC_SIMPLACE_CROP}")
 python scripts/prepare_torchcrop_workspace.py --config "${TC_CONFIG}" \
     --out-dir "${TC_OUT_DIR}" --crop-source "${TC_CROP_SOURCE}" \
-    --crop-xml "${TC_TEMPLATE_DATA}/crop/crop.xml" \
+    --crop-xml "${TC_CROP_XML_PATH}" \
+        ${TC_CROP_BLOCK_ARG[@]:+"${TC_CROP_BLOCK_ARG[@]}"} \
     --seeds-xml "${TC_TEMPLATE_DATA}/crop/seeds.xml" \
+        --seeds-crop "${TC_SEEDS_CROP:-winter_wheat}" \
     --management-xml "${TC_TEMPLATE_DATA}/management/management.xml" \
     > /dev/null || { echo "ERROR: could not prepare the workspace" >&2; exit 1; }
 

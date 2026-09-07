@@ -176,7 +176,11 @@ def _run_tile(
 
     ct = _global_cell_table(tgrid, w, n_lon)
 
-    mask = export_cell_mask(tcfg, tgrid, soil)
+    # No soil-export fallback here: `tgrid` is this tile's grid, while the
+    # SimplaceIDs in an existing soil.csv index the whole target grid, so they
+    # cannot be unflattened onto it. A tiled run with the soil stage off keeps
+    # the cropland-only cell set it has always kept.
+    mask = export_cell_mask(tcfg, tgrid, soil, soil_export_fallback=False)
     climate = apply_cell_mask(climate, mask) if climate is not None else None
     soil = apply_cell_mask(soil, mask) if soil is not None else None
     hydraulic = apply_cell_mask(hydraulic, mask) if hydraulic is not None else None

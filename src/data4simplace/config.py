@@ -30,6 +30,11 @@ class ExecutionFlags(BaseModel):
     # irrigated and rainfed harvested area, and add the vIRR column to the
     # SIMPLACE management file. See the irrigation block.
     run_irrigation_classification: bool = False
+    # Observed crop phenology from CLMS HRL Croplands, aggregated to CyBench
+    # administrative units and to the target grid. A *validation* dataset rather
+    # than a model input: it is what a run is scored and calibrated against, so
+    # it lands under ``validation/`` rather than beside weather and soil.
+    run_phenology_processing: bool = False
     apply_agricultural_mask: bool = False
     # Intermediate NetCDF/CSV statistics for the n most frequent soil classes
     # per cell (see soil.n_primary_classes); the SIMPLACE CSVs are unaffected.
@@ -107,6 +112,13 @@ class PathsConfig(BaseModel):
     # Annual global CO2 series as ``year,ppm``. Unset -> the built-in
     # global-mean table, and the written file records that it is a fallback.
     co2_file: Optional[Path] = None
+    # CLMS HRL Croplands root, holding ``inventory/`` and ``tiles/<PRODUCT>/<year>/``.
+    # Needed by the phenology (validation) stage; unset -> that stage skips.
+    clms_root: Optional[Path] = None
+    # CyBench administrative polygons, ``<country>/<country>.shp``. The support
+    # the phenology medians are reported on, and the key they join to CyBench
+    # yields by.
+    cybench_polygon_root: Optional[Path] = None
     output_dir: Path = Path("./output")
 
 
@@ -396,7 +408,7 @@ class SoilConfig(BaseModel):
     #              to force them onto; this is the whole point of the layout.
     #   simplace - remap onto the wide reference's layer bottoms, so the long and
     #              wide files describe the same layering and compare directly.
-    long_depths: Literal["native", "simplace"] = "native"
+    long_depths: Literal["native", "simplace", "reference"] = "native"
     # Per-column constants for long-layout columns SoilGrids cannot derive
     # (van Genuchten ``alfa``/``n``, ``ksat``, ``macroporevolume``,
     # ``dampingdepth``, ``drainage_rate``, ``deltatheta``, ``maxRootingDepth``,
@@ -432,6 +444,32 @@ class SoilConfig(BaseModel):
     wcs_timeout: int = 180
 
 
+class PhenologyConfig(BaseModel):
+    """Observed phenology from CLMS HRL Croplands (a validation dataset)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    # CLMS publishes 2017 onward. Eight years is ample for a phenology whose
+    # parameters are time-invariant; it only means the product cannot inform
+    # anything that needs a pre-2017 anomaly.
+    years: list[int] = Field(default_factory=lambda: list(range(2017, 2025)))
+    # CyBench two-letter codes. Only these 23 have polygons; CH, CY, IS, LI, LU,
+    # MT, NO and SI are in the target scope but ship none.
+    countries: list[str] = Field(
+        default_factory=lambda: [
+            "AT", "BE", "BG", "CZ", "DE", "DK", "EE", "EL", "ES", "FI", "FR",
+            "HR", "HU", "IE", "IT", "LT", "LV", "NL", "PL", "PT", "RO", "SE", "SK",
+        ]
+    )
+    # Pixel stride for the cut-finding pass. The antimode only has to show where
+    # two modes separate, not measure a median, so a sixteenth of the pixels is
+    # plenty and the pass costs a sixteenth of the reads.
+    cut_stride: int = 4
+    # Rows per accumulation block, bounding peak memory independently of tile
+    # size.
+    block_rows: int = 2048
+
+
 class PipelineConfig(BaseModel):
     """Fully validated configuration for a pipeline run."""
 
@@ -448,6 +486,7 @@ class PipelineConfig(BaseModel):
     site: SiteConfig = Field(default_factory=SiteConfig)
     npk: NPKConfig = Field(default_factory=NPKConfig)
     irrigation: IrrigationConfig = Field(default_factory=IrrigationConfig)
+    phenology: PhenologyConfig = Field(default_factory=PhenologyConfig)
     missing_value: float = -99.0
 
     @model_validator(mode="after")
@@ -514,6 +553,31 @@ class PipelineConfig(BaseModel):
                 + ". paths.co2_file stays optional -- without it the built-in "
                 "global-mean CO2 table is written and labelled a fallback."
             )
+        return self
+
+    @model_validator(mode="after")
+    def _check_phenology(self) -> "PipelineConfig":
+        """The phenology stage needs both a source and a reporting geometry."""
+        if not self.flags.run_phenology_processing:
+            return self
+        missing = [
+            name
+            for name, value in (
+                ("clms_root", self.paths.clms_root),
+                ("cybench_polygon_root", self.paths.cybench_polygon_root),
+            )
+            if value is None
+        ]
+        if missing:
+            raise ValueError(
+                "flags.run_phenology_processing requires "
+                + " and ".join(f"paths.{name}" for name in missing)
+                + ". The first is where the CLMS tiles were fetched to; the "
+                "second is the administrative geometry the medians are reported "
+                "on, which is also the key they join to CyBench yields by."
+            )
+        if not self.phenology.years:
+            raise ValueError("phenology.years is empty; nothing to process")
         return self
 
     @model_validator(mode="after")

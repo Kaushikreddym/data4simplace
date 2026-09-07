@@ -384,6 +384,61 @@ def test_days_to_maturity_wraps_a_winter_season(tmp_path, grid):
     assert (frame["days_to_maturity"] > 0).all()
 
 
+def test_emergence_is_collected_and_dated_from_sowing(tmp_path, grid):
+    """The solution now writes Phenology.EmergenceDOY; it must reach the schema."""
+    directory = tmp_path / "yearly"
+    directory.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(
+        {
+            "projectid": [TEST_CELLS[0]],
+            "Year": [2000],
+            "PlantingDOY": [250],
+            "EmergenceDOY": [268],
+            "AnthesisDOY": [150],
+            "MaturityDOY": [228],
+            "Yield_t_ha": [6.84],
+        }
+    ).to_csv(directory / f"{TEST_CELLS[0]}_yearly.csv", sep=";", index=False)
+
+    frame = to_run_schema(read_yearly(tmp_path), grid)
+
+    assert frame["emergence_doy"].iloc[0] == pytest.approx(268.0)
+    assert frame["anthesis_doy"].iloc[0] == pytest.approx(150.0)
+    # Sown DOY 250, emerged DOY 268 the same autumn -> 18 days, no wrap.
+    assert frame["days_to_emergence"].iloc[0] == pytest.approx(18.0)
+    # Anthesis and maturity fall in the next calendar year and still wrap.
+    assert frame["days_to_maturity"].iloc[0] == pytest.approx(343.0)
+
+
+def test_a_stage_never_reached_is_nan_not_doy_zero(tmp_path, grid):
+    """Phenology writes 0 for a stage the crop never reached.
+
+    Left as 0 it would enter a circular mean as 31 December and drag the
+    unit's date across New Year -- the exact failure the circular arithmetic
+    exists to prevent.
+    """
+    directory = tmp_path / "yearly"
+    directory.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(
+        {
+            "projectid": [TEST_CELLS[0]],
+            "Year": [2000],
+            "PlantingDOY": [250],
+            "EmergenceDOY": [0],
+            "MaturityDOY": [0],
+            "Yield_t_ha": [0.0],
+        }
+    ).to_csv(directory / f"{TEST_CELLS[0]}_yearly.csv", sep=";", index=False)
+
+    frame = to_run_schema(read_yearly(tmp_path), grid)
+
+    assert pd.isna(frame["emergence_doy"].iloc[0])
+    assert pd.isna(frame["maturity_doy"].iloc[0])
+    # And the derived durations inherit the gap rather than inventing one.
+    assert pd.isna(frame["days_to_emergence"].iloc[0])
+    assert pd.isna(frame["days_to_maturity"].iloc[0])
+
+
 def test_absent_output_columns_are_reported(tmp_path, grid, caplog):
     directory = tmp_path / "yearly"
     directory.mkdir(parents=True)

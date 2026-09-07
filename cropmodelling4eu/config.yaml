@@ -6,11 +6,11 @@
 # are comparable. Validated by cropmodelling4eu.config.RunConfig (pydantic).
 # =============================================================================
 
-run_name: winter_wheat_2000_2024
+run_name: winter_wheat_2000_2024_euval
 
 paths:
   # A finished data4simplace export: weather/, soil/, site/, management/.
-  export_dir: "/data01/FDS/muduchuru/Data/SIMPLACE/EU"
+  export_dir: "/data01/FDS/muduchuru/Data/SIMPLACE/EU_val"
   # This package's own outputs; each run gets <output_dir>/<run_name>/.
   output_dir: "/data01/FDS/muduchuru/Data/SIMPLACE/cropmodelling4eu"
   # fertilizer_composition.xml — not part of the export, it lives next to the

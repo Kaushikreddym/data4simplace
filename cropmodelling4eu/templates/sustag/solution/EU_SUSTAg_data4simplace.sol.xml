@@ -1665,6 +1665,20 @@ WIKI_END</description>
         <out id="Year" datatype="INT" mode="LAST" rule="CURRENT.YEAR" />
         <out id="SowingDOY" datatype="INT" mode="LAST" rule="SowingDate.SowingDOY" />
         <out id="ForcedSow" datatype="INT" mode="LAST" rule="SowingRule.SeasonSowForced" />
+        <!-- The stage dates the lintul5 Phenology component already latches.
+             They cost nothing to write (EMERG/IDEMERG are computed anyway and
+             consumed by two other components) and they close three gaps:
+             emergence was previously unobservable on either model, so the CLMS
+             comparison had to pair its emergence against the *sowing* date;
+             MaturityDOY replaces collect.py's fallback of reading the harvest
+             row's own CURRENT.DATE; and AnthesisDOY restores the PEP725
+             heading pairing (germany.PHASES[51]), which has had nothing to
+             pair against since this solution replaced Brandenburg's.
+             mode="LAST" with the block's resetrule="DefaultManagement.DoSow"
+             gives the value latched during the season that is being harvested. -->
+        <out id="EmergenceDOY" datatype="INT" mode="LAST" rule="Phenology.EmergenceDOY" />
+        <out id="AnthesisDOY" datatype="INT" mode="LAST" rule="Phenology.AnthesisDOY" />
+        <out id="MaturityDOY" datatype="INT" mode="LAST" rule="Phenology.MaturityDOY" />
         <out id="Yield_noHS" datatype="DOUBLE" mode="LAST" rule="BiomassTranslocation.WSO" />
         <out id="Yield_HS_H_TCan" datatype="DOUBLE" mode="LAST" rule="HeatStressTCan.HSAdjustedYield" />
         <!--out id="cCellosesoilC" datatype="DOUBLE" mode="SUM" rule="array:sum(${SoilCN.cCellosesoilC})" />

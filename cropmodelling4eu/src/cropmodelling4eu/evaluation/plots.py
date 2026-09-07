@@ -937,6 +937,7 @@ def _basemap(ax: plt.Axes, p: dict[str, str], extent=EUROPE_EXTENT) -> None:
 def country_choropleth(
     polygons: gpd.GeoDataFrame,
     values: pd.Series,
+    key_col: str = "country",
     title: str = "",
     cbar_label: str = "",
     diverging: bool = True,
@@ -947,14 +948,19 @@ def country_choropleth(
     figsize: tuple[float, float] = (5.6, 6.0),
     annotate: bool = False,
     mean_label: str | None = None,
+    linewidth: float = 0.6,
     ax: plt.Axes | None = None,
 ) -> Figure:
-    """Fill each national footprint with a per-country value.
+    """Fill each administrative footprint with a per-unit value.
 
     Args:
-        polygons: Country footprints from
-            :func:`utils.regions.load_country_polygons`.
-        values: Value per country, indexed by country code.
+        polygons: Footprints from :func:`utils.regions.load_country_polygons`
+            (national) or :func:`utils.regions.load_admin_polygons` (the
+            NUTS-2/NUTS-3 units CyBench reports on).
+        values: Value per unit, indexed by whatever ``key_col`` names.
+        key_col: Column of ``polygons`` the index of ``values`` matches —
+            ``"country"`` for the national maps, ``"adm_id"`` for the
+            sub-national ones.
         title: Axes title.
         cbar_label: Colour-bar label, including units.
         diverging: ``True`` for a signed quantity (bias) — a zero-centred
@@ -977,6 +983,10 @@ def country_choropleth(
             it is not a country) as ``"<mean_label> = <value>"``, e.g.
             ``"Mean"`` for a magnitude or ``"Mean bias"`` for a signed one.
             ``None`` draws nothing.
+        linewidth: Unit outline width. The default suits ~23 national
+            footprints; drop it to ~0.15 for the ~800 NUTS units, where a
+            0.6 pt stroke on every boundary covers the fill it is meant to
+            separate and the map reads as a grey mesh.
         ax: Draw into this existing axes instead of creating a new figure —
             how a notebook cell panels several choropleths into one figure
             (create the axes with ``subplot_kw={"projection":
@@ -987,7 +997,7 @@ def country_choropleth(
     """
     p = palette(mode)
     frame = polygons.copy()
-    frame["value"] = frame["country"].map(values)
+    frame["value"] = frame[key_col].map(values)
 
     own_fig = ax is None
     if own_fig:
@@ -1007,9 +1017,9 @@ def country_choropleth(
     plotted = frame.to_crs(EUROPE_PROJECTION.proj4_init)
     plotted.plot(
         ax=ax, column="value", cmap=cmap, norm=norm,
-        edgecolor=p["surface"], linewidth=0.6, zorder=2,
+        edgecolor=p["surface"], linewidth=linewidth, zorder=2,
         missing_kwds={"color": p["land"], "edgecolor": p["surface"],
-                      "linewidth": 0.6, "hatch": None},
+                      "linewidth": linewidth, "hatch": None},
         legend=True,
         legend_kwds={"label": cbar_label, "orientation": "horizontal",
                      "shrink": 0.62, "pad": 0.02, "aspect": 30},

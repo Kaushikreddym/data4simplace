@@ -11,6 +11,7 @@ from data4simplace.spatial.cropland_weights import (
     CroplandWeights,
     apply_cell_mask,
     export_cell_mask,
+    exported_soil_cells,
     keep_cells,
 )
 
@@ -20,6 +21,7 @@ __all__ = [
     "HECTARES_PER_KM2",
     "apply_cell_mask",
     "export_cell_mask",
+    "exported_soil_cells",
     "keep_cells",
     "latitude_band_area_km2",
     "pixel_area_km2",

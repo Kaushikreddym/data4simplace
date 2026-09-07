@@ -11,30 +11,18 @@
 #
 # Tunables come from BOTH environment files, unchanged:
 #   submit/simplace_env.sh   (SP_*)   and   submit/torchcrop_env.sh   (TC_*)
-#
-# SIMPLACE first, because its sowing date is a *result*: the rule-based
-# solution sows on the first day inside the planting window on which a weather
-# rule fires, per cell and per season. torchcrop has no such rule -- it latches
-# one day-of-year -- so run alone it takes the export's proposed date and the
-# two models grow different seasons. Chaining them removes the single largest
-# difference between the runs, and it is the only difference that cannot be
-# removed by configuration.
-#
-# Three jobs, dependency-chained, so the whole thing is one submission:
-#
-#   1. <run>/submit.sh          SIMPLACE array, one task per line range
-#   2. cropmodelling_handoff.sh afterany -- collect, and write the sowing table
-#   3. submit_torchcrop.sh      afterok  -- shard array on those dates, + maps
-#
-# `afterany` on the handoff and `afterok` on torchcrop is deliberate: a
-# part-failed SIMPLACE array should still be collected and reported (its
-# retryable tasks are listed by --status), but torchcrop must not start on a
-# sowing table that was never written.
 # =============================================================================
 
+# No `-e`: sp_activate sources ~/.bashrc, which reaches
+# /etc/profile.d/debuginfod.sh, whose `cat "/etc/debuginfod"/*.urls | tr ...`
+# fails on the unmatched glob -- with pipefail that is a non-zero pipeline, and
+# with -e it kills this script before it prints anything. sp_activate already
+# stands `set -u` down for the same class of reason. Every sibling submit
+# script uses exactly this line.
 set -uo pipefail
 
 SUBMIT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 # shellcheck disable=SC1091
 source "${SUBMIT_DIR}/simplace_env.sh"
 # shellcheck disable=SC1091
@@ -45,6 +33,7 @@ DRY_RUN=0
 STATUS=0
 RETRY=0
 SMOKE=0
+
 for arg in "$@"; do
     case "${arg}" in
         --build-only) BUILD_ONLY=1 ;;
@@ -52,19 +41,17 @@ for arg in "$@"; do
         --status)     STATUS=1 ;;
         --retry)      RETRY=1 ;;
         --smoke)      SMOKE=1 ;;
-        -h|--help)    sed -n '2,34p' "${BASH_SOURCE[0]}"; exit 0 ;;
-        *) echo "Unknown option: ${arg}" >&2; exit 2 ;;
+        -h|--help)    sed -n '2,14p' "${BASH_SOURCE[0]}"; exit 0 ;;
+        *)            echo "ERROR: Unknown option '${arg}'" >&2; exit 2 ;;
     esac
 done
 
 sp_activate
 cd "${SP_PROJECT_DIR}" || exit 1
 
-# Where the SIMPLACE run lands, and therefore where its sowing table lands.
-# Resolved the same way `cm4eu simplace build` resolves it, so --status can
-# find a run this script did not submit.
+# Resolve the run directory used by SIMPLACE and sowing table exports
 resolve_run_dir() {
-    if [ -n "${SP_RUN_DIR}" ]; then
+    if [[ -n "${SP_RUN_DIR:-}" ]]; then
         echo "${SP_RUN_DIR}"
         return
     fi
@@ -75,17 +62,8 @@ print(load_config(sys.argv[1]).run_dir / "simplace")
 PY
 }
 
-# --- Smoke test ---------------------------------------------------------------
-# The same 30 German cells through both models, in the foreground, with the
-# handoff done inline: there is no array to wait on, so there is no job to
-# depend on either.
-#
-# torchcrop's outputs and workspace land under ${SP_SMOKE_DIR}/torchcrop/, the
-# same layout the production chain uses: workspace/crop_<crop>.yaml is the
-# crop this run actually used, checkable directly against
-# ${TC_SIMPLACE_TEMPLATE}/data/crop/crop.xml, data/crop/seeds.xml and
-# data/management/management.xml in the SIMPLACE template.
-if [ "${SMOKE}" -eq 1 ]; then
+# --- Smoke Test ---------------------------------------------------------------
+if [[ "${SMOKE}" -eq 1 ]]; then
     CELLS="${SP_SMOKE_DIR}/de_cells.csv"
     SMOKE_CONFIG="${SP_SMOKE_DIR}/smoke.yaml"
     SMOKE_TC_DIR="${SP_SMOKE_DIR}/torchcrop"
@@ -98,47 +76,53 @@ if [ "${SMOKE}" -eq 1 ]; then
     echo "  seasons   : ${SP_SMOKE_START}-${SP_SMOKE_END}"
     echo "  crop      : ${SMOKE_CROP_FILE} (${TC_SMOKE_CROP_SOURCE})"
     echo "  directory : ${SP_SMOKE_DIR}"
-    echo "  sowing    : SIMPLACE-simulated, handed to torchcrop (per IOPT)"
-    echo "  iopt sweep: ${TC_SMOKE_IOPTS} -- both models, one SIMPLACE build per"
-    echo "              value (no CLI override for vIOPT, unlike torchcrop --iopt)"
+    echo "  sowing    : SIMPLACE-simulated, handed to torchcrop"
+    echo "  iopt sweep: ${TC_SMOKE_IOPTS}"
     echo "=================================================="
 
-    if [ "${DRY_RUN}" -eq 1 ]; then
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
         echo "--dry-run: nothing run."
         exit 0
     fi
 
-    # The base config: cells and the torchcrop workspace (crop file) are
-    # iopt-independent, so both are derived once here rather than inside the
-    # per-IOPT loop below. Each IOPT's SIMPLACE run derives its own
-    # smoke_iopt<n>.yaml from the same main config (see submit_simplace.sh
-    # --smoke), so this file drives only the cell selection and torchcrop.
-    python scripts/make_smoke_config.py --config "${SP_PROJECT_DIR}/config.yaml" \
+    python scripts/make_smoke_config.py \
+        --config "${SP_PROJECT_DIR}/config.yaml" \
         --out "${SMOKE_CONFIG}" \
-        --start-year "${SP_SMOKE_START}" --end-year "${SP_SMOKE_END}" || exit 1
+        --start-year "${SP_SMOKE_START}" \
+        --end-year "${SP_SMOKE_END}" || exit 1
 
     TC_TEMPLATE_DATA="${TC_SIMPLACE_TEMPLATE}/data"
-    python scripts/prepare_torchcrop_workspace.py --config "${SMOKE_CONFIG}" \
-        --out-dir "${SMOKE_TC_DIR}" --crop-source "${TC_SMOKE_CROP_SOURCE}" \
-        --crop-xml "${TC_TEMPLATE_DATA}/crop/crop.xml" \
+    # The smoke test runs the SUSTAg solution too (see smoke.yaml's
+    # solution_file), so torchcrop must be harmonised against LINTUL5_crop.xml's
+    # WW block, not the Brandenburg template -- otherwise the smoke test
+    # compares two different crops while reporting "75 of 75 parameters from
+    # simplace", which is true and misleading at once. The smoke SIMPLACE
+    # workspace is built below, so the *production* run's copy is used; it is
+    # the same file, and it exists before torchcrop needs it.
+    _smoke_crop="${SMOKE_TC_DIR%/torchcrop}/simplace_iopt${TC_SMOKE_IOPTS%% *}/workspace/data/crop/LINTUL5_crop.xml"
+    TC_CROP_XML_PATH="${TC_CROP_XML:-${TC_TEMPLATE_DATA}/crop/crop.xml}"
+    if [[ -z "${TC_CROP_XML:-}" && -f "${_smoke_crop}" ]]; then
+        TC_CROP_XML_PATH="${_smoke_crop}"
+        : "${TC_SIMPLACE_CROP:=WW}"
+        echo "smoke torchcrop crop source : ${TC_CROP_XML_PATH} (block ${TC_SIMPLACE_CROP})"
+    fi
+    TC_CROP_BLOCK_ARG=()
+    [ -n "${TC_SIMPLACE_CROP:-}" ] && TC_CROP_BLOCK_ARG=(--simplace-crop "${TC_SIMPLACE_CROP}")
+    python scripts/prepare_torchcrop_workspace.py \
+        --config "${SMOKE_CONFIG}" \
+        --out-dir "${SMOKE_TC_DIR}" \
+        --crop-source "${TC_SMOKE_CROP_SOURCE}" \
+        --crop-xml "${TC_CROP_XML_PATH}" \
+        ${TC_CROP_BLOCK_ARG[@]:+"${TC_CROP_BLOCK_ARG[@]}"} \
         --seeds-xml "${TC_TEMPLATE_DATA}/crop/seeds.xml" \
+        --seeds-crop "${TC_SEEDS_CROP:-winter_wheat}" \
         --management-xml "${TC_TEMPLATE_DATA}/management/management.xml" \
         > /dev/null || exit 1
 
-    # One SIMPLACE build and one torchcrop pass per IOPT (TC_SMOKE_IOPTS,
-    # default "1 2 3"), same cells and seasons throughout -- only vIOPT's
-    # nutrient-limitation setting differs, so a bias between the three is that
-    # setting and nothing else. SP_IOPT drives submit_simplace.sh --smoke into
-    # its own simplace_iopt<n>/ run directory (see its own --smoke block);
-    # torchcrop's --iopt overrides the (iopt-independent) base config instead
-    # of needing a build of its own. Filenames match the naming
-    # germany_smoke_evaluation.ipynb reads.
-    #
-    # --daily-out reads the summary and the daily trajectory off *one*
-    # simulation (run_cells(..., mode="both")) instead of running the cells
-    # twice -- a build artifact of this run rather than something an
-    # evaluation notebook re-derives on demand.
-    SIMPLACE_OUTS=() SMOKE_OUTS=() SMOKE_DAILY_OUTS=()
+    SIMPLACE_OUTS=()
+    SMOKE_OUTS=()
+    SMOKE_DAILY_OUTS=()
+
     for IOPT in ${TC_SMOKE_IOPTS}; do
         echo ""
         echo "--- iopt=${IOPT}: SIMPLACE ---"
@@ -147,10 +131,11 @@ if [ "${SMOKE}" -eq 1 ]; then
         SP_OUT_DIR="${SP_SMOKE_DIR}/simplace_iopt${IOPT}"
         SOWING="${SP_OUT_DIR}/sowing_from_simplace.csv"
         SIMPLACE_OUT="${SP_OUT_DIR}/simplace_europe.parquet"
-        [ -s "${SOWING}" ] || {
+
+        if [[ ! -s "${SOWING}" ]]; then
             echo "ERROR: ${SOWING} not written by the SIMPLACE smoke run." >&2
             exit 1
-        }
+        fi
         SIMPLACE_OUTS+=("${SIMPLACE_OUT}")
 
         TC_OUT="${SMOKE_TC_DIR}/de_torchcrop_iopt${IOPT}.parquet"
@@ -160,10 +145,15 @@ if [ "${SMOKE}" -eq 1 ]; then
 
         echo "--- iopt=${IOPT}: torchcrop, on SIMPLACE's simulated sowing ---"
         echo "Handing $(( $(wc -l < "${SOWING}") - 1 )) simulated sowing dates to torchcrop..."
-        python scripts/run_cells_torchcrop.py --config "${SMOKE_CONFIG}" \
-            --cells "${CELLS}" --sowing-file "${SOWING}" \
-            --crop-file "${SMOKE_CROP_FILE}" --iopt "${IOPT}" \
-            --out "${TC_OUT}" --daily-out "${TC_DAILY_OUT}" \
+        
+        python scripts/run_cells_torchcrop.py \
+            --config "${SMOKE_CONFIG}" \
+            --cells "${CELLS}" \
+            --sowing-file "${SOWING}" \
+            --crop-file "${SMOKE_CROP_FILE}" \
+            --iopt "${IOPT}" \
+            --out "${TC_OUT}" \
+            --daily-out "${TC_DAILY_OUT}" \
             --daily-variables ${TC_DAILY_VARIABLES} || exit 1
     done
 
@@ -184,17 +174,11 @@ if [ "${SMOKE}" -eq 1 ]; then
     echo "  crop file : ${SMOKE_CROP_FILE}"
     echo "  audit     : ${SMOKE_TC_DIR}/workspace/crop_parameter_audit.csv"
     echo ""
-    echo "Both models sowed on the same dates within each IOPT, so a phenology"
-    echo "difference below is the model and not the calendar. Compare a"
-    echo "matched pair (same IOPT on both sides):"
-    echo ""
+    echo "Validation command:"
     echo "  python scripts/validate_germany.py --cells ${CELLS} \\"
     echo "      --torchcrop ${SMOKE_TC_DIR}/de_torchcrop_iopt3.parquet \\"
     echo "      --simplace ${SP_SMOKE_DIR}/simplace_iopt3/simplace_europe.parquet \\"
     echo "      --out-dir ${SP_SMOKE_DIR}/validation"
-    echo ""
-    echo "Or open evaluation/germany_smoke_evaluation.ipynb, which loads all"
-    echo "three IOPT runs on both sides and plots the sweep."
     echo "=================================================="
     exit 0
 fi
@@ -203,13 +187,11 @@ RUN_DIR="$(resolve_run_dir)"
 SOWING_FILE="${RUN_DIR}/sowing_from_simplace.csv"
 
 # --- Status -------------------------------------------------------------------
-# Never builds: it is a question about a run, and a build would rewrite run.env
-# underneath the answer.
-if [ "${STATUS}" -eq 1 ]; then
+if [[ "${STATUS}" -eq 1 ]]; then
     echo "=================================================="
     echo "1. SIMPLACE — ${RUN_DIR}"
     echo "=================================================="
-    if [ -x "${RUN_DIR}/submit.sh" ]; then
+    if [[ -x "${RUN_DIR}/submit.sh" ]]; then
         "${RUN_DIR}/submit.sh" --status
     else
         echo "  not built yet."
@@ -219,7 +201,7 @@ if [ "${STATUS}" -eq 1 ]; then
     echo "=================================================="
     echo "2. HANDOFF — ${SOWING_FILE}"
     echo "=================================================="
-    if [ -s "${SOWING_FILE}" ]; then
+    if [[ -s "${SOWING_FILE}" ]]; then
         echo "  $(( $(wc -l < "${SOWING_FILE}") - 1 )) cell-seasons over" \
              "$(tail -n +2 "${SOWING_FILE}" | cut -d, -f1 | sort -u | wc -l) cells"
     else
@@ -234,21 +216,43 @@ if [ "${STATUS}" -eq 1 ]; then
     exit 0
 fi
 
-# --- 1. Build and submit SIMPLACE ---------------------------------------------
+# --- 1. Build and Submit SIMPLACE ---------------------------------------------
 echo "Building the SIMPLACE run and validating the solution..."
 BUILD_ARGS=(--config "${SP_CONFIG}" --lines-per-task "${SP_LINES_PER_TASK}")
-[ -n "${SP_RUN_DIR}" ] && BUILD_ARGS+=(--out-dir "${SP_RUN_DIR}")
+[[ -n "${SP_RUN_DIR:-}" ]] && BUILD_ARGS+=(--out-dir "${SP_RUN_DIR}")
 
-BUILD_OUT=$(cm4eu simplace build "${BUILD_ARGS[@]}" 2>&1) || {
+if ! BUILD_OUT=$(cm4eu simplace build "${BUILD_ARGS[@]}" 2>&1); then
     echo "${BUILD_OUT}" >&2
     echo "ERROR: build failed; nothing submitted." >&2
     exit 1
-}
+fi
+
 echo "${BUILD_OUT}"
 RUN_DIR=$(echo "${BUILD_OUT}" | sed -n 's/^Built in *: *//p')
 SOWING_FILE="${RUN_DIR}/sowing_from_simplace.csv"
 
-if [ "${BUILD_ONLY}" -eq 1 ]; then
+# Harmonise torchcrop against the crop file THIS SIMPLACE run reads, not
+# against the Brandenburg template. They are different crops: the SUSTAg WW
+# block runs IDSL=2 with VERSAT=70 (vernalisation on) and TSUM1=1125, while
+# Brandenburg's winter_wheat is IDSL=0, TSUM1=1623, RGRLAI 2.2x higher. With
+# the template as the source, section 6 of full_run_evaluation.ipynb compared two
+# parameterisations rather than two models. Set as a pair, and only when the
+# workspace actually has the file, so an unbuilt or differently-shaped run
+# falls back to the previous behaviour rather than failing here.
+if [[ -z "${TC_CROP_XML:-}" ]]; then
+    _sp_crop="${RUN_DIR}/workspace/data/crop/LINTUL5_crop.xml"
+    if [[ -f "${_sp_crop}" ]]; then
+        export TC_CROP_XML="${_sp_crop}"
+        export TC_SIMPLACE_CROP="${TC_SIMPLACE_CROP:-WW}"
+        echo "torchcrop crop source : ${TC_CROP_XML} (block ${TC_SIMPLACE_CROP})"
+    else
+        echo "WARNING: ${_sp_crop} not found; torchcrop falls back to" >&2
+        echo "         ${TC_SIMPLACE_TEMPLATE}/data/crop/crop.xml, which is a" >&2
+        echo "         different crop than this SIMPLACE run uses." >&2
+    fi
+fi
+
+if [[ "${BUILD_ONLY}" -eq 1 ]]; then
     echo ""
     echo "--build-only: built and validated, nothing submitted."
     echo "  ${RUN_DIR}/submit.sh"
@@ -265,7 +269,7 @@ echo "  2. handoff   : ${SOWING_FILE}"
 echo "  3. torchcrop : ${TC_OUT_DIR}"
 echo "=================================================="
 
-if [ "${DRY_RUN}" -eq 1 ]; then
+if [[ "${DRY_RUN}" -eq 1 ]]; then
     "${RUN_DIR}/submit.sh" --dry-run
     echo ""
     TC_SOWING_FILE="${SOWING_FILE}" "${SUBMIT_DIR}/submit_torchcrop.sh" --dry-run
@@ -275,45 +279,50 @@ if [ "${DRY_RUN}" -eq 1 ]; then
 fi
 
 SP_ARGS=()
-[ "${RETRY}" -eq 1 ] && SP_ARGS+=(--retry)
-SP_OUT=$("${RUN_DIR}/submit.sh" ${SP_ARGS[@]:+"${SP_ARGS[@]}"}) || {
+[[ "${RETRY}" -eq 1 ]] && SP_ARGS+=(--retry)
+
+if ! SP_OUT=$("${RUN_DIR}/submit.sh" "${SP_ARGS[@]+"${SP_ARGS[@]}"}"); then
     echo "${SP_OUT}" >&2
     echo "ERROR: SIMPLACE submission failed; nothing chained behind it." >&2
     exit 1
-}
+fi
+
 echo "${SP_OUT}"
 SP_JOB=$(echo "${SP_OUT}" | sed -n 's/^Submitted \([0-9]\+\).*/\1/p' | head -1)
 
-# --retry with nothing to retry prints no job id. The sowing table is then
-# already there, so the chain simply starts at the handoff.
-if [ -z "${SP_JOB}" ]; then
+# --retry with nothing to retry prints no job id.
+if [[ -z "${SP_JOB}" ]]; then
     echo ""
     echo "No SIMPLACE array was submitted (nothing to retry)."
-    if [ ! -s "${SOWING_FILE}" ]; then
+    if [[ ! -s "${SOWING_FILE}" ]]; then
         echo "ERROR: and no sowing table exists. Collect the run first:" >&2
         echo "       cm4eu simplace collect --config ${SP_CONFIG} --out-dir ${RUN_DIR}" >&2
         exit 1
     fi
     TC_SOWING_FILE="${SOWING_FILE}" exec "${SUBMIT_DIR}/submit_torchcrop.sh" \
-        ${SP_ARGS[@]:+"${SP_ARGS[@]}"}
+        "${SP_ARGS[@]+"${SP_ARGS[@]}"}"
 fi
 
-# --- 2. Handoff: collect, and write the sowing table --------------------------
+# --- 2. Handoff: Collect and write sowing table -------------------------------
 mkdir -p "${SP_LOG_DIR}"
-HANDOFF_JOB=$(sbatch --parsable \
+
+if ! HANDOFF_JOB=$(sbatch --parsable \
     --dependency=afterany:"${SP_JOB}" \
     --partition="${SP_PARTITION}" \
     --mem="${SP_MEM}" \
     --time=01:00:00 \
     --export=ALL,SP_PROJECT_DIR,SP_CONFIG,SP_CONDA_ENV,CM_RUN_DIR="${RUN_DIR}" \
-    "${SUBMIT_DIR}/cropmodelling_handoff.sh") \
-    || { echo "ERROR: handoff submission failed" >&2; exit 1; }
+    "${SUBMIT_DIR}/cropmodelling_handoff.sh"); then
+    echo "ERROR: handoff submission failed" >&2
+    exit 1
+fi
+
 echo "Handoff submitted     : ${HANDOFF_JOB}  (afterany:${SP_JOB})"
 
-# --- 3. torchcrop, on SIMPLACE's dates ----------------------------------------
+# --- 3. torchcrop on SIMPLACE's dates -----------------------------------------
 TC_SOWING_FILE="${SOWING_FILE}" \
 TC_DEPENDENCY="afterok:${HANDOFF_JOB}" \
-    "${SUBMIT_DIR}/submit_torchcrop.sh" ${SP_ARGS[@]:+"${SP_ARGS[@]}"} || exit 1
+    "${SUBMIT_DIR}/submit_torchcrop.sh" "${SP_ARGS[@]+"${SP_ARGS[@]}"}" || exit 1
 
 cat <<EOF
 

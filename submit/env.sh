@@ -39,6 +39,10 @@ export D4S_TILE_DEG="${D4S_TILE_DEG:-5.0}"
 
 # --- SLURM -------------------------------------------------------------------
 export D4S_PARTITION="${D4S_PARTITION:-compute}"
+# Whole-domain stages that cannot be tiled -- the NPK/management export and the
+# phenology reduction -- peak above what a `compute` node has (95 GB). They go to
+# `highmem` (192 GB) instead. Everything else stays on compute.
+export D4S_BIGMEM_PARTITION="${D4S_BIGMEM_PARTITION:-highmem}"
 # Sized to the MSWX read pool (climate.read_workers, capped at 16): that pool is
 # the only real parallelism in a tile. Measured peak RSS of a running tile was
 # 4.7 GB, so the previous 40 cpus / 80 GB reserved a whole 80-core, 95 GB node

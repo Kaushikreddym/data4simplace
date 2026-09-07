@@ -95,6 +95,8 @@ def prepare_workspace(
     crop_xml: Path | None = None,
     seeds_xml: Path | None = None,
     management_xml: Path | None = None,
+    simplace_crop: str | None = None,
+    seeds_crop: str | None = None,
     overwrite: bool = True,
 ) -> TorchcropWorkspace:
     """Write the run's inputs to ``<out_dir>/workspace/`` and return their paths.
@@ -104,6 +106,12 @@ def prepare_workspace(
     :func:`cropmodelling4eu.torchcrop.params.compare_crop_parameters` is run
     whenever ``crop_xml`` is given, whichever source is selected — the audit is
     worth having precisely when the run is *not* using SIMPLACE's crop.
+
+    ``simplace_crop`` names the ``<crop>`` block to read, and is **required for
+    a multi-crop file**: the EU SUSTAg ``LINTUL5_crop.xml`` holds eight, keyed
+    ``MAIZ MAIF WW BARL RAPE POTA SUGB CC``, and reading the wrong one produces
+    a run that looks entirely normal. Brandenburg's single-block ``crop.xml``
+    needs nothing.
     """
     if crop_source not in ("torchcrop", "simplace"):
         raise ValueError(f"crop_source must be 'torchcrop' or 'simplace', not {crop_source!r}")
@@ -123,13 +131,16 @@ def prepare_workspace(
             simplace_crop_xml=crop_xml if crop_source == "simplace" else None,
             seeds_xml=seeds_xml if crop_source == "simplace" else None,
             crop_name=crop,
+            simplace_crop=simplace_crop,
+            seeds_crop_name=seeds_crop,
             management_xml=management_xml if crop_source == "simplace" else None,
         )
 
     audit_path: Path | None = None
     if crop_xml is not None and Path(crop_xml).is_file():
         comparison = crop_params.compare_crop_parameters(
-            crop_xml, crop_name=crop, management_xml=management_xml
+            crop_xml, crop_name=crop, simplace_crop=simplace_crop,
+            management_xml=management_xml,
         )
         audit_path = root / AUDIT_FILE
         comparison.to_csv(audit_path, index=False)
