@@ -12,6 +12,7 @@ from __future__ import annotations
 from datetime import date
 
 import numpy as np
+import pandas as pd
 import pytest
 
 from data4simplace.phenology.decode import (
@@ -177,3 +178,122 @@ def test_crop_lookup_agrees_with_the_slots() -> None:
         assert splits[code]
     assert slot_of[0] == -1        # "no cropland" is not a crop
     assert slot_of[65535] == -1    # nor is "outside area"
+
+
+# --------------------------------------------------------------------------- #
+# PEP725 -- the ground check on the CLMS calendar
+# --------------------------------------------------------------------------- #
+#
+# The load-bearing one is the season alignment. PEP725 dates by calendar year
+# and this stage by harvest year, and getting it wrong produces a plausible
+# season length and a plausible bias while destroying every interannual number
+# downstream -- so it fails silently unless a test pins it.
+
+
+def _pep_frame(rows):
+    """A minimal load_observations-shaped frame."""
+    return pd.DataFrame(
+        rows, columns=["s_id", "provider_id", "lon", "lat", "alt", "year",
+                       "phase_id", "doy"]
+    ).astype({"year": "int64", "phase_id": "int64", "doy": "float64"})
+
+
+def test_autumn_stages_move_to_the_following_harvest_year():
+    """Emergence in autumn 2020 belongs to the crop harvested in 2021."""
+    from data4simplace.phenology import pep725
+
+    seasons = pep725.station_seasons(_pep_frame([
+        (1, 101, 10.0, 51.0, 100, 2020, 0, 270.0),    # sowing, autumn 2020
+        (1, 101, 10.0, 51.0, 100, 2020, 10, 280.0),   # emergence, autumn 2020
+        (1, 101, 10.0, 51.0, 100, 2021, 100, 210.0),  # harvest, summer 2021
+    ]))
+    assert len(seasons) == 1
+    row = seasons.iloc[0]
+    assert row["harvest_year"] == 2021
+    assert row["sowing_doy"] == 270.0
+    assert row["emergence_doy"] == 280.0
+    assert row["harvest_doy"] == 210.0
+    # 2020-10-06 to 2021-07-29 = 296 days. Note 296, not 295: 2020 is a leap
+    # year, which is exactly why the duration is taken from real dates rather
+    # than from a fixed-length day-of-year wrap.
+    assert row["season_length_days"] == 296.0
+
+
+def test_a_calendar_year_holds_two_different_seasons():
+    """The trap: one PEP725 year carries the emergence of the *next* crop."""
+    from data4simplace.phenology import pep725
+
+    seasons = pep725.station_seasons(_pep_frame([
+        (1, 101, 10.0, 51.0, 100, 2020, 10, 280.0),   # -> harvest year 2021
+        (1, 101, 10.0, 51.0, 100, 2020, 100, 210.0),  # -> harvest year 2020
+    ])).set_index("harvest_year")
+
+    assert set(seasons.index) == {2020, 2021}
+    assert np.isnan(seasons.loc[2020, "emergence_doy"])
+    assert np.isnan(seasons.loc[2021, "harvest_doy"])
+    # Neither year has both endpoints, so neither gets a season length -- the
+    # honest answer, where pivoting on the raw year would have invented one.
+    assert seasons["season_length_days"].isna().all()
+
+
+def test_a_late_emerging_crop_stays_in_its_own_harvest_year():
+    """A January emergence precedes that summer's harvest, not the next one."""
+    from data4simplace.phenology import pep725
+
+    seasons = pep725.station_seasons(_pep_frame([
+        (1, 101, 10.0, 51.0, 100, 2021, 10, 20.0),    # emergence, 20 Jan 2021
+        (1, 101, 10.0, 51.0, 100, 2021, 100, 210.0),  # harvest, summer 2021
+    ]))
+    assert seasons.iloc[0]["harvest_year"] == 2021
+    assert seasons.iloc[0]["season_length_days"] == 190.0
+
+
+def test_station_is_matched_to_the_cell_that_contains_it():
+    """Containment, and the SimplaceID must match the grid's own arithmetic."""
+    from data4simplace.grid import TargetGrid
+    from data4simplace.phenology import pep725
+
+    grid = TargetGrid(min_lon=0.0, max_lon=2.0, min_lat=50.0, max_lat=52.0,
+                      resolution_deg=0.1)
+    seasons = pd.DataFrame({
+        "s_id": [1, 2], "harvest_year": [2021, 2021],
+        "lon": [0.05, 1.95], "lat": [51.95, 50.05],
+        "emergence_doy": [280.0, 285.0], "harvest_doy": [210.0, 212.0],
+        "sowing_doy": [270.0, 272.0], "season_length_days": [295.0, 292.0],
+    })
+    matched = pep725.match_to_grid(seasons, grid)
+
+    n_lon = grid.lon_centers.size
+    assert matched.loc[0, "SimplaceID"] == 1                       # NW corner
+    assert matched.loc[1, "SimplaceID"] == 19 * n_lon + 19 + 1     # SE corner
+    # Containment bounds the distance by half a cell diagonal.
+    assert (matched["distance_km"] < 8.0).all()
+
+
+def test_circular_mean_survives_new_year():
+    """Two emergences either side of 1 January must not average to July."""
+    from data4simplace.phenology import pep725
+
+    mean = pep725.circular_mean_doy(np.array([360.0, 5.0]))
+    assert mean > 360.0 or mean < 5.0
+    assert pep725.doy_difference(np.array([5.0]), np.array([360.0]))[0] == pytest.approx(
+        10.25, abs=0.5
+    )
+
+
+def test_skill_separates_a_level_offset_from_the_interannual_signal():
+    """A constant offset must show as bias, not as lost anomaly correlation."""
+    from data4simplace.phenology import pep725
+
+    rng = np.random.default_rng(0)
+    units = np.repeat(np.arange(30), 8)
+    pep = 200.0 + rng.normal(0, 6, size=units.size) + units * 0.5
+    paired = pd.DataFrame({
+        "SimplaceID": units,
+        "pep_harvest_doy": pep,
+        "clms_harvest_doy": pep - 19.0,      # the CPMCH offset, exactly
+    })
+    result = pep725.skill(paired, "harvest_doy")
+    assert result["bias"] == pytest.approx(-19.0, abs=0.01)
+    assert result["anomaly_r"] == pytest.approx(1.0, abs=0.01)
+    assert result["spatial_r"] == pytest.approx(1.0, abs=0.01)

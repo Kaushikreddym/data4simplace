@@ -42,6 +42,20 @@ if [ -n "${TC_CROP_FILE:-}" ] && [ -f "${TC_CROP_FILE}" ]; then
     echo "Crop params  : ${TC_CROP_FILE}"
 fi
 
+# Per-region calibrated crop, from a finished `cm4eu calibrate` run -- see
+# TC_REGION_CROP_DIR / TC_REGIONS_FILE in torchcrop_env.sh. TC_CROP_FILE above
+# is then the fallback region_crop_map uses for an uncalibrated region or a
+# cell the region table does not cover, not the whole-domain crop.
+REGION_ARG=()
+if [ -n "${TC_REGION_CROP_DIR:-}" ]; then
+    [ -n "${TC_REGIONS_FILE:-}" ] || {
+        echo "ERROR: TC_REGION_CROP_DIR is set but TC_REGIONS_FILE is not." >&2
+        exit 1
+    }
+    REGION_ARG=(--region-crop-dir "${TC_REGION_CROP_DIR}" --regions-file "${TC_REGIONS_FILE}")
+    echo "Region crops : ${TC_REGION_CROP_DIR} (regions: ${TC_REGIONS_FILE})"
+fi
+
 SOWING_ARG=()
 if [ -n "${TC_SOWING_FILE:-}" ]; then
     [ -f "${TC_SOWING_FILE}" ] || {
@@ -75,6 +89,7 @@ srun --cpu-bind=none python -m cropmodelling4eu.torchcrop.run \
     --torch-threads "${TC_TORCH_THREADS}" \
     --device cpu \
     ${CROP_ARG[@]:+"${CROP_ARG[@]}"} \
+    ${REGION_ARG[@]:+"${REGION_ARG[@]}"} \
     ${SOWING_ARG[@]:+"${SOWING_ARG[@]}"} \
     ${DAILY_ARG[@]:+"${DAILY_ARG[@]}"}
 STATUS=$?

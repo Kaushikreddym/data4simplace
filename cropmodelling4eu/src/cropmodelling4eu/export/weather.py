@@ -36,9 +36,11 @@ __all__ = [
     "SENTINEL",
     "load_season_block",
     "load_seasons",
+    "load_windows",
     "saturation_vp",
     "season_window",
     "sowing_date",
+    "to_channels",
 ]
 
 #: Missing-value sentinel of the weather export.
@@ -118,6 +120,62 @@ def _read_file(path: Path) -> pd.DataFrame:
     ).set_index("Date")
 
 
+def to_channels(block: pd.DataFrame, has_wind: bool) -> np.ndarray:
+    """One date-indexed weather slice as a ``[T, 8]`` array in :data:`CHANNELS` order.
+
+    The unit conversions are properties of the *export*, not of a model or of a
+    window, so every reader goes through here: a second implementation of
+    "W m-2 to MJ m-2 d-1" or of the vapour-pressure reconstruction is a second
+    chance to get one of them wrong.
+    """
+    tmin = block["TempMin"].to_numpy()
+    tmax = block["TempMax"].to_numpy()
+    frame = pd.DataFrame(
+        {
+            "doy": block.index.dayofyear.to_numpy(float),
+            "davtmp": (tmin + tmax) / 2.0,
+            "tmin": tmin,
+            "tmax": tmax,
+            "irrad": block["Radiation"].to_numpy() * W_PER_M2_TO_MJ,
+            "rain": np.nan_to_num(block["Precipitation"].to_numpy(), nan=0.0),
+            # No vapour-pressure column exists, so it is rebuilt from the
+            # saturation value at mean temperature and relative humidity.
+            "vp": saturation_vp(block["TempMean"].to_numpy())
+            * block["RelHumCalc"].to_numpy()
+            / 100.0,
+            "wind": (
+                block["Windspeed"].to_numpy() if has_wind else FALLBACK_WIND_M_S
+            ),
+        }
+    ).interpolate(limit_direction="both")
+    return frame[list(CHANNELS)].to_numpy(dtype=np.float32)
+
+
+def load_windows(
+    export_dir: Path,
+    simplace_id: int,
+    windows: dict[int, tuple[pd.Timestamp, pd.Timestamp]],
+    grid: GridConfig,
+) -> dict[int, np.ndarray]:
+    """Read one cell's file once and slice out explicit date windows.
+
+    :func:`load_seasons` derives its windows from a sowing day-of-year; a
+    calibration run cuts a much shorter one around each season (see
+    :mod:`cropmodelling4eu.calibration.dataset`) and needs to say so directly.
+    A window the record cannot cover in full is omitted rather than returned
+    short, so every caller can assume a fixed length.
+    """
+    raw = _read_file(weather_path(export_dir, simplace_id, grid))
+    has_wind = raw["Windspeed"].notna().any()
+    out: dict[int, np.ndarray] = {}
+    for year, (start, end) in windows.items():
+        block = raw.loc[start:end]
+        if block.empty or block.index[0] > start or block.index[-1] < end:
+            continue
+        out[year] = to_channels(block, has_wind)
+    return out
+
+
 def load_seasons(
     export_dir: Path,
     simplace_id: int,
@@ -159,27 +217,7 @@ def load_seasons(
             or (block.index[-1] - sown).days < min_days_after_sowing
         ):
             continue
-        tmin = block["TempMin"].to_numpy()
-        tmax = block["TempMax"].to_numpy()
-        frame = pd.DataFrame(
-            {
-                "doy": block.index.dayofyear.to_numpy(float),
-                "davtmp": (tmin + tmax) / 2.0,
-                "tmin": tmin,
-                "tmax": tmax,
-                "irrad": block["Radiation"].to_numpy() * W_PER_M2_TO_MJ,
-                "rain": np.nan_to_num(block["Precipitation"].to_numpy(), nan=0.0),
-                # No vapour-pressure column exists, so it is rebuilt from the
-                # saturation value at mean temperature and relative humidity.
-                "vp": saturation_vp(block["TempMean"].to_numpy())
-                * block["RelHumCalc"].to_numpy()
-                / 100.0,
-                "wind": (
-                    block["Windspeed"].to_numpy() if has_wind else FALLBACK_WIND_M_S
-                ),
-            }
-        ).interpolate(limit_direction="both")
-        out[year] = frame[list(CHANNELS)].to_numpy(dtype=np.float32)
+        out[year] = to_channels(block, has_wind)
     return out
 
 

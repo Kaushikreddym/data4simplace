@@ -26,7 +26,7 @@ import numpy as np
 import pandas as pd
 
 from . import torchcrop as torchcrop_mod
-from .config import SIM_PARQUET, SIMPLACE_PARQUET
+from .config import MIN_PLAUSIBLE_SEASON_DAYS, SIM_PARQUET, SIMPLACE_PARQUET
 
 logger = logging.getLogger(__name__)
 
@@ -36,8 +36,8 @@ __all__ = ["load_runs", "pair_models"]
 _COLUMNS = (
     "SimplaceID", "year", "lon", "lat",
     "yield_t_ha", "yield_g_m2", "biomass_g_m2", "max_lai",
-    "days_to_maturity", "tranrf_mean", "nni_mean",
-    "sowing_doy", "maturity_doy",
+    "days_to_maturity", "days_to_emergence", "tranrf_mean", "nni_mean",
+    "sowing_doy", "emergence_doy", "anthesis_doy", "maturity_doy",
 )
 
 
@@ -64,6 +64,40 @@ def _load_simplace(path: Path, years: tuple[int, int] | None) -> pd.DataFrame:
     # happens) simply has no harvest_doy either, rather than a KeyError.
     if "maturity_doy" in frame.columns:
         frame["harvest_doy"] = frame["maturity_doy"]
+
+    # The run's own season (sowing -> maturity) and the endpoint-matched one
+    # (emergence -> maturity, what CLMS observes). Both are durations, so
+    # neither is wrapped; the second is what config.CLMS_STAGES scores, since
+    # pairing a sowing-based duration against an emergence-based observation
+    # would carry the whole sowing-to-emergence lag as an apparent bias.
+    if "days_to_maturity" in frame.columns:
+        frame["season_length_days"] = frame["days_to_maturity"].astype(float)
+        if "days_to_emergence" in frame.columns:
+            frame["emergence_to_maturity_days"] = (
+                frame["season_length_days"] - frame["days_to_emergence"].astype(float)
+            )
+        # collect.to_run_schema wraps a duration forward into (0, 365], so a
+        # season running past its own sowing anniversary is written as the
+        # remainder. Dropping the *durations* is the honest repair: the dates
+        # are still what SIMPLACE wrote, so such a row still carries a harvest
+        # bias -- it just cannot report how long the season was. See
+        # config.MIN_PLAUSIBLE_SEASON_DAYS for why the cut is where it is.
+        wrapped = frame["season_length_days"] < MIN_PLAUSIBLE_SEASON_DAYS
+        if wrapped.any():
+            logger.warning(
+                "simplace: %d of %d rows (%.2f%%) carry a season shorter than "
+                "%.0f days -- the (0, 365] wrap in collect.to_run_schema, not "
+                "a %.0f-day crop. Their durations are dropped; their dates are "
+                "kept", int(wrapped.sum()), len(frame),
+                100.0 * float(wrapped.mean()), MIN_PLAUSIBLE_SEASON_DAYS,
+                float(frame.loc[wrapped, "season_length_days"].median()),
+            )
+            duration_cols = [c for c in ("season_length_days",
+                                         "emergence_to_maturity_days",
+                                         "days_to_maturity", "days_to_emergence")
+                             if c in frame.columns]
+            frame.loc[wrapped, duration_cols] = np.nan
+        frame["season_wrapped"] = wrapped
     return frame
 
 
@@ -130,7 +164,8 @@ def pair_models(
     runs: dict[str, pd.DataFrame],
     columns: tuple[str, ...] = (
         "yield_t_ha", "biomass_g_m2", "max_lai", "sowing_doy",
-        "maturity_doy", "days_to_maturity",
+        "emergence_doy", "maturity_doy", "days_to_maturity",
+        "days_to_emergence",
     ),
 ) -> pd.DataFrame:
     """One row per ``(SimplaceID, year)`` both models cover, side by side.

@@ -11,12 +11,17 @@ differences easy to miss: 95 % of the values agree, so a spot check passes.
 This module does the comparison exhaustively and by name, so a run can state
 which crop it actually ran rather than assuming.
 
-The mapping is explicit and one-way (SIMPLACE → torchcrop). It has to be:
-SIMPLACE stores a lookup table as two parallel ``<parameter>`` lists
-(``SLATableDVS`` / ``SLATableSLA``) where torchcrop stores one list of pairs
-(``slatb``), and the two spell most scalars differently in case alone but not
-all of them (``RGRLAI`` → ``rgrl``). Guessing by lowercasing would silently
-skip exactly the parameters that have been renamed.
+The mapping dictionaries (``SCALARS``, ``TABLES``) are keyed explicitly rather
+than by case-folding: SIMPLACE stores a lookup table as two parallel
+``<parameter>`` lists (``SLATableDVS`` / ``SLATableSLA``) where torchcrop
+stores one list of pairs (``slatb``), and the two spell most scalars
+differently in case alone but not all of them (``RGRLAI`` → ``rgrl``).
+Guessing by lowercasing would silently skip exactly the parameters that have
+been renamed.
+
+Reading runs SIMPLACE → torchcrop (:func:`write_crop_yaml`); a calibration fit
+runs the other way, writing a *torchcrop* preset back into a SIMPLACE
+``crop.xml`` (:func:`write_simplace_crop_xml`), on the same two dictionaries.
 """
 
 from __future__ import annotations
@@ -40,6 +45,10 @@ __all__ = [
     "crop_parameters_from_simplace",
     "load_simplace_crop",
     "summarise",
+    "write_crop_yaml",
+    "write_crop_yaml_from_parameters",
+    "flatten_crop_yaml",
+    "write_simplace_crop_xml",
 ]
 
 #: SIMPLACE ``crop.xml`` id -> torchcrop preset scalar name.
@@ -570,3 +579,232 @@ def summarise(comparison: pd.DataFrame) -> str:
             f"simplace={row['simplace']}  torchcrop={row['torchcrop']}"
         )
     return "\n".join(lines)
+
+
+def write_crop_yaml_from_parameters(
+    path: Path,
+    params,
+    template: Path | None = None,
+    crop_name: str = "wheat",
+    description: str | None = None,
+) -> Path:
+    """Write a **live** ``CropParameters`` back out as a torchcrop preset YAML.
+
+    The counterpart of :func:`write_crop_yaml`, which builds a preset from a
+    SIMPLACE XML. This one takes the object a calibration has been mutating and
+    writes what it currently holds, so the output of a fit is a *runnable crop
+    file* rather than a table of numbers: the production runner already loads
+    one with ``CropParameters(config_file=...)``, and a calibrated parameter set
+    is used by pointing at its file.
+
+    ``template`` supplies the section layout — normally the workspace's own
+    ``crop_<crop>.yaml``, i.e. the file the run started from, so a calibrated
+    crop diffs cleanly against its own starting point. Every scalar and table
+    the template names is overwritten from ``params``; anything the template
+    does not name is left exactly as the template had it, which is what keeps
+    ``provenance`` and the recorded ``simplace_seeds`` block intact.
+
+    Args:
+        path: Destination YAML.
+        params: A ``torchcrop.CropParameters``.
+        template: Preset to take the layout from; ``None`` uses the bundled
+            preset for ``crop_name``.
+        crop_name: Name written into the file.
+        description: Replaces the template's description.
+
+    Returns:
+        ``path``.
+    """
+    import yaml
+    from torchcrop.parameters.crop_params import _builtin_crop_path
+
+    source = Path(template) if template is not None else Path(_builtin_crop_path(crop_name))
+    preset = yaml.safe_load(source.read_text())
+
+    def current(name: str):
+        value = getattr(params, name, None)
+        if value is None:
+            return None
+        tensor = value.detach() if hasattr(value, "detach") else value
+        return (
+            [[float(x) for x in row] for row in tensor]
+            if getattr(tensor, "ndim", 0) == 2
+            else float(tensor)
+        )
+
+    written = 0
+    for section in preset.get("sections", {}).values():
+        for group in ("scalars", "tables"):
+            for name in list(section.get(group, {})):
+                value = current(name)
+                if value is not None:
+                    section[group][name] = value
+                    written += 1
+
+    preset |= {
+        "crop_name": crop_name,
+        "description": (
+            description
+            or f"{crop_name}, written from a live CropParameters by "
+            "cropmodelling4eu.torchcrop.params.write_crop_yaml_from_parameters"
+        ),
+        "written_from": str(source),
+    }
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w") as handle:
+        yaml.safe_dump(preset, handle, sort_keys=False, default_flow_style=False)
+    logger.info("wrote %s (%d parameters from the live object)", path, written)
+    return path
+
+
+def flatten_crop_yaml(path: Path) -> dict[str, float | list[list[float]]]:
+    """A torchcrop preset's ``scalars``/``tables``, keyed by name, section-blind.
+
+    What :func:`write_simplace_crop_xml` reads a calibrated region's
+    ``crop_region_<NN>.yaml`` through — the same shape :func:`_torchcrop_preset`
+    builds from the bundled presets, but from an arbitrary file on disk.
+    """
+    import yaml
+
+    preset = yaml.safe_load(Path(path).read_text())
+    out: dict[str, float | list[list[float]]] = {}
+    for section in preset.get("sections", {}).values():
+        out |= section.get("scalars", {})
+        out |= section.get("tables", {})
+    return out
+
+
+def write_simplace_crop_xml(
+    path: Path,
+    calibrated: Path | dict,
+    template_crop_xml: Path,
+    simplace_crop: str,
+) -> Path:
+    """Write a calibrated torchcrop preset back into a SIMPLACE ``crop.xml``.
+
+    The reverse of :func:`write_crop_yaml`, on the same ``SCALARS`` /
+    ``TABLES`` dictionaries. Needed once a calibration fit has to drive a
+    SIMPLACE run as well as a torchcrop one — until then the mapping only ran
+    SIMPLACE → torchcrop, because nothing needed the other direction.
+
+    ``template_crop_xml`` is copied **byte-for-byte** except the text span of
+    the ``<crop>`` block named ``simplace_crop``: that one block is re-parsed,
+    has its ``SCALARS``/``TABLES`` entries overwritten and is spliced back into
+    the original text, rather than round-tripping the whole document through
+    ElementTree's serialiser — which reformats every start tag's attribute
+    whitespace document-wide, turning an eight-crop file's untouched blocks
+    into diff noise and making the one line that matters hard to find. Only
+    the rewritten block's own attribute spacing (not its values, text content
+    or comments — the fragment is parsed with ``insert_comments=True``) can
+    differ from the template; every other ``<crop>`` block, and everything
+    outside ``<crop>...</crop>`` entirely, is identical to the source.
+
+    Only the **single interleaved table** shape is written — ``<parameter
+    id="RUETB">`` holding one flat ``<value>`` list, keyed by the upper-cased
+    torchcrop table name, which is what every multi-crop SIMPLACE file this
+    project reads (the EU SUSTAg ``LINTUL5_crop.xml``) uses. A template using
+    the two-parallel-parameter shape (Brandenburg's ``crop.xml``) raises,
+    since no calibration run has ever targeted that template.
+
+    Args:
+        path: Destination ``crop.xml``.
+        calibrated: A ``crop_region_<NN>.yaml`` path (see
+            :func:`write_crop_yaml_from_parameters`), or an already-flattened
+            ``{name: value}`` dict (see :func:`flatten_crop_yaml`).
+        template_crop_xml: The SIMPLACE file whose layout and every
+            non-calibrated parameter are kept, e.g. the project's own
+            ``LINTUL5_crop.xml``.
+        simplace_crop: The ``<crop>`` block to overwrite (``"WW"``).
+
+    Returns:
+        ``path``.
+
+    Raises:
+        ValueError: If ``simplace_crop`` matches no block, or a calibrated
+            table's SIMPLACE id is stored in the two-parameter shape.
+    """
+    import re
+
+    def parse_fragment(xml_text: str) -> ET.Element:
+        # A fresh parser per call: an expat-backed XMLParser is single-use.
+        return ET.fromstring(xml_text, ET.XMLParser(target=ET.TreeBuilder(insert_comments=True)))
+
+    values = flatten_crop_yaml(calibrated) if not isinstance(calibrated, dict) else calibrated
+    # newline="" turns off universal-newline translation: a stray \r on an
+    # unrelated line must not get silently normalised by this round trip.
+    with Path(template_crop_xml).open(newline="") as handle:
+        source = handle.read()
+
+    block_re = re.compile(r"<crop\b[^>]*>.*?</crop\s*>", re.S)
+    spans = list(block_re.finditer(source))
+    fragments = [(m, parse_fragment(m.group(0))) for m in spans]
+    found = next(
+        ((m, el) for m, el in fragments if crop_block_key(el) == simplace_crop), None,
+    )
+    if found is None:
+        available = [crop_block_key(el) or "?" for _, el in fragments]
+        raise ValueError(
+            f"no crop {simplace_crop!r} in {template_crop_xml}; it declares {available}"
+        )
+    span, block = found
+
+    written: dict[str, str] = {}
+    for sp_name, tc_name in SCALARS.items():
+        value = values.get(tc_name)
+        if value is None or isinstance(value, list):
+            continue
+        parameter = block.find(f"parameter[@id='{sp_name}']")
+        if parameter is None:
+            continue
+        parameter.text = f"{float(value):.8g}"
+        written[sp_name] = "scalar"
+
+    skipped: list[str] = []
+    for tc_name, (x_name, y_name) in TABLES.items():
+        pairs = values.get(tc_name)
+        if not isinstance(pairs, list):
+            continue
+        pid = tc_name.upper()
+        parameter = block.find(f"parameter[@id='{pid}']")
+        if parameter is None:
+            if block.find(f"parameter[@id='{x_name}']") is not None:
+                raise ValueError(
+                    f"crop {simplace_crop!r} in {template_crop_xml} stores "
+                    f"{tc_name} as {x_name}/{y_name} (the two-parameter "
+                    f"shape); write_simplace_crop_xml only writes the single "
+                    f"interleaved {pid} shape"
+                )
+            skipped.append(tc_name)
+            continue
+        for child in list(parameter):
+            parameter.remove(child)
+        parameter.text = "\n\t  "
+        for x, y in pairs:
+            vx = ET.SubElement(parameter, "value")
+            vx.text, vx.tail = f"{float(x):.8g}", " "
+            vy = ET.SubElement(parameter, "value")
+            vy.text, vy.tail = f"{float(y):.8g}", "\n\t  "
+        written[pid] = "table"
+
+    if skipped:
+        logger.info(
+            "%s crop %r has no %s in the single interleaved shape; left as "
+            "the template had them: %s",
+            template_crop_xml, simplace_crop, "parameter" if len(skipped) == 1 else "parameters",
+            sorted(skipped),
+        )
+
+    new_block = ET.tostring(block, encoding="unicode")
+    source = source[: span.start()] + new_block + source[span.end() :]
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="") as handle:
+        handle.write(source)
+    logger.info(
+        "wrote %s: %d parameter(s) of crop %r overwritten from %s",
+        path, len(written), simplace_crop,
+        calibrated if isinstance(calibrated, (str, Path)) else "(given dict)",
+    )
+    return path

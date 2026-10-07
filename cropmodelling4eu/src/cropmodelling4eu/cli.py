@@ -13,6 +13,18 @@ project CSV, symlinks to every input, and the run's own ``submit.sh`` /
 ``run_task.sh``. From then on the run is driven from there and needs neither
 this CLI nor a config — ``cm4eu simplace run`` remains for a one-off range in
 the foreground.
+
+    cm4eu export-regions --calibration-dir <calibrate out-dir> \\
+        --template <template>/data/crop/LINTUL5_crop.xml --simplace-crop WW \\
+        --out-dir <dir>
+
+Turns a finished ``cm4eu calibrate`` run into what a *per-region* SIMPLACE
+build needs: one ``cells_region_<NN>.csv`` (for ``simplace build
+--cells-file``) and one ``crop_region_<NN>.xml`` per calibrated region, the
+template with that region's torchcrop fit written back in. torchcrop's own
+side of a per-region run takes the calibration directory directly (``cm4eu
+calibrate``'s ``<stage>/crops/``) via ``--region-crop-dir`` /
+``--regions-file`` on ``cropmodelling4eu.torchcrop.run``.
 """
 
 from __future__ import annotations
@@ -176,6 +188,103 @@ def _cmd_simplace(args: argparse.Namespace) -> int:
     )
 
 
+def _cmd_calibrate(args: argparse.Namespace) -> int:
+    """Fit torchcrop's crop parameters against the observations, by stage."""
+    from cropmodelling4eu.calibration import CalibrationConfig, prepare
+
+    config = _resolve_config(args)
+    settings = CalibrationConfig()
+    if args.fraction is not None:
+        settings = settings.model_copy(
+            update={"data": settings.data.model_copy(update={"fraction": args.fraction})}
+        )
+    if args.epochs is not None:
+        settings = settings.model_copy(
+            update={"optim": settings.optim.model_copy(update={"max_epochs": args.epochs})}
+        )
+    if args.batch_size is not None:
+        settings = settings.model_copy(
+            update={"data": settings.data.model_copy(update={"batch_size": args.batch_size})}
+        )
+    if args.threads is not None:
+        config = config.model_copy(
+            update={"torchcrop": config.torchcrop.model_copy(
+                update={"torch_threads": args.threads}
+            )}
+        )
+    if args.stage != "all":
+        settings = settings.model_copy(
+            update={"stage_order": (args.stage,), "joint_finetune": False}
+        )
+
+    prepared = prepare(
+        config,
+        settings,
+        crop_file=args.crop_file,
+        sowing_file=args.sowing_file,
+        pep725_root=args.pep725,
+        with_yield="yield" in settings.stage_order,
+        with_fpar="lai" in settings.stage_order,
+        out_dir=args.out_dir,
+        overwrite_cache=args.rebuild_cache,
+        workers=args.workers,
+    )
+    if args.prepare_only:
+        print(prepared.summarise())
+        return 0
+
+    for result in prepared.calibrator.run(free_blocked=args.free_blocked):
+        print(
+            f"\n{result.stage}: {result.epochs} epochs, best validation "
+            f"{result.best_val:.4f}"
+        )
+        for key, value in sorted(result.test.items()):
+            print(f"  test {key:<32} {value:.4f}")
+        if result.blocked:
+            print("  not freed:")
+            for name, reason in sorted(result.blocked.items()):
+                print(f"    {name:<34} {reason}")
+    return 0
+
+
+def _cmd_export_regions(args: argparse.Namespace) -> int:
+    """Per-region SIMPLACE crop.xml + cell lists, from a finished calibration run."""
+    import pandas as pd
+
+    from cropmodelling4eu.torchcrop.params import write_simplace_crop_xml
+
+    calibration_dir = Path(args.calibration_dir)
+    regions = pd.read_parquet(calibration_dir / "regions.parquet")
+    crops_dir = calibration_dir / args.stage / "crops"
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    written: list[int] = []
+    fallback: list[int] = []
+    for region_id, group in regions.groupby("region_id", sort=True):
+        region_id = int(region_id)
+        name = group["region"].iloc[0]
+        group[["SimplaceID"]].to_csv(
+            out_dir / f"cells_region_{region_id:02d}.csv", index=False
+        )
+        crop_yaml = crops_dir / f"crop_region_{region_id:02d}.yaml"
+        if not crop_yaml.is_file():
+            fallback.append(region_id)
+            print(f"region {region_id:02d} {name:<10} not calibrated (no {crop_yaml.name}) "
+                  f"-- its cells run on --template unchanged")
+            continue
+        write_simplace_crop_xml(
+            out_dir / f"crop_region_{region_id:02d}.xml",
+            crop_yaml, args.template, args.simplace_crop,
+        )
+        written.append(region_id)
+
+    print(f"\n{len(written)} region crop.xml file(s) written, {len(fallback)} uncalibrated "
+          f"region(s) fall back to {args.template}, {len(written) + len(fallback)} cell list(s) "
+          f"-- all under {out_dir}")
+    return 0
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="cm4eu",
@@ -265,6 +374,116 @@ def _build_parser() -> argparse.ArgumentParser:
     simplace.add_argument("--debug", action="store_true", help="Keep SIMPLACE's full log level.")
     simplace.add_argument("--dry-run", action="store_true", help="Print the command, run nothing.")
     simplace.set_defaults(func=_cmd_simplace, no_management=False)
+
+    calibrate = sub.add_parser(
+        "calibrate",
+        help="Fit torchcrop's crop parameters against CLMS phenology, CyBench "
+        "yield and CyBench fAPAR, by stage.",
+    )
+    calibrate.add_argument("--config", type=Path, help="Run configuration YAML.")
+    calibrate.add_argument("--export", type=Path, help="Export directory.")
+    calibrate.add_argument("--composition", type=Path)
+    calibrate.add_argument(
+        "--stage", default="all", choices=["all", "phenology", "yield", "lai"],
+        help="Run one stage, or every stage in `stage_order` (currently "
+        "phenology and yield; lai and the joint fine-tune are switched off). Stages "
+        "accumulate terms rather than replacing the objective, so running one "
+        "alone is a diagnostic, not the plan.",
+    )
+    calibrate.add_argument(
+        "--crop-file", type=Path,
+        help="The workspace crop_<crop>.yaml the run starts from — normally "
+        "<TC_OUT_DIR>/workspace/crop_wheat.yaml. Without it the bundled "
+        "torchcrop preset is calibrated, which is a different crop from the "
+        "one the production run uses.",
+    )
+    calibrate.add_argument(
+        "--sowing-file", type=Path,
+        help="sowing_from_simplace.csv from a finished SIMPLACE run — the "
+        "sowing convention the production run and every CALIBRATION.md number "
+        "are on. A static file; nothing here re-runs SIMPLACE. Without it the "
+        "export's site calendar is used, which sows a median 22 d later and "
+        "gives every cell one fixed date for all seasons.",
+    )
+    calibrate.add_argument(
+        "--pep725", type=Path,
+        help="PEP725 export directory. Without it there is no heading stage "
+        "and no ground-truth emergence anomaly, so the identifiability rule "
+        "binds at two stages everywhere.",
+    )
+    calibrate.add_argument("--out-dir", type=Path)
+    calibrate.add_argument(
+        "--fraction", type=float,
+        help="Override the per-epoch stratified draw (default 0.20).",
+    )
+    calibrate.add_argument("--epochs", type=int, help="Override optim.max_epochs.")
+    calibrate.add_argument(
+        "--batch-size", type=int,
+        help="Cell-years per forward pass (default 192). Measured: 768 costs "
+        "1.33x the wall time of 192 for 4x the cells, at 1.3 GB — the day loop "
+        "is per-day, not per-cell. The floor on batch *count* is the region "
+        "count, since a batch carries one region's parameters.",
+    )
+    calibrate.add_argument(
+        "--workers", type=int, default=1,
+        help="Processes computing region-batches concurrently (default 1, "
+        "exactly sequential). A batch carries one region and the penalties are "
+        "scoped to it, so batches of different regions are disjoint and run "
+        "together for the same result. The ceiling is the REGION COUNT (~29), "
+        "which one node's 80 cores already covers — more nodes have nothing to "
+        "do.",
+    )
+    calibrate.add_argument(
+        "--threads", type=int,
+        help="torch intra-op threads (default from the config). Measured to "
+        "make no difference at all — 1, 4, 10 and 20 threads are within noise "
+        "of each other, because the day loop is a Python loop over tiny "
+        "[B]-shaped tensors. Ask for cores to run more jobs, not a faster one.",
+    )
+    calibrate.add_argument(
+        "--free-blocked", action="store_true",
+        help="Free the parameters the spec files mark blocked. Every current "
+        "blocker is a data problem: the N group is unidentifiable at nni 0.985 "
+        "and the heat group is unmapped between the two models.",
+    )
+    calibrate.add_argument(
+        "--rebuild-cache", action="store_true",
+        help="Re-extract the pooled seasons even if a cache covers them.",
+    )
+    calibrate.add_argument(
+        "--prepare-only", action="store_true",
+        help="Build the regions, observations and weather cache, report them "
+        "and stop. What to run first on a new export.",
+    )
+    calibrate.set_defaults(func=_cmd_calibrate, no_management=False)
+
+    export_regions = sub.add_parser(
+        "export-regions",
+        help="Per-region SIMPLACE crop.xml + cell lists from a finished "
+        "'calibrate' run, for a per-region SIMPLACE production build.",
+    )
+    export_regions.add_argument(
+        "--calibration-dir", type=Path, required=True,
+        help="A 'cm4eu calibrate --out-dir' directory: holds regions.parquet "
+        "and <stage>/crops/crop_region_<NN>.yaml.",
+    )
+    export_regions.add_argument(
+        "--stage", default="yield", choices=["phenology", "yield"],
+        help="Which stage's calibrated crop files to use (default: yield, "
+        "the final stage -- phenology seeds it and yield fine-tunes on top).",
+    )
+    export_regions.add_argument(
+        "--template", type=Path, required=True,
+        help="The SIMPLACE crop.xml whose layout and every non-calibrated "
+        "parameter are kept, e.g. the production template's own "
+        "data/crop/LINTUL5_crop.xml.",
+    )
+    export_regions.add_argument(
+        "--simplace-crop", required=True,
+        help="The <crop> block in --template to overwrite, e.g. WW.",
+    )
+    export_regions.add_argument("--out-dir", type=Path, required=True)
+    export_regions.set_defaults(func=_cmd_export_regions)
     return parser
 
 
@@ -276,7 +495,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return int(args.func(args))
     except Exception as exc:  # noqa: BLE001 - surface any failure to the CLI
-        logging.getLogger(__name__).error("%s", exc, exc_info=args.verbose)
+        # Always with the traceback: a batch job that dies six hours in gets one
+        # shot at saying where, and `--verbose` is not set on a submitted run.
+        logging.getLogger(__name__).error("%s", exc, exc_info=True)
         return 1
 
 

@@ -1,0 +1,101 @@
+# =============================================================================
+# Stage 2 — yield. Assimilation leads this stage, not partitioning.
+#
+# On the harmonised crop HI is 0.408 — just below the 0.45-0.55 anchor — while
+# biomass is 1 067 g m-2 against SIMPLACE's 1 807 on the identical cells,
+# seasons and sowing dates. The yield gap is a growth gap, not a partitioning
+# gap: torchcrop reaches a *larger* peak LAI (7.31 vs 6.50) out of 40 % less
+# biomass. That points at `ruetb` / `scale_factor_rue` and at the SLA that
+# turns assimilate into leaf area. The partitioning group is freed anyway — it
+# is what keeps HI from drifting while RUE moves — but it does not carry the
+# stage.
+#
+# Two groups are `blocked`: the loader excludes them and logs the reason, so a
+# run that frees them has to say so on the command line rather than doing it by
+# default. Both correspond to open blockers in CALIBRATION.md.
+# =============================================================================
+
+parameters:
+  # --- Partitioning ---------------------------------------------------------
+  # The `fotb` step of the full fraction in one hundredth of a DVS was named as
+  # the cause of the harvest-index tail; the harmonised run falsifies that — the
+  # step is still there and only 0.7 % of cell-seasons exceed HI 0.6. Free as a
+  # shape parameter, not as a fix.
+  crop.fltb@0.646: {bounds: [0, 0.7]}
+  crop.fltb@0.95:  {bounds: [0, 0.7]}
+  crop.fstb@0.646: {bounds: [0, 1]}
+  crop.fstb@0.95:  {bounds: [0, 1]}
+  crop.fotb@0.99:  {bounds: [0, 1]}
+  crop.fotb@1.0:   {bounds: [0, 1]}
+
+  # --- Assimilation ---------------------------------------------------------
+  crop.ruetb@0.0:  {bounds: [2.0, 4.0]}
+  crop.ruetb@1.0:  {bounds: [2.0, 4.0]}
+  crop.ruetb@1.3:  {bounds: [0.5, 3.0]}
+  crop.scale_factor_rue: {bounds: [0.8, 1.25]}
+
+  # --- Water ----------------------------------------------------------------
+  crop.depnr: {bounds: [2.0, 5.0]}
+  crop.cfet:  {bounds: [0.8, 1.2]}
+  # Capped by the soil profile's own rootable depth at materialize time, not
+  # here: the cap is per cell and a bound is per region.
+  crop.rdmcr: {bounds: [0.8, 2.0]}
+  crop.rri:   {bounds: [0.008, 0.030]}
+
+  # --- Nitrogen (iopt = 3) --- BLOCKED --------------------------------------
+  # Initial mineral N is a median ~243 kg/ha against a measured 30-90
+  # (soil.mineral_n_fraction = 0.01), so the crop is effectively N-unlimited
+  # and these have nothing to bite on. Pooled `nni` on the harmonised run is
+  # 0.985 over 1 711 524 cell-seasons — *worse* than the 0.96 the warning was
+  # written against. Either fix the export first or leave them blocked; a
+  # calibrated `nlue` on an N-unlimited domain is a number with no information
+  # in it.
+  crop.nmaxso: {bounds: [0.015, 0.035], blocked: "initial mineral N: nni = 0.985"}
+  crop.frnx:   {bounds: [0.3, 1.0],     blocked: "initial mineral N: nni = 0.985"}
+  crop.nlue:   {bounds: [0.8, 1.5],     blocked: "initial mineral N: nni = 0.985"}
+  crop.tcnt:   {bounds: [5, 20],        blocked: "initial mineral N: nni = 0.985"}
+  crop.dvsnt:  {bounds: [0.6, 1.0],     blocked: "initial mineral N: nni = 0.985"}
+  # A *management* parameter in SIMPLACE, so freeing it decouples the two
+  # models even once the N blocker is cleared.
+  crop.nrf:    {bounds: [0.4, 0.9],     blocked: "management parameter in SIMPLACE"}
+
+  # --- Heat around anthesis --- BLOCKED -------------------------------------
+  # SIMPLACE parameterises heat stress with vTCritical 31 C, vStartDVS 0.75 and
+  # vEndDVS 1.25; three of those have torchcrop counterparts and none is in
+  # SCALARS, so torchcrop runs the group on its own defaults (27 / 0.8 / 1.3).
+  # Freeing them before the mapping is written starts the stage from a
+  # difference nobody chose. The fourth SIMPLACE parameter has no counterpart at
+  # all — it reduces yield linearly per degree-hour, torchcrop ramps between a
+  # critical and a limit temperature — which is a structural difference, not a
+  # parameter one.
+  crop.grain_heat_temp_critical:  {bounds: [24, 32], blocked: "heat group unmapped"}
+  crop.grain_heat_temp_limit:     {bounds: [34, 45], blocked: "heat group unmapped"}
+  crop.grain_heat_begin_devstage: {bounds: [0.7, 1.1], blocked: "heat group unmapped"}
+  crop.grain_heat_end_devstage:   {bounds: [1.2, 1.6], blocked: "heat group unmapped"}
+
+constraints:
+  # RUE is non-increasing with development.
+  - members: [crop.ruetb@0.0, crop.ruetb@1.0]
+    order: descending
+  # `fotb` is non-decreasing: the storage organ's share never falls.
+  - members: [crop.fotb@0.99, crop.fotb@1.0]
+    order: ascending
+
+simplex:
+  # fl + fs + fo = 1 is a constraint ConstraintGroup cannot express, and
+  # calibrating the three independently produces an invalid partitioning that
+  # still runs. At these two knots the SUSTAg `fotb` is 0 and has no row to
+  # write, so the group enforces fl + fs <= 1 by rescaling instead of deriving
+  # a third member — which is the honest reading of a crop file whose own
+  # tables do not sum to one between DVS 0.95 and 1.0.
+  - members: [crop.fltb@0.646, crop.fstb@0.646]
+  - members: [crop.fltb@0.95, crop.fstb@0.95]
+
+priors:
+  # The SIMPLACE crop.xml values, which are where both models start.
+  crop.ruetb@0.0: {value: 2.6, spread: 0.4}
+  crop.ruetb@1.0: {value: 2.5, spread: 0.4}
+  crop.ruetb@1.3: {value: 2.0, spread: 0.5}
+  crop.scale_factor_rue: {value: 1.0, spread: 0.15}
+  crop.depnr: {value: 4.5, spread: 1.0}
+  crop.rdmcr: {value: 1.25, spread: 0.3}

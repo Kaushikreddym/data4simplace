@@ -97,6 +97,13 @@ export TC_DAILY_VARIABLES="${TC_DAILY_VARIABLES:-LAI AGB NNI TRANRF}"
 # by opening anything, which is what this fixes.
 export TC_WORK_DIR="${TC_WORK_DIR:-${TC_OUT_DIR}/workspace}"
 export TC_CROP_FILE="${TC_CROP_FILE:-${TC_WORK_DIR}/crop_${TC_CROP}.yaml}"
+# Per-region calibrated crop (opt-in, both unset by default): a finished
+# `cm4eu calibrate` run's <stage>/crops/ directory and its own regions.parquet.
+# Set together -- torchcrop_array.sh checks that, run_shard enforces it. With
+# these set, TC_CROP_FILE above stops being the whole-domain crop and becomes
+# region_crop_map's fallback for an uncalibrated region or an unplaced cell.
+export TC_REGION_CROP_DIR="${TC_REGION_CROP_DIR:-}"
+export TC_REGIONS_FILE="${TC_REGIONS_FILE:-}"
 # torchcrop | simplace -- whose crop parameters the run uses. `simplace` (the
 # default, matching the smoke test) rebuilds the crop file from the solution's
 # own crop.xml, which is what makes a SIMPLACE comparison a comparison of the

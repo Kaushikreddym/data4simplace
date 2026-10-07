@@ -193,6 +193,7 @@ EXPORT_VARS="${EXPORT_VARS},TC_LOG_DIR,TC_COMPOSITION_XML,TC_CROP,TC_START_YEAR"
 EXPORT_VARS="${EXPORT_VARS},TC_END_YEAR,TC_IOPT,TC_N_SHARDS,TC_BATCH_SIZE"
 EXPORT_VARS="${EXPORT_VARS},TC_IO_WORKERS,TC_TORCH_THREADS,TC_SOWING_FILE"
 EXPORT_VARS="${EXPORT_VARS},TC_WORK_DIR,TC_CROP_FILE,TC_DAILY,TC_DAILY_VARIABLES"
+EXPORT_VARS="${EXPORT_VARS},TC_REGION_CROP_DIR,TC_REGIONS_FILE"
 
 # --- Which shards still need running -----------------------------------------
 missing_shards() {
@@ -237,6 +238,10 @@ else
 echo "  array        : skipped (--maps-only)"
 fi
 echo "  crop         : ${TC_CROP_FILE} (${TC_CROP_SOURCE})"
+if [ -n "${TC_REGION_CROP_DIR:-}" ]; then
+echo "  region crops : ${TC_REGION_CROP_DIR} (regions: ${TC_REGIONS_FILE})"
+echo "                 crop above is the fallback for an uncalibrated region"
+fi
 [ -n "${TC_SOWING_FILE:-}" ] && \
 echo "  sowing       : ${TC_SOWING_FILE} (SIMPLACE-simulated)"
 [ -n "${TC_DEPENDENCY:-}" ] && \

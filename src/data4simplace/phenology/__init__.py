@@ -12,6 +12,17 @@ from data4simplace.phenology.decode import (
     days_to_doy,
     decode_yydoy,
 )
+from data4simplace.phenology.pep725 import (
+    PHASES,
+    Phase,
+    load_observations,
+    match_to_admin,
+    match_to_grid,
+    pair_admin,
+    pair_grid,
+    skill,
+    station_seasons,
+)
 from data4simplace.phenology.seasons import (
     CROP_CODES,
     SPLIT_CROPS,
@@ -24,6 +35,8 @@ from data4simplace.phenology.seasons import (
 
 __all__ = [
     "CROP_CODES",
+    "PHASES",
+    "Phase",
     "CTY_CLASSES",
     "DATE_FLAGS",
     "N_BINS",
@@ -36,4 +49,11 @@ __all__ = [
     "days_to_doy",
     "decode_yydoy",
     "default_cut_day",
+    "load_observations",
+    "match_to_admin",
+    "match_to_grid",
+    "pair_admin",
+    "pair_grid",
+    "skill",
+    "station_seasons",
 ]

@@ -55,7 +55,10 @@ PHENOLOGY_COLUMNS: tuple[str, ...] = (
 )
 
 #: Added by :func:`add_phenology_columns` when the run supports it.
-OPTIONAL_PHENOLOGY_COLUMNS: tuple[str, ...] = ("emergence_doy",)
+OPTIONAL_PHENOLOGY_COLUMNS: tuple[str, ...] = (
+    "emergence_doy",
+    "emergence_to_maturity_days",
+)
 
 
 def load_simulation(
@@ -187,7 +190,12 @@ def add_phenology_columns(
     # added to the summary frame; an older Parquet simply has no emergence
     # column, which is the honest state rather than a derived guess.
     if "days_to_emergence" in out.columns:
-        out["emergence_doy"] = wrap_doy(sown + out["days_to_emergence"].astype(float))
+        emerged = out["days_to_emergence"].astype(float)
+        out["emergence_doy"] = wrap_doy(sown + emerged)
+        # The endpoint-matched duration: CLMS observes emergence -> harvest,
+        # so the sowing-based season_length_days above would carry the whole
+        # sowing-to-emergence lag as an apparent bias.
+        out["emergence_to_maturity_days"] = days + harvest_lag_days - emerged
     else:
         logger.info(
             "the run carries no days_to_emergence; emergence_doy is not derived"

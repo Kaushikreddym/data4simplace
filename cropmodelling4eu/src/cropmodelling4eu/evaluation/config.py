@@ -46,6 +46,7 @@ __all__ = [
     "GRID_RES_DEG",
     "HARVEST_LAG_DAYS",
     "MIN_CELLS_PER_GRIDCELL",
+    "MIN_PLAUSIBLE_SEASON_DAYS",
     "MIN_WEIGHT_COVERAGE",
     "OUTPUT_DIR",
     "PhenologyStage",
@@ -173,6 +174,19 @@ CLMS_CROP: Final[str] = "wheat_winter"
 CLMS_MIN_PIXELS: Final[int] = 10_000
 CLMS_MIN_SEASON_SHARE: Final[float] = 0.2
 
+#: Shortest season a collected SIMPLACE row can describe before it is read as
+#: an arithmetic artefact rather than a result.
+#:
+#: ``simplace.collect`` derives ``days_to_maturity`` as ``maturity_doy -
+#: sowing_doy`` wrapped forward into ``(0, 365]``, so a season that genuinely
+#: runs past its own sowing anniversary comes back as the remainder -- a
+#: 380-day season is written as 15 days. The two populations separate cleanly:
+#: on the EU_val run the genuine seasons start at 160 days and the wrapped ones
+#: stop at 79, with 12 of 1.7 M rows in between. Rows below this threshold keep
+#: their dates (``maturity_doy`` is still the day SIMPLACE wrote) and lose only
+#: their **durations**, which are the quantities the wrap corrupted.
+MIN_PLAUSIBLE_SEASON_DAYS: Final[float] = 150.0
+
 
 class ClmsStage(NamedTuple):
     """One simulated column and the CLMS field it is compared against.
@@ -196,24 +210,26 @@ class ClmsStage(NamedTuple):
     caveat: str
 
 
-#: The CLMS pairings. Emergence is deliberately **not** a like-for-like row:
-#: neither production run emits an emergence date, so the only simulated column
-#: on that end of the season is the sowing date, and the pairing is reported as
-#: a lag rather than as a bias.
+#: The CLMS pairings. All three are like-for-like since both runs gained an
+#: emergence date (SIMPLACE's ``Phenology.EmergenceDOY``, torchcrop's
+#: ``tsump = tsumem`` crossing): the observed season's endpoints are emergence
+#: and harvest, and the simulated side now carries both. A run made before that
+#: change simply has no ``emergence_doy`` column and the two rows that need it
+#: drop out, rather than being silently paired against the sowing date.
 CLMS_STAGES: Final[tuple[ClmsStage, ...]] = (
     ClmsStage(
         key="emergence",
         label="Emergence",
-        sim_col="sowing_doy",
+        sim_col="emergence_doy",
         obs_col="obs_emergence_doy",
         circular=True,
         caveat=(
-            "NOT a like-for-like pairing. Neither run writes an emergence "
-            "date -- SIMPLACE's solution emits no EmergenceDOY and torchcrop's "
-            "schema has no emergence column -- so the simulated side is the "
-            "*sowing* date. Read the residual as the observed sowing-to-"
-            "emergence lag, which the model's tsumem is supposed to reproduce "
-            "and which is not scored anywhere else."
+            "Like-for-like, and new: SIMPLACE writes Phenology.EmergenceDOY "
+            "and torchcrop writes days_to_emergence from the tsump = tsumem "
+            "crossing, so both sides mean 'the day the crop came up'. This is "
+            "the only row that scores tsumem directly. Earlier runs of this "
+            "notebook paired the *sowing* date here and reported the residual "
+            "as a lag; those numbers are not comparable with these."
         ),
     ),
     ClmsStage(
@@ -235,14 +251,16 @@ CLMS_STAGES: Final[tuple[ClmsStage, ...]] = (
     ClmsStage(
         key="season_length",
         label="Season length",
-        sim_col="season_length_days",
+        sim_col="emergence_to_maturity_days",
         obs_col="obs_season_length_days",
         circular=False,
         caveat=(
-            "Endpoints differ on both ends: the simulated season runs sowing "
-            "-> maturity, the observed one emergence -> harvest. The bias is "
-            "therefore the sum of the emergence-lag row and the harvest row, "
-            "and the notebook checks that it closes."
+            "Endpoint-matched: emergence -> maturity on the simulated side "
+            "against CLMS's emergence -> harvest, rather than the run's own "
+            "sowing -> maturity column. That makes the bias exactly "
+            "bias(harvest) - bias(emergence), which the notebook checks "
+            "closes; paired against the sowing-based duration it would carry "
+            "the whole sowing-to-emergence lag as an apparent error."
         ),
     ),
 )

@@ -1,0 +1,141 @@
+# =============================================================================
+# Stage 1 — phenology. torchcrop's own `load_calibration_config` schema, plus
+# the `priors` / `ratio_priors` / `simplex` blocks this package reads itself.
+#
+# `Current` values are the SUSTAg `WW` block as written to
+# <TC_OUT_DIR>/workspace/crop_wheat.yaml. A current value outside its bound
+# means the run starts from the wrong place, which is why every bound below
+# was checked against that file rather than against torchcrop's preset.
+#
+# `idsl` is NOT here and never will be: it is 2, it is SIMPLACE's own value in
+# the WW block, and it is in `Lintul5Model._NON_DIFFERENTIABLE_FIELDS`, so no
+# gradient reaches it.
+# =============================================================================
+
+parameters:
+  # --- Tier 1: free in every region ----------------------------------------
+  # Every region has exactly two dated stages — CLMS emergence and harvest — so
+  # tier 1 is what two dates identify, and nothing more. This is the first row
+  # of CALIBRATION.md's coverage table, and the identifiability diagnostic on
+  # the EU_val export confirms it the hard way: with `vbase`, `phottb` and
+  # `vernrt` freed as well, the parameter correlation matrix comes back at
+  # 0.997-0.999 across `vbase`/`versat`/`phottb@0`/`phottb@17`/`vernrt@10` —
+  # far past the 0.95 at which one of a pair should be frozen. Those four
+  # therefore sit at tier 2, released only where a third dated stage exists.
+
+  # The single most identifiable parameter in the plan. At 60 the crop emerges
+  # in 3.3 days against a ground-observed 12 (PEP725 median, IQR 10-16, 4 433
+  # station-seasons). `tsump` accumulates clamp(T - tbasem, 0), so at an autumn
+  # mean of 10-13 C a 12-day lag implies 120-160 C.d — and upstream's example
+  # independently fits 160 on German ground observations. The lower bound is
+  # 100 because everything below it reproduces the 3-day failure.
+  #
+  # **Capped at the physical prior (150 +- 50), not at upstream's 300.** The
+  # first full run showed why: at (100, 300) `tsumem` ran to 294 in 10 of the 17
+  # tier-1 regions and *still* left emergence 14 d early, with sowing-to-
+  # emergence at 17.8 d against a ground-observed 12. A thermal requirement
+  # twice the ground observation is not a fitted parameter, it is a sink --
+  # simulated emergence is `sowing + days_to_emergence` and only the second term
+  # is free, so a systematically early sowing date is absorbed here until the
+  # bound stops it. Capping at prior + 1 spread keeps the parameter physical and
+  # forces the residual to surface where it belongs: as an emergence bias
+  # attributable to the sowing window, an input to *both* models and outside
+  # every stage of this plan.
+  #
+  # `init` is set explicitly because the *current* value, 60, is outside the
+  # bound on purpose — 60 is the failure this parameter exists to remove, so
+  # seeding from it would start every region clamped to the lower bound.
+  crop.tsumem:   {bounds: [100, 200], init: 150}
+
+  # JRC TSUM1 431-1240. 1125 is inside the prior now; it was 1623 while the
+  # crop ran at idsl = 0 and had to buy the delay with an inflated thermal sum.
+  crop.tsum1:    {bounds: [500, 1300]}
+  # JRC TSUM2 400-1350 (mean 794).
+  crop.tsum2:    {bounds: [400, 1350]}
+
+  # JRC VERNSAT 6-70 (mean 54). At the top of the prior, so expect it to move
+  # down.
+  crop.versat:   {bounds: [5, 70]}
+  # --- Tier 2: freed only where a third dated stage is observed -------------
+  # PEP725 heading (BBCH 51, so CON/ATC/NEM and parts of ALS/PAN), scored
+  # against the anthesis date `run.py` now writes. Two dates cannot separate
+  # these from the tier-1 four: the measured correlations are above 0.997.
+
+  # Hard constraint vbase <= versat - 5: it is the denominator in
+  # vernf = (vern - vbase) / (versat - vbase), and versat == vbase makes the
+  # whole vernalisation block a no-op — inert next to a tsum1 that was
+  # calibrated *with* vernalisation.
+  crop.vbase:    {bounds: [0, 25], tier: 2}
+
+  # Fixed abscissae (SIMPLACE's own knots); free abscissae are not identifiable
+  # from three dates. Unimodal, enforced by the ascending/descending pair below.
+  crop.vernrt@-10.0: {bounds: [0, 1], tier: 2}
+  crop.vernrt@-4.0:  {bounds: [0, 1], tier: 2}
+  crop.vernrt@3.0:   {bounds: [0, 1], tier: 2}
+  crop.vernrt@10.0:  {bounds: [0, 1], tier: 2}
+  crop.vernrt@17.0:  {bounds: [0, 1], tier: 2}
+  crop.vernrt@30.0:  {bounds: [0, 1], tier: 2}
+
+  # Two knots only, a straight ramp, non-decreasing. Adding interior knots is a
+  # stage-1 decision, not a given.
+  crop.phottb@0.0:  {bounds: [0, 1], tier: 2}
+  crop.phottb@17.0: {bounds: [0, 1], tier: 2}
+
+  # Above this DVS vernfac = 1. Trades against versat.
+  crop.vernalisation_devstage: {bounds: [0.2, 0.5], tier: 2}
+  # SIMPLACE's solution binds 0.4 on its Phenology component while torchcrop
+  # defaults to 0. It is a *solution* constant, not a crop-file parameter, so
+  # no crop mapping can carry it — and 0 versus 0.4 is the difference between a
+  # crop whose development can halt completely without vernalisation and one
+  # that always keeps 40 % of its rate. Freeing it is what makes the two models
+  # comparable here.
+  crop.minimal_vernalisation_factor: {bounds: [0.0, 0.5], tier: 2}
+  crop.tbasem: {bounds: [-2, 4], tier: 2}
+  # The SUSTAg crop caps the daily increment at 30 C.d, the same as WOFOST, so
+  # the JRC TSUM prior transfers directly. (Brandenburg's capped at 27, which is
+  # why an earlier version of this said it did not.)
+  crop.dtsmtb@30.0: {bounds: [20, 32], tier: 2}
+  crop.dtsmtb@45.0: {bounds: [20, 32], tier: 2}
+
+constraints:
+  # vbase <= versat. The documented constraint is vbase <= versat - 5, and the
+  # 5-unit margin is not expressible in an ordering group — what it guards
+  # against is versat == vbase making vernf = (vern - vbase)/(versat - vbase)
+  # a no-op, and torchcrop's own `denom_zero` branch already catches the exact
+  # degeneracy. The ordering is what stops the pair inverting.
+  - members: [crop.vbase, crop.versat]
+    order: ascending
+  # vernrt is unimodal in temperature: it rises to a plateau and falls.
+  - members: [crop.vernrt@-10.0, crop.vernrt@-4.0, crop.vernrt@3.0]
+    order: ascending
+  - members: [crop.vernrt@10.0, crop.vernrt@17.0, crop.vernrt@30.0]
+    order: descending
+  - members: [crop.phottb@0.0, crop.phottb@17.0]
+    order: ascending
+  - members: [crop.dtsmtb@30.0, crop.dtsmtb@45.0]
+    order: ascending
+
+priors:
+  # JRC EU_Phenology_Complete_ver2019, the MARS/BioMA per-cell calibration on
+  # 14 175 x 25 km cells. It is a WOFOST parameterisation and LINTUL-5 caps the
+  # daily increment, so the numbers do not transfer 1:1 — the *spread* is what
+  # is used, as the scale the L2 pull is measured in, and the map stays an
+  # independent check because it is never in the loss.
+  crop.tsum1:  {value: 860, spread: 200}
+  crop.tsum2:  {value: 794, spread: 240}
+  crop.versat: {value: 54,  spread: 16}
+  # Not JRC: the ground observation. PEP725 sowing-to-emergence is 12 d at an
+  # autumn mean of 10-13 C over tbasem = 0.
+  crop.tsumem: {value: 150, spread: 50}
+
+ratio_priors:
+  # The near-singular direction, pinned rather than frozen. Holding
+  # tsum1 + tsum2 fixed and sliding the split moves maturity by 0.003 d per
+  # C.d reallocated: real, symmetric, near-linear — and hopeless as a lever
+  # against a CLMS harvest RMSE of 21 d. Both stay free; the *ratio* carries the
+  # prior. `spread` is released by the trainer wherever anthesis or heading is
+  # observed, which is what turns the prior back into data.
+  - numerator: crop.tsum1
+    denominator: crop.tsum2
+    value: 0.52          # JRC mean 860 / (860 + 794)
+    spread: 0.06

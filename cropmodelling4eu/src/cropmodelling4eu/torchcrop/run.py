@@ -251,7 +251,7 @@ def build_soil_params(
 
 def build_site_params(
     ids: np.ndarray,
-    year: int,
+    year: int | np.ndarray,
     sowing_doy: np.ndarray | int,
     bundle: ExportBundle,
     dtype=torch.float32,
@@ -263,16 +263,24 @@ def build_site_params(
     open early enough for the *earliest* sower in the batch, since
     ``Lintul5Model`` compares ``doy >= site.idpl`` element-wise and each cell
     latches on its own value inside the shared window.
+
+    ``year`` is per-cell too, for the same reason: a production batch is one
+    season, but a calibration batch is one *region* and may hold several (see
+    :mod:`cropmodelling4eu.calibration.dataset`). CO2 rose 90 ppm across the
+    export's own window, so a shared value across seasons would be a real
+    error rather than a rounding one.
     """
     _, lat = id_to_lonlat(ids, bundle.config.grid)
     altitude = bundle.site.altitude_m(ids)
-    co2 = float(bundle.co2.get(year, bundle.co2.iloc[-1]))
     n = ids.size
+    years = np.broadcast_to(np.asarray(year, dtype=np.int64), (n,))
+    last = float(bundle.co2.iloc[-1])
+    co2 = np.array([float(bundle.co2.get(int(y), last)) for y in years])
     idpl = np.broadcast_to(np.asarray(sowing_doy, dtype=float), (n,))
     return SiteParameters(
         latitude=torch.as_tensor(lat, dtype=dtype),
         altitude=torch.as_tensor(altitude, dtype=dtype),
-        co2=torch.full((n,), co2, dtype=dtype),
+        co2=torch.as_tensor(co2, dtype=dtype),
         plant_at_sowing=torch.ones(n, dtype=dtype),
         idpl=torch.as_tensor(idpl.copy(), dtype=dtype),
     )
@@ -484,6 +492,12 @@ def _summary_frame(
     # frame whose value depends on where that threshold sits.
     tsump = torch.stack([s.tsump for s in out.states[1:]], dim=1)
     days_to_emergence = crossing_day(tsump, tsumem).cpu().numpy() - sow_index
+    # Anthesis is DVS 1.0 on the same interpolated crossing. It is the only
+    # observation that separates the pre- from the post-anthesis thermal sum:
+    # without it `tsum1` and `tsum2` are identified only by their sum (see
+    # CALIBRATION.md's identifiability rule). SIMPLACE has always written
+    # `Phenology.AnthesisDOY`; this is torchcrop's side of the same column.
+    days_to_anthesis = crossing_day(dvs, 1.0).cpu().numpy() - sow_index
 
     frame = pd.DataFrame(
         {
@@ -498,6 +512,7 @@ def _summary_frame(
             "max_lai": out.lai.max(dim=1).values.cpu().numpy(),
             "final_dvs": out.dvs[:, -1].cpu().numpy(),
             "days_to_emergence": days_to_emergence,
+            "days_to_anthesis": days_to_anthesis,
             "days_to_maturity": days_to_maturity,
             "n_applied_g_m2": applied[:, 0],
             "p_applied_g_m2": applied[:, 1],
@@ -728,7 +743,6 @@ def run_cells(
     ids = np.intersect1d(np.asarray(ids, dtype=np.int64), bundle.ids)
     if ids.size == 0:
         raise ValueError("none of the requested cells are runnable in this export")
-
     plan = sowing_plan(ids, list(years), bundle.site.sowing_doy(ids), sowing)
     n_batches = sum(
         int(np.ceil(group.size / settings.batch_size)) for _, group, _ in plan
@@ -814,6 +828,66 @@ def run_cells_daily(
 # --------------------------------------------------------------------------- #
 
 
+def region_crop_map(
+    ids: np.ndarray,
+    regions_file: Path,
+    region_crop_dir: Path,
+    fallback: "CropParameters",
+) -> dict[int, tuple[np.ndarray, "CropParameters"]]:
+    """``ids`` split by calibration region, each with its own crop parameters.
+
+    ``regions_file`` is a calibration run's own ``regions.parquet``
+    (``SimplaceID``, ``region_id``); ``region_crop_dir`` its ``<stage>/crops/``
+    (see :func:`cropmodelling4eu.torchcrop.params.write_crop_yaml_from_parameters`).
+    Two things fall back to ``fallback`` rather than failing a production run
+    outright, and both are logged by what they cover: a region with no
+    ``crop_region_<NN>.yaml`` there is uncalibrated the same way a region with
+    no observations is (see ``CalibrationResult.blocked``), and a cell the
+    table does not place in any region at all is one this calibration run
+    never saw. ``-1`` keys that second group.
+
+    Returns:
+        ``{region_id: (cell_ids, crop_params)}``, every value of ``ids``
+        covered exactly once.
+    """
+    table = pd.read_parquet(Path(regions_file))[["SimplaceID", "region_id"]]
+    table = table.drop_duplicates("SimplaceID").set_index("SimplaceID")["region_id"]
+
+    region_of = table.reindex(ids)
+    covered = region_of.dropna()
+    groups: dict[int, np.ndarray] = {
+        int(region_id): sub.index.to_numpy(np.int64)
+        for region_id, sub in covered.groupby(covered)
+    }
+    uncovered = region_of.index[region_of.isna()].to_numpy(np.int64)
+    if uncovered.size:
+        groups[-1] = uncovered
+        logger.warning(
+            "%d cell(s) are not in %s and run on the fallback crop",
+            uncovered.size, regions_file,
+        )
+
+    out: dict[int, tuple[np.ndarray, "CropParameters"]] = {}
+    missing_regions: list[int] = []
+    for region_id, region_ids in groups.items():
+        if region_id == -1:
+            out[region_id] = (region_ids, fallback)
+            continue
+        path = Path(region_crop_dir) / f"crop_region_{region_id:02d}.yaml"
+        if path.is_file():
+            out[region_id] = (region_ids, CropParameters(config_file=str(path)))
+        else:
+            out[region_id] = (region_ids, fallback)
+            missing_regions.append(region_id)
+    if missing_regions:
+        logger.warning(
+            "%d region(s) have no calibrated crop file under %s and run on "
+            "the fallback crop: %s", len(missing_regions), region_crop_dir,
+            sorted(missing_regions),
+        )
+    return out
+
+
 def run_shard(
     config: RunConfig,
     shard: int,
@@ -823,6 +897,8 @@ def run_shard(
     overwrite: bool = False,
     sowing: pd.DataFrame | None = None,
     crop_file: Path | None = None,
+    region_crop_dir: Path | None = None,
+    regions_file: Path | None = None,
     daily: bool = False,
     daily_variables: tuple[str, ...] = ("LAI", "AGB", "NNI", "TRANRF"),
 ) -> Path:
@@ -838,7 +914,21 @@ def run_shard(
     :func:`_summary_frame` / :func:`_daily_frame`) rather than re-running the
     model, so the trajectory is exactly the run the summary row came from and
     costs no extra forward pass.
+
+    ``region_crop_dir`` (with ``regions_file``) runs a calibration's per-region
+    crop fit instead of the single ``crop_file`` for the whole domain: the
+    shard's cells are split by :func:`region_crop_map` and each region's slice
+    goes through :func:`run_cells` with that region's own ``CropParameters`` —
+    the same per-region-batch invariant
+    :mod:`cropmodelling4eu.calibration.dataset` calibrates under, since a
+    torchcrop ``CropParameters`` is one object applied uniformly to whatever
+    batch it is given, not a per-cell field. ``crop_file`` is then what an
+    uncalibrated region or an unplaced cell falls back to, same as when it is
+    the only crop argument given.
     """
+    if bool(region_crop_dir) != bool(regions_file):
+        raise ValueError("region_crop_dir and regions_file must be given together")
+
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"torchcrop_shard_{shard:03d}.parquet"
@@ -851,7 +941,8 @@ def run_shard(
     device = torch.device(settings.device)
 
     # The workspace's crop file when there is one, so the parameters a shard
-    # runs with are the ones on disk that can be opened and checked.
+    # runs with are the ones on disk that can be opened and checked. In region
+    # mode this is the fallback for whatever region_crop_map cannot place.
     crop_params = load_crop_parameters(crop_file, config.season.crop)
 
     # A potential-yield run applies no fertilizer, so it needs no schedule.
@@ -863,6 +954,47 @@ def run_shard(
         ids = ids[:: int(np.ceil(ids.size / max_cells))][:max_cells]
 
     years = config.season.years
+    results: list[pd.DataFrame] = []
+    daily_results: list[pd.DataFrame] = []
+    t_start = time.time()
+
+    if region_crop_dir is not None:
+        groups = region_crop_map(ids, regions_file, region_crop_dir, crop_params)
+        logger.info(
+            "shard %d/%d: %d cells (of %d) over %d region(s), %d years, "
+            "sowing from %s, device=%s",
+            shard, n_shards, ids.size, bundle.ids.size, len(groups), len(years),
+            "a simulated table" if sowing is not None else "the site calendar", device,
+        )
+        logger.info(bundle.site.summarise())
+        for region_id, (region_ids, region_params) in sorted(groups.items()):
+            label = "unplaced cells" if region_id == -1 else f"region {region_id:02d}"
+            logger.info("shard %d: %s, %d cells", shard, label, region_ids.size)
+            out = run_cells(
+                config, region_ids, years, mode="both" if daily else "summary",
+                bundle=bundle, sowing=sowing, crop_params=region_params,
+            )
+            if daily:
+                summary, trajectory = out
+                results.append(summary)
+                daily_results.append(trajectory)
+            else:
+                results.append(out)
+
+        frame = pd.concat(results, ignore_index=True)
+        frame.to_parquet(out_path, index=False, compression="zstd")
+        logger.info(
+            "shard %d wrote %d rows to %s in %.1f min",
+            shard, len(frame), out_path, (time.time() - t_start) / 60,
+        )
+        if daily:
+            daily_frame = pd.concat(daily_results, ignore_index=True)
+            daily_frame.to_parquet(daily_path, index=False, compression="zstd")
+            logger.info(
+                "shard %d wrote %d daily rows to %s", shard, len(daily_frame), daily_path,
+            )
+        return out_path
+
     plan = sowing_plan(ids, years, bundle.site.sowing_doy(ids), sowing)
     n_batches = sum(
         int(np.ceil(group.size / settings.batch_size)) for _, group, _ in plan
@@ -877,9 +1009,6 @@ def run_shard(
     )
     logger.info(bundle.site.summarise())
 
-    results: list[pd.DataFrame] = []
-    daily_results: list[pd.DataFrame] = []
-    t_start = time.time()
     done = 0
 
     for group_years, group, doy in plan:
@@ -1026,7 +1155,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--crop-file", type=Path,
                    help="crop parameter YAML from the run workspace "
                         "(crop_<crop>.yaml); without it torchcrop's bundled "
-                        "preset is used")
+                        "preset is used. In --region-crop-dir mode this is "
+                        "the fallback for an uncalibrated region or a cell "
+                        "the region table does not cover.")
+    p.add_argument("--region-crop-dir", type=Path,
+                   help="a calibration's <stage>/crops/ directory "
+                        "(crop_region_<NN>.yaml per region) -- run each "
+                        "region's cells on its own calibrated crop instead "
+                        "of one crop_file for the whole domain. Needs "
+                        "--regions-file too.")
+    p.add_argument("--regions-file", type=Path,
+                   help="the calibration's regions.parquet (SimplaceID, "
+                        "region_id) --region-crop-dir splits cells by.")
     p.add_argument("--sowing-file", type=Path,
                    help="CSV of (SimplaceID, year, sowing_doy) to sow on "
                         "instead of the export's calendar -- what a finished "
@@ -1067,6 +1207,8 @@ def main(argv: list[str] | None = None) -> int:
         overwrite=args.overwrite,
         sowing=pd.read_csv(args.sowing_file) if args.sowing_file else None,
         crop_file=args.crop_file,
+        region_crop_dir=args.region_crop_dir,
+        regions_file=args.regions_file,
         daily=args.daily,
         daily_variables=tuple(args.daily_variables),
     )

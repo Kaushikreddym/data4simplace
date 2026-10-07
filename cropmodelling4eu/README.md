@@ -140,6 +140,47 @@ therefore did not cause. SIMPLACE's heading and harvest dates were unbiased to
 within a day on the previous export and are ~20 d late on the current one —
 see the note at the top of VALIDATION.md before quoting either.
 
+## Calibrating torchcrop
+
+torchcrop is differentiable, so its crop parameters can be fitted against
+observations by backpropagating through the model's own day loop.
+[CALIBRATION.md](CALIBRATION.md) is the design and every number behind it;
+`src/cropmodelling4eu/calibration/` is that document made executable.
+
+```bash
+# What the export supports: regions, observations, the season cache. Run this
+# first — it is where a missing reference or an empty cell set shows up.
+cm4eu calibrate --config config.yaml --prepare-only \
+  --crop-file <TC_OUT_DIR>/workspace/crop_wheat.yaml
+
+# Stage 1 (phenology), then yield, then LAI, then a joint fine-tune.
+cm4eu calibrate --config config.yaml \
+  --crop-file <TC_OUT_DIR>/workspace/crop_wheat.yaml \
+  --pep725 /data01/FDS/muduchuru/Data/Agri/PEP725
+```
+
+Three things are worth knowing before reading a result:
+
+- **`--crop-file` is not optional in practice.** Without it the *bundled*
+  torchcrop preset is calibrated, which is a different crop from the one the
+  production run uses, and every number in CALIBRATION.md is against the
+  harmonised SUSTAg `WW` block.
+- **A parameter is freed only where the observations identify it.** The
+  nitrogen and heat groups are `blocked:` in the spec files with their reasons,
+  and the vernalisation block needs a third dated stage; the reasons are
+  written into each stage's `summary.json` rather than left in the source.
+- **Each stage writes runnable crop files**, one per region, in torchcrop's own
+  preset layout — so a calibrated region is used by pointing
+  `CropParameters(config_file=...)` at it.
+- **It parallelises over regions on one node, and only one.** Batches of
+  different regions have disjoint gradients, so `--workers 29` runs them
+  concurrently for the same result. The ceiling is the region count, which a
+  single 80-core node already covers; extra nodes would idle, and threads do
+  nothing because the day loop holds the GIL.
+
+Submit it with `./submit/submit_calibration.sh` (see `--help`); run
+`--prepare` first on a new export.
+
 ## Layout
 
 ```
@@ -147,6 +188,7 @@ cropmodelling4eu/
 ├── config.yaml                     # one run config for both models
 ├── TORCHCROP.md                    # the torchcrop run's design and caveats
 ├── SIMPLACE.md                     # the SIMPLACE run's, and the unit warning
+├── CALIBRATION.md                  # fitting torchcrop's crop by backprop
 ├── VALIDATION.md                   # the Germany smoke test vs CyBench + PEP725
 ├── scripts/                        # cell selection, per-cell runs, validation
 ├── src/cropmodelling4eu/
@@ -155,6 +197,7 @@ cropmodelling4eu/
 │   ├── export/                     # the shared reader layer
 │   ├── torchcrop/                  # run.py (one shard) + maps.py (combine, grid, plot)
 │   ├── simplace/                   # workspace, project, solution, run, collect
+│   ├── calibration/                # regions, observations, losses, the stage loop
 │   └── evaluation/                 # the library the notebooks call
 ├── evaluation/                     # the four evaluation notebooks + outputs/
 ├── submit/                         # SLURM drivers: torchcrop's array, and the

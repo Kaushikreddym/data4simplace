@@ -1,0 +1,65 @@
+# =============================================================================
+# Stage 3 — LAI. Target the mean, not the tail — this reversed.
+#
+# The bimodal failure this stage was written around is gone: 0.13 % of
+# cell-seasons peak below 1.5 (against 6.2 %) and 0.02 % never reach DVS 2.
+# What replaced it is a uniform over-build — median peak LAI 7.31, only 5.5 %
+# inside the expected 4-6 — on 1 067 g m-2 of biomass, i.e. a canopy larger
+# than SIMPLACE's (6.50) out of 40 % less dry matter. That ratio is `slatb` and
+# `scale_factor_sla` almost by definition, with `scale_factor_rdr_leaves` and
+# `rdrltb` as the other side of the same balance: leaf area per gram is too
+# high, or leaves are kept too long, or both.
+#
+# `kdiftb` is FROZEN and is not in this file. Against fAPAR, k and LAI are
+# exactly degenerate — any k is compensable by an LAI — so calibrating both
+# fits the observation and gets the canopy wrong. A true LAI product (CGLS
+# 300 m, HR-VPP) would break the degeneracy and enable a stage 3b; neither is
+# on disk.
+# =============================================================================
+
+parameters:
+  # --- Specific leaf area ---------------------------------------------------
+  crop.slatb@0.0: {bounds: [0.008, 0.025]}
+  crop.slatb@0.4: {bounds: [0.008, 0.025]}
+  crop.slatb@1.0: {bounds: [0.008, 0.025]}
+  crop.slatb@2.0: {bounds: [0.008, 0.025]}
+  crop.scale_factor_sla: {bounds: [0.7, 1.4]}
+
+  # --- Establishment --------------------------------------------------------
+  # The lower bound was 0.008, which the current value 0.00817 sits on top of.
+  crop.rgrl: {bounds: [0.005, 0.035]}
+  crop.tdwi: {bounds: [10, 40]}
+  crop.laii: {bounds: [0.005, 0.05]}
+
+  # --- Closure --------------------------------------------------------------
+  crop.laicr: {bounds: [3.0, 6.0]}
+
+  # --- Senescence -----------------------------------------------------------
+  crop.rdrl:   {bounds: [0.02, 0.10]}
+  crop.rdrshm: {bounds: [0.01, 0.05]}
+  # Widened from 0.05, which the current 0.09 at 50 C exceeded.
+  crop.rdrltb@-10.0: {bounds: [0, 0.12]}
+  crop.rdrltb@10.0:  {bounds: [0, 0.12]}
+  crop.rdrltb@15.0:  {bounds: [0, 0.12]}
+  crop.rdrltb@30.0:  {bounds: [0, 0.12]}
+  crop.rdrltb@50.0:  {bounds: [0, 0.12]}
+  crop.scale_factor_rdr_leaves: {bounds: [0.6, 1.6]}
+  crop.dvsdlt: {bounds: [0.8, 1.4]}
+
+  # --- N feedback on the canopy --------------------------------------------
+  crop.nlai: {bounds: [0.5, 1.5], blocked: "initial mineral N: nni = 0.985"}
+  crop.nsla: {bounds: [0.2, 1.0], blocked: "initial mineral N: nni = 0.985"}
+
+constraints:
+  # Leaf death rate is non-decreasing in temperature.
+  - members:
+      [crop.rdrltb@-10.0, crop.rdrltb@10.0, crop.rdrltb@15.0,
+       crop.rdrltb@30.0, crop.rdrltb@50.0]
+    order: ascending
+
+priors:
+  crop.scale_factor_sla: {value: 1.0, spread: 0.15}
+  crop.scale_factor_rdr_leaves: {value: 1.0, spread: 0.2}
+  crop.rgrl:  {value: 0.00817, spread: 0.004}
+  crop.tdwi:  {value: 21.0, spread: 6.0}
+  crop.laicr: {value: 4.0, spread: 0.8}

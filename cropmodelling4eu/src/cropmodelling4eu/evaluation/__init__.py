@@ -10,6 +10,7 @@ here. Two compare against **CyBench** at country level
 :mod:`config`      Paths, country scope, evaluation constants, stage registries
 :mod:`doy`         Circular day-of-year arithmetic
 :mod:`torchcrop`   Loader for the combined TorchCrop run
+:mod:`fullrun`     Both models' full continental runs, side by side
 :mod:`cybench`     Loaders for the CyBench yield, calendar and crop-mask CSVs
 :mod:`clms`        Loader for the CLMS HRL Croplands per-year observed phenology
 :mod:`gdhy`        Loader for the GDHY 0.5° gridded yield product
@@ -34,6 +35,7 @@ from . import (
     cybench,
     germany,
     doy,
+    fullrun,
     gdhy,
     grid,
     metrics,
@@ -51,6 +53,7 @@ __all__ = [
     "config",
     "cybench",
     "doy",
+    "fullrun",
     "gdhy",
     "germany",
     "grid",
