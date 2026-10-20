@@ -850,7 +850,7 @@ def test_applying_a_gradient_steps_only_its_own_region(crop_params):
     before = {r: float(problem.manager(r)._latents["crop__tsum1"]) for r in (1, 2)}
     _Cal()._apply(
         problem, optimizer,
-        BatchOutcome(region_id=1, grads={"crop__tsum1": 1.0}, loss=0.0, report={}),
+        BatchOutcome(regions=[1], grads={1: {"crop__tsum1": 1.0}}, loss=0.0, report={}),
         grad_clip=1.0,
     )
     after = {r: float(problem.manager(r)._latents["crop__tsum1"]) for r in (1, 2)}
@@ -1130,3 +1130,280 @@ def test_laundering_the_containers_spares_a_learnable_parameter(crop_params):
 
     assert holder.crop_params.rdrshm is learnable
     assert isinstance(holder.crop_params.rdrshm, torch.nn.Parameter)
+
+
+# --------------------------------------------------------------------------- #
+# Mixed-region batches on one global calendar axis
+# --------------------------------------------------------------------------- #
+
+
+def test_mixed_batches_span_regions_and_keep_the_draw_stratified():
+    """One forward pass can carry every region once the start day is global."""
+    sampler = StratifiedFractionSampler(
+        _unit_years(), fraction=0.5, batch_size=10_000, mix_regions=True
+    )
+    batches = sampler.epoch(0)
+    assert len(batches) == 1, "the whole draw fits one batch"
+    drawn = batches[0]
+    assert drawn["region_id"].nunique() == 3
+    assert drawn["year"].nunique() == 8
+    region_packed = pd.concat(
+        StratifiedFractionSampler(_unit_years(), fraction=0.5, batch_size=10_000).epoch(0)
+    )
+    key = ["unit", "year"]
+    assert drawn.sort_values(key)[key].reset_index(drop=True).equals(
+        region_packed.sort_values(key)[key].reset_index(drop=True)
+    ), "mixing changes the packing, never the draw"
+
+
+def test_mixed_batches_still_respect_the_cell_year_limit():
+    for batch in StratifiedFractionSampler(
+        _unit_years(), 1.0, 32, mix_regions=True
+    ).epoch(0):
+        assert batch["n_cells"].sum() <= 32 or len(batch) == 1
+
+
+def test_waves_keep_overlapping_mixed_batches_sequential():
+    from cropmodelling4eu.calibration.parallel import waves
+
+    batches = [
+        pd.DataFrame({"region_id": [1, 2]}),
+        pd.DataFrame({"region_id": [2, 3]}),
+        pd.DataFrame({"region_id": [4]}),
+    ]
+    grouped = waves(batches)
+    assert [len(w) for w in grouped] == [2, 1], "{1,2} and {4} together, {2,3} after"
+
+
+def test_mixing_needs_a_global_start_day():
+    with pytest.raises(ValueError, match="start_doy"):
+        DataConfig(mix_regions=True)
+    DataConfig(mix_regions=True, start_doy=200)
+
+
+def test_a_global_start_drops_early_sowers_and_clips_doy_366():
+    """A sower before the window opens would latch on day 0; 366 never latches."""
+    from cropmodelling4eu.calibration.dataset import build_pool
+
+    regions, observations, bundle = _pool_inputs()
+    sowing = pd.DataFrame(
+        [
+            {"SimplaceID": cell, "year": year, "sowing_doy": doy}
+            for cell, doy in ((1, 250), (2, 366), (3, 190), (4, 210))
+            for year in (2020, 2021)
+        ]
+    )
+    settings = DataConfig(start_doy=200, pre_days=15)
+    pool = build_pool(observations, regions, bundle, settings, sowing)
+    assert 3 not in set(pool["SimplaceID"]), "DOY 190 sows before the window opens"
+    assert pool["sowing_doy"].max() == 365
+    assert pool["anchor_doy"].eq(215).all(), "one anchor for the whole pool"
+
+
+def _two_region_crops(crop_params):
+    import copy
+
+    a, b = copy.deepcopy(crop_params), copy.deepcopy(crop_params)
+    b.tsum1 = b.tsum1 * 1.1
+    b.tsumem = b.tsumem * 2.0
+    return a, b
+
+
+def test_stacked_crops_share_equal_fields_and_gather_the_rest(crop_params):
+    from cropmodelling4eu.calibration.problem import stack_crops
+
+    a, b = _two_region_crops(crop_params)
+    index = torch.tensor([0, 1, 1, 0])
+    mixed = stack_crops([a, b], index, torch.device("cpu"))
+    assert mixed.tsum2.dim() == 0, "an equal field stays one shared tensor"
+    assert torch.equal(mixed.tsum1, torch.stack([a.tsum1, b.tsum1])[index])
+    assert a.tsum1.dim() == 0, "the region containers are not modified"
+
+
+def test_a_stacked_row_reaches_only_its_own_region_s_latent(crop_params):
+    from cropmodelling4eu.calibration.problem import stack_crops
+
+    a, b = _two_region_crops(crop_params)
+    za = torch.tensor(1.0, requires_grad=True)
+    zb = torch.tensor(1.0, requires_grad=True)
+    a.tsum1 = a.tsum1 * za
+    b.tsum1 = b.tsum1 * zb
+    mixed = stack_crops([a, b], torch.tensor([0, 0, 1]), torch.device("cpu"))
+    (mixed.tsum1 * torch.tensor([1.0, 0.0, 0.0])).sum().backward()
+    assert za.grad is not None and float(za.grad) != 0.0
+    assert zb.grad is None or float(zb.grad) == 0.0
+
+
+def test_a_mixed_forward_matches_one_pass_per_region(crop_params):
+    """Per-row parameters must cost nothing in accuracy against per-region passes."""
+    from cropmodelling4eu.calibration.checkpointed import run_trajectories
+    from cropmodelling4eu.calibration.problem import stack_crops
+
+    a, b = _two_region_crops(crop_params)
+
+    def run(crop, n):
+        with torch.no_grad():
+            return run_trajectories(
+                _toy_model(crop), _toy_weather(batch=n), 1,
+                keep=("tsump", "dvs", "lai"), segment=0,
+            )
+
+    mixed = run(stack_crops([a, b], torch.tensor([0, 1, 0]), torch.device("cpu")), 3)
+    only_a, only_b = run(a, 1), run(b, 1)
+    for name in ("tsump", "dvs", "lai"):
+        assert torch.equal(mixed[name][0], only_a[name][0])
+        assert torch.equal(mixed[name][2], only_a[name][0])
+        assert torch.equal(mixed[name][1], only_b[name][0])
+    assert not torch.equal(only_a["dvs"], only_b["dvs"]), "the regions must differ"
+
+
+def _scoring_calibrator(wso_of_row):
+    """A Calibrator with only what `_batch_loss` reads, forward stubbed out."""
+    from cropmodelling4eu.calibration.config import CalibrationConfig
+    from cropmodelling4eu.calibration.trainer import Calibrator
+
+    cal = object.__new__(Calibrator)
+    cal.settings = CalibrationConfig()
+    cal.device = torch.device("cpu")
+    cal.climatology = RunningClimatology()
+    cal._observed = {
+        ("U1", 2020): {"yield_level": (6.0, 1.0)},
+        ("U2", 2020): {"yield_level": (5.0, 1.0)},
+        ("U3", 2020): {"yield_level": (8.0, 1.0)},
+    }
+    cal._forward = lambda batch, stage: (
+        {"wso": wso_of_row(batch)[:, None].expand(-1, 3)}, torch.tensor(60.0)
+    )
+    return cal
+
+
+def _batch(units, regions, cells_per_unit=2):
+    from cropmodelling4eu.calibration.dataset import RegionBatch
+
+    n = len(units) * cells_per_unit
+    return RegionBatch(
+        region_ids=np.repeat(regions, cells_per_unit).astype(np.int64),
+        ids=np.arange(n, dtype=np.int64), years=np.full(n, 2020),
+        weather=np.zeros((n, 3, 8), dtype=np.float32), start_doy=200,
+        start_dates=np.array(["2019-07-19"] * len(units), dtype="datetime64[ns]"),
+        sowing_doy=np.full(n, 250), unit_index=np.repeat(np.arange(len(units)), cells_per_unit),
+        units=np.array(units), unit_years=np.full(len(units), 2020),
+    )
+
+
+def test_a_mixed_batch_gives_each_region_its_own_loss_and_gradient():
+    """Sum of per-region means: each latent sees exactly its single-region gradient."""
+    level = {1: torch.tensor(650.0, requires_grad=True), 2: torch.tensor(500.0, requires_grad=True)}
+
+    def wso(batch):
+        return torch.stack([level[int(r)] for r in batch.region_ids])
+
+    cal = _scoring_calibrator(wso)
+    mixed_loss, _, per_region = cal._batch_loss(
+        _batch(["U1", "U2", "U3"], [1, 1, 2]), ("yield",), {"yield": 1.0}
+    )
+    mixed_loss.backward()
+    mixed_grads = {r: float(level[r].grad) for r in level}
+
+    singles = {}
+    for region, units, regions in ((1, ["U1", "U2"], [1, 1]), (2, ["U3"], [2])):
+        level[region].grad = None
+        loss, _, alone = _scoring_calibrator(wso)._batch_loss(
+            _batch(units, regions), ("yield",), {"yield": 1.0}
+        )
+        loss.backward()
+        singles[region] = (float(loss), float(level[region].grad))
+        assert per_region[region]["loss"] == pytest.approx(alone[region]["loss"])
+
+    assert float(mixed_loss) == pytest.approx(sum(v[0] for v in singles.values()))
+    for region in level:
+        assert mixed_grads[region] == pytest.approx(singles[region][1])
+    assert set(per_region) == {1, 2}
+    assert "yield/yield_rmse_t_ha" in per_region[1]
+
+
+def test_simplace_is_scored_per_region_on_the_calibration_s_own_split(tmp_path):
+    """Unit means first, then compared — the reduction the torchcrop loss uses."""
+    from cropmodelling4eu.evaluation.calibration_loss import score_simplace
+
+    pd.DataFrame(
+        {"unit": ["A", "A", "B"], "year": 2020, "region_id": [1, 1, 2],
+         "SimplaceID": [10, 11, 20]}
+    ).to_parquet(tmp_path / "pool.parquet")
+    pd.DataFrame(
+        {"unit": ["A", "B", "A"], "year": 2020,
+         "variable": ["harvest_date", "harvest_date", "yield_level"],
+         "value": [pd.Timestamp("2020-07-20"), pd.Timestamp("2020-07-10"), 6.0],
+         "weight": 1.0}
+    ).to_parquet(tmp_path / "observations.parquet")
+    pd.DataFrame(
+        {"unit": ["A", "B"], "year": 2020, "region_id": [1, 2], "split": ["val", "test"]}
+    ).to_parquet(tmp_path / "phenology_split.parquet")
+    simulated = pd.DataFrame(
+        {"SimplaceID": [10, 11, 20], "year": 2020,
+         "maturity_doy": [200, 204, 196], "yield_g_m2": [500.0, 700.0, 800.0]}
+    )
+    out = score_simplace(tmp_path, simulated, "phenology").set_index(
+        ["split", "region_id", "term"]
+    )["value"]
+    # Unit A matures on DOY 202 = 2020-07-20 (leap year): zero error.
+    assert out[("val", 1, "phenology/harvest_date_bias_d")] == pytest.approx(0.0)
+    # Unit B on DOY 196 = 2020-07-14, four days after its harvest.
+    assert out[("test", 2, "phenology/harvest_date_bias_d")] == pytest.approx(4.0)
+    assert out[("val", 1, "yield/yield_bias_t_ha")] == pytest.approx(0.0)
+
+
+def test_the_lai_stage_is_disabled_with_its_reason():
+    from cropmodelling4eu.calibration.config import CalibrationConfig
+
+    with pytest.raises(ValueError, match="'lai' is disabled: no LAI observations"):
+        CalibrationConfig(stage_order=("phenology", "yield", "lai"))
+    assert CalibrationConfig().stage_order == ("phenology", "yield")
+
+
+def test_a_calibrated_field_the_template_lacks_survives_the_round_trip(tmp_path):
+    """The SUSTAg template names no scale_factor_rue; its fitted value must not revert."""
+    import yaml
+    from torchcrop import CropParameters
+    from torchcrop.parameters.crop_params import _builtin_crop_path
+
+    from cropmodelling4eu.torchcrop.params import write_crop_yaml_from_parameters
+
+    preset = yaml.safe_load(open(_builtin_crop_path("wheat")))
+    for section in preset.get("sections", {}).values():
+        for group in ("scalars", "tables"):
+            section.get(group, {}).pop("scale_factor_rue", None)
+    template = tmp_path / "template.yaml"
+    template.write_text(yaml.safe_dump(preset))
+
+    crop = CropParameters(config_file=str(template))
+    crop.scale_factor_rue = torch.tensor(0.8747)
+    crop.tsum1 = torch.tensor(1015.26)
+    out = write_crop_yaml_from_parameters(tmp_path / "crop.yaml", crop, template=template)
+
+    again = CropParameters(config_file=str(out))
+    assert float(again.scale_factor_rue) == pytest.approx(0.8747)
+    assert float(again.tsum1) == pytest.approx(1015.26)
+    assert "Calibrated (not in template)" in yaml.safe_load(out.read_text())["sections"]
+
+
+def test_scale_factor_rue_is_folded_into_ruetb_for_simplace(tmp_path):
+    """SIMPLACE has no RUE multiplier; RUE = scale * RUETB, so folding is exact."""
+    from cropmodelling4eu.torchcrop.params import write_simplace_crop_xml
+
+    template = tmp_path / "crop.xml"
+    template.write_text(
+        '<CropProperties><crop><parameter id="Crop">WW</parameter>'
+        '<parameter id="TSUM1">1125</parameter>'
+        '<parameter id="RUETB"><value>0</value><value>3.0</value>'
+        '<value>1.3</value><value>2.0</value></parameter>'
+        '</crop></CropProperties>'
+    )
+    out = write_simplace_crop_xml(
+        tmp_path / "out.xml",
+        {"tsum1": 1000.0, "scale_factor_rue": 0.9, "ruetb": [[0.0, 3.0], [1.3, 2.0]]},
+        template, "WW",
+    )
+    text = out.read_text()
+    assert "2.7" in text and "1.8" in text, text
+    assert ">1000<" in text

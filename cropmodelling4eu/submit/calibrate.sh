@@ -55,6 +55,9 @@ ARGS=(
 [ -n "${CAL_PEP725:-}" ] && [ -d "${CAL_PEP725}" ] && ARGS+=(--pep725 "${CAL_PEP725}")
 [ -n "${CAL_EPOCHS:-}" ]   && ARGS+=(--epochs "${CAL_EPOCHS}")
 [ -n "${CAL_FRACTION:-}" ] && ARGS+=(--fraction "${CAL_FRACTION}")
+[ -n "${CAL_START_DOY:-}" ] && ARGS+=(--start-doy "${CAL_START_DOY}")
+[ "${CAL_MIX_REGIONS:-0}" = "1" ] && ARGS+=(--mix-regions)
+[ -n "${CAL_DEVICE:-}" ] && ARGS+=(--device "${CAL_DEVICE}")
 [ "${CAL_PREPARE_ONLY:-0}" = "1" ] && ARGS+=(--prepare-only)
 
 echo "cm4eu calibrate ${ARGS[*]}"

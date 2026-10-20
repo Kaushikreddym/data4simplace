@@ -5,6 +5,7 @@ Usage
     data4simplace --config config.yaml
     data4simplace --config config.yaml --verbose
     data4simplace --config config.yaml --dry-run
+    data4simplace --config scenario.yaml --link-base --tile-deg 5
 """
 
 from __future__ import annotations
@@ -67,6 +68,14 @@ def _build_parser() -> argparse.ArgumentParser:
         "per-cell global. Pass --tile-deg to also check tile completeness.",
     )
     parser.add_argument(
+        "--link-base",
+        action="store_true",
+        help="Complete a weather-only scenario export: link soil, site.csv and "
+        "the wide fertilizer schedule from paths.cell_set_from and write the "
+        "scenario's own site/co2.csv. With --tile-deg, refuses until every "
+        "tile is done.",
+    )
+    parser.add_argument(
         "--verbose",
         "-v",
         action="store_true",
@@ -88,12 +97,24 @@ def _configure_logging(verbose: bool) -> None:
     )
 
 
-def _report_plan(config: PipelineConfig) -> None:
+def _report_plan(config: PipelineConfig) -> bool:
+    """Log the enabled stages; ``False`` if a required climate variable is absent."""
+    log = logging.getLogger(__name__)
+    if config.flags.run_climate_processing:
+        from data4simplace.climate import MSWXHandler
+
+        if missing := MSWXHandler(config).missing_required():
+            log.error(
+                "Climate source %s/%s lacks required variable(s): %s",
+                config.climate.source, config.climate.experiment or "", ", ".join(missing),
+            )
+            return False
     enabled = [name for name, on in config.flags.model_dump().items() if on]
-    logging.getLogger(__name__).info(
+    log.info(
         "Dry run — configuration valid. Enabled stages: %s",
         ", ".join(enabled) or "(none)",
     )
+    return True
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -110,8 +131,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     if args.dry_run:
-        _report_plan(config)
-        return 0
+        return 0 if _report_plan(config) else 2
 
     if args.count_tiles:
         if args.tile_deg is None:
@@ -127,7 +147,17 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     try:
-        if args.combine_only:
+        if args.link_base:
+            from data4simplace.scenario import link_base_export
+            from data4simplace.tiling import count_tiles
+
+            expected = count_tiles(config, args.tile_deg) if args.tile_deg else None
+            record = link_base_export(config, tiles_expected=expected)
+            log.info(
+                "Linked base export into %s (%d weather cells)",
+                config.paths.output_dir, record["weather_cells"],
+            )
+        elif args.combine_only:
             from data4simplace.tiling import combine_tiles
 
             stats = combine_tiles(config, tile_deg=args.tile_deg)

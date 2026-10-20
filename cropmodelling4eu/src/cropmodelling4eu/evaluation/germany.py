@@ -24,7 +24,7 @@ disguise. Sowing is reported either way because it propagates into every later
 stage.
 
 Used by ``evaluation/germany_smoke_evaluation.ipynb`` and by
-``scripts/validate_germany.py``, which is a thin CLI over it.
+``cm4eu smoke validate`` (:func:`cropmodelling4eu.smoke.report`).
 """
 
 from __future__ import annotations

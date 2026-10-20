@@ -39,7 +39,12 @@ from data4simplace.site import (
 )
 from data4simplace.soil import SoilGridsHandler
 from data4simplace.soil.multiclass import PrimaryClassStatistics, TopClassAggregation
-from data4simplace.spatial import apply_cell_mask, export_cell_mask, keep_cells
+from data4simplace.spatial import (
+    apply_cell_mask,
+    base_export_cells,
+    export_cell_mask,
+    keep_cells,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -91,7 +96,7 @@ class Pipeline:
 
         # --- Processing stages ------------------------------------------------
         if flags.run_climate_processing:
-            logger.info("Stage: climate processing (MSWX)")
+            logger.info("Stage: climate processing (%s)", self._config.climate.source)
             result.climate = MSWXHandler(self._config).load()
 
         if flags.run_soil_processing:
@@ -147,7 +152,10 @@ class Pipeline:
         # soil stage actually produced values for, so weather, soil and
         # management all cover exactly the same cells.
         logger.info("Stage: resolving the exported cell set")
-        mask = export_cell_mask(self._config, self._grid, result.soil)
+        mask = export_cell_mask(
+            self._config, self._grid, result.soil,
+            within=base_export_cells(self._config),
+        )
         if result.climate is not None:
             result.climate = apply_cell_mask(result.climate, mask)
         if result.soil is not None:
@@ -227,7 +235,9 @@ class Pipeline:
                     exporter.export(result.site, result.cell_table, out_dir)
                 )
                 series, source = load_co2_series(
-                    self._config.paths.co2_file, self._simulated_years()
+                    self._config.paths.co2_file,
+                    self._simulated_years(),
+                    self._config.site.co2_hold_year,
                 )
                 result.written.append(write_co2_series(series, source, out_dir))
 

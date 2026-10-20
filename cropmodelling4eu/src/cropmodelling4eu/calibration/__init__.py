@@ -209,6 +209,11 @@ def prepare(
         overwrite=overwrite_cache,
     )
     dataset = CellYearDataset(pool, cache)
+    # Persisted so a model that is not calibrated here — SIMPLACE — can be
+    # scored on the same units, cells and observations
+    # (`evaluation.calibration_loss`).
+    observations.table.to_parquet(out_dir / "observations.parquet", index=False)
+    dataset.pool.drop(columns="row").to_parquet(out_dir / "pool.parquet", index=False)
 
     if crop_file is None:
         logger.warning(

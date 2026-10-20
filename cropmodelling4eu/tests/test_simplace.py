@@ -8,7 +8,9 @@ SIMPLACE's output columns into the shared run schema.
 
 from __future__ import annotations
 
+import re
 import subprocess
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -682,3 +684,30 @@ def test_scaling_an_absent_column_is_an_error(transform_solution):
 def test_scaling_an_absent_transform_is_an_error(transform_solution):
     with pytest.raises(KeyError, match="no transform 'nope'"):
         transform_solution.scale_transform("nope", {"Irradiation": 86.4})
+
+
+# --- simplace.co2: annual ------------------------------------------------------
+_SUSTAG = Path(__file__).resolve().parents[1] / "templates/sustag/solution/EU_SUSTAg_data4simplace.sol.xml"
+
+
+@pytest.mark.skipif(not _SUSTAG.is_file(), reason="SUSTAg template not present")
+def test_co2_annual_rewires_every_consumer(tmp_path):
+    """Every reader of the run-constant CO2 moves to the year-keyed table.
+
+    Verified against SIMPLACE itself on 3 cells: with the table switching from
+    284 to 800 ppm on 1 Jan, yield followed the 800 ppm run, not the 284 one.
+    """
+    from cropmodelling4eu.simplace.solution import read_solution
+
+    doc = read_solution(_SUSTAG)
+    assert doc.rewire_co2_annual("${_WORKDIR_}/data/project/co2_annual.csv") == 4
+    out = doc.write(tmp_path / _SUSTAG.name)
+    text = out.read_text()
+    live = re.sub(r"<!--.*?-->", "", text, flags=re.S)
+    assert "gcm_rcp_scenario.vCO2" not in live
+    assert 'key="CURRENT.YEAR"' in text and "co2_annual.csv" in text
+    # Rewiring twice adds no second resource.
+    again = read_solution(out)
+    with pytest.raises(KeyError):
+        again.rewire_co2_annual("x")
+    assert text.count('id="co2_annual"') == 1

@@ -95,6 +95,31 @@ def id_column_index(project_csv: Path, divider: str = ",") -> int:
     )
 
 
+def _export_bind_roots(export_dir: Path) -> list[Path]:
+    """The export plus every directory its own symlinks resolve into.
+
+    A derived export (one file replaced, the rest symlinked from the original)
+    is only readable in the container if the link targets are bound too: the
+    links are resolved inside it, so an unbound target makes SIMPLACE fail on
+    the first weather file. Entries are scanned two levels deep, which is
+    where data4simplace's layout puts its files, and nested roots are dropped.
+    """
+    export_dir = Path(export_dir)
+    entries = [
+        child
+        for top in export_dir.iterdir()
+        for child in (top, *(top.iterdir() if top.is_dir() and not top.is_symlink() else ()))
+    ] if export_dir.is_dir() else []
+    targets = {
+        (resolved if resolved.is_dir() else resolved.parent)
+        for entry in entries
+        if entry.is_symlink()
+        and not (resolved := entry.resolve()).is_relative_to(export_dir.resolve())
+    }
+    roots = sorted({export_dir, *targets})
+    return [r for r in roots if not any(r != o and r.is_relative_to(o) for o in roots)]
+
+
 def _render_env(
     workspace: Workspace,
     config: RunConfig,
@@ -106,7 +131,7 @@ def _render_env(
     # Binds that live inside the run directory are written relative to SP_ROOT
     # so the whole folder can be copied elsewhere and still run; the rest are
     # absolute because they genuinely are.
-    external = [f"{workspace.export_dir}:{workspace.export_dir}:ro"]
+    external = [f"{path}:{path}:ro" for path in _export_bind_roots(workspace.export_dir)]
     if workspace.template_dir is not None:
         external.append(f"{workspace.template_dir}:{workspace.template_dir}:ro")
     if workspace.weather_cache is not None:

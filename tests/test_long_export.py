@@ -14,6 +14,7 @@ from data4simplace.exporters.layout import (
     SOIL_DIALECTS,
     SUSTAG_SOIL,
     detect_layout,
+    _stock_to_concentration,
     select_dialect,
 )
 from data4simplace.exporters.mgmt_export import LongManagementExporter, ManagementExporter
@@ -275,8 +276,18 @@ def test_mineral_n_round_trips_through_the_concentration(long_config, soil_datas
     thickness = profile["depth_bottom_cm"] - profile["depth_top_cm"]
     back = long_frame["NH4_mg_kg"].to_numpy() * thickness.to_numpy() * profile[
         "bulkdensity"
-    ].to_numpy() / 100.0
+    ].to_numpy() / 10.0
     assert back == pytest.approx(profile["ammonium"].to_numpy(), rel=1e-9)
+
+
+def test_mineral_n_concentration_has_physical_magnitude():
+    """25 kg N/ha in a 20 cm layer at 1.4 kg/dm3 is ~8.9 mg/kg, not ~89."""
+    frame = pd.DataFrame(
+        {"depth_top_cm": [0.0], "depth_bottom_cm": [20.0], "bulkdensity": [1.4]}
+    )
+    assert _stock_to_concentration(np.array([25.0]), frame)[0] == pytest.approx(
+        25.0 * 1e6 / (1e5 * 20.0 * 1.4)
+    )
 
 
 def test_unmapped_properties_are_named_not_silently_dropped(

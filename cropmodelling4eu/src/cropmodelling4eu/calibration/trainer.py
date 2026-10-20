@@ -13,13 +13,12 @@ Stage  Freed                           Loss
 1      phenology                       ``L_phen``
 2      yield, phenology frozen         ``L_yield + l1 L_phen``
 3      canopy, yield anchored          ``L_lai + l2 L_yield + l1 L_phen``
-4      all                             joint fine-tune at a small learning rate
 =====  ==============================  ==========================================
 
-**Stage 4 is not optional on this run.** The harmonised run puts the canopy
-20-60 % *above* target rather than below it, so stage 3 removes leaf area that
-stage 2 was fitting yield through — a strictly larger perturbation than the one
-the retention weight was sized for, and running the wrong way.
+**There is no joint stage.** The coupling is one-way — every yield parameter
+moves maturity by exactly zero, while ``tsum1``/``tsum2``/``phottb`` move yield —
+so a stage freeing both would let the yield loss buy yield with harvest dates.
+Phenology is fitted once, then frozen.
 
 **Stage 1 moves more than its position suggests.** ``tsumem`` going from 60 to
 ~200 C.d delays emergence by about a month, which removes a month of early
@@ -41,6 +40,7 @@ import json
 import logging
 import time
 from dataclasses import dataclass, field
+from dataclasses import fields as dataclass_fields
 from pathlib import Path
 from typing import Any
 
@@ -63,7 +63,13 @@ from cropmodelling4eu.calibration.losses import (
 )
 from cropmodelling4eu.calibration.observations import ObservationSet
 from cropmodelling4eu.calibration.parallel import BatchOutcome, RegionPool, waves
-from cropmodelling4eu.calibration.problem import CalibrationProblem, load_stage_specs
+from cropmodelling4eu.calibration.problem import (
+    BOOTSTRAP_TABLES,
+    CalibrationProblem,
+    load_stage_specs,
+    row_tables_supported,
+    stack_crops,
+)
 from cropmodelling4eu.calibration.regions import CalibrationRegions
 from cropmodelling4eu.calibration.splits import Split, make_split
 from cropmodelling4eu.config import RunConfig
@@ -101,7 +107,12 @@ _DATE_VARIABLES = frozenset(
 
 @dataclass(slots=True)
 class StageResult:
-    """What one stage produced."""
+    """What one stage produced.
+
+    ``batch_history`` is the long ``(epoch, split, batch, region_id, term,
+    value)`` table: every batch's loss and diagnostics **per region**, which
+    ``history.csv``'s epoch-and-domain means average away.
+    """
 
     stage: str
     epochs: int
@@ -110,6 +121,7 @@ class StageResult:
     parameters: pd.DataFrame
     blocked: dict[str, str]
     test: dict[str, float] = field(default_factory=dict)
+    batch_history: pd.DataFrame = field(default_factory=pd.DataFrame)
 
 
 class _Containers:
@@ -284,7 +296,12 @@ class Calibrator:
     # ------------------------------------------------------------------ #
 
     def _model(self, batch: RegionBatch) -> Any:
-        """A model for one batch, on this region's persistent crop parameters."""
+        """A model for one batch, each row on its own region's crop parameters.
+
+        One region is its persistent ``CropParameters`` moved to the device; a
+        mixed batch gathers every field that differs between its regions to
+        ``[B]`` / ``[B, N, 2]`` (see :func:`stack_crops`).
+        """
         from torchcrop import Lintul5Model
 
         settings = self.config.torchcrop
@@ -301,10 +318,15 @@ class Calibrator:
         site = build_site_params(
             batch.ids, batch.years, batch.sowing_doy, self.bundle
         )
+        regions = batch.regions
+        index = torch.as_tensor(
+            np.searchsorted(regions, batch.region_ids), device=self.device
+        )
+        crop = stack_crops(
+            [self.region_crops[r] for r in regions], index, self.device
+        )
         return Lintul5Model(
-            self.region_crops[batch.region_id],
-            soil.to(device=self.device),
-            site.to(device=self.device),
+            crop, soil.to(device=self.device), site.to(device=self.device),
         ).to(self.device)
 
     def _sow_index(self, batch: RegionBatch) -> torch.Tensor:
@@ -366,47 +388,94 @@ class Calibrator:
 
     def _batch_loss(
         self, batch: RegionBatch, stages: tuple[str, ...], weights: dict[str, float]
-    ) -> tuple[torch.Tensor, dict[str, float]]:
-        """Score one batch under an accumulated objective.
+    ) -> tuple[torch.Tensor, dict[str, float], dict[int, dict[str, float]]]:
+        """Score one batch under an accumulated objective, region by region.
+
+        One forward pass, then the stage losses per region on that region's
+        rows and unit-years, summed. Summing per-region means — not one mean
+        over the batch — is what keeps a mixed batch's gradient on each region
+        identical to the one its own single-region batch would give, and it is
+        the per-region breakdown the loss maps are drawn from. A single-region
+        batch reduces to exactly the previous objective.
 
         ``batch.units`` is passed to every loss as the climatology key, and it
         carries the **unit alone**, not ``(unit, year)``: the climatology is a
         per-unit reference level *across* seasons, and a batch spanning several
         years is exactly what lets it see them.
+
+        Returns:
+            ``(total, report, per_region)`` — the report is the mean of the
+            per-region diagnostics, and ``per_region`` maps each region to its
+            own ``loss`` and stage-prefixed diagnostics.
         """
         keep_stage = stages[-1]
         trajectories, tsumem = self._forward(batch, keep_stage)
-        unit_index = torch.as_tensor(batch.unit_index, device=self.device)
-        total = torch.zeros((), device=self.device)
-        report: dict[str, float] = {}
-        scored = 0
+        sow_index = self._sow_index(batch)
+        unit_regions = batch.unit_regions
+        variables = tuple(dict.fromkeys(v for st in stages for v in STAGE_VARIABLES[st]))
+        targets, obs_weights = self._targets(batch, variables)
 
-        for stage in stages:
-            variables = STAGE_VARIABLES[stage]
-            targets, obs_weights = self._targets(batch, variables)
-            if not targets:
+        total = torch.zeros((), device=self.device)
+        per_region: dict[int, dict[str, float]] = {}
+        for region in batch.regions:
+            rows = torch.as_tensor(batch.rows_of(region), device=self.device)
+            segments = np.flatnonzero(unit_regions == region)
+            remap = np.full(batch.n_units, -1, dtype=np.int64)
+            remap[segments] = np.arange(len(segments))
+            unit_index = torch.as_tensor(
+                remap[batch.unit_index[batch.rows_of(region)]], device=self.device
+            )
+            seg = torch.as_tensor(segments, device=self.device)
+            units = batch.units[segments]
+            region_traj = {k: v[rows] for k, v in trajectories.items()}
+            region_tsumem = tsumem[rows] if tsumem.dim() > 0 else tsumem
+
+            region_total = torch.zeros((), device=self.device)
+            report: dict[str, float] = {}
+            scored = 0
+            for stage in stages:
+                stage_targets = {
+                    k: v[seg] for k, v in targets.items()
+                    if k in STAGE_VARIABLES[stage] and bool(torch.isfinite(v[seg]).any())
+                }
+                if not stage_targets:
+                    continue
+                stage_weights = {
+                    k: obs_weights[k][seg] for k in STAGE_VARIABLES[stage]
+                }
+                if stage == "phenology":
+                    loss, info = PhenologyLoss(self.settings.loss, self.climatology)(
+                        region_traj, region_tsumem, stage_targets, unit_index, units,
+                        sow_index[rows], stage_weights,
+                    )
+                elif stage == "yield":
+                    loss, info = YieldLoss(self.settings.loss, self.climatology)(
+                        region_traj["wso"][:, -1], stage_targets, unit_index, units,
+                        stage_weights,
+                    )
+                else:
+                    loss, info = CanopyLoss(self.settings.loss)(
+                        region_traj["frac_intercepted"], stage_targets, unit_index,
+                        units, stage_weights,
+                    )
+                region_total = region_total + weights.get(stage, 1.0) * loss
+                scored += 1
+                report |= {f"{stage}/{k}": v for k, v in info.items()}
+            if not scored:
                 continue
-            weight = weights.get(stage, 1.0)
-            if stage == "phenology":
-                loss, info = PhenologyLoss(self.settings.loss, self.climatology)(
-                    trajectories, tsumem, targets, unit_index, batch.units,
-                    self._sow_index(batch), obs_weights,
-                )
-            elif stage == "yield":
-                loss, info = YieldLoss(self.settings.loss, self.climatology)(
-                    trajectories["wso"][:, -1], targets, unit_index, batch.units,
-                    obs_weights,
-                )
-            else:
-                loss, info = CanopyLoss(self.settings.loss)(
-                    trajectories["frac_intercepted"], targets, unit_index,
-                    batch.units, obs_weights,
-                )
-            total = total + weight * loss
-            scored += 1
-            report |= {f"{stage}/{k}": v for k, v in info.items()}
-        report["scored_stages"] = scored
-        return total, report
+            report["scored_stages"] = scored
+            report["loss"] = float(region_total.detach())
+            report["rows"] = len(rows)
+            per_region[region] = report
+            total = total + region_total
+
+        summary = _mean_reports(list(per_region.values()))
+        summary.pop("loss", None)
+        summary.pop("rows", None)
+        summary["scored_stages"] = max(
+            (r["scored_stages"] for r in per_region.values()), default=0
+        )
+        return total, summary, per_region
 
     def batch_gradients(
         self,
@@ -418,53 +487,57 @@ class Calibrator:
         """One batch's gradients, loss and diagnostics — the unit of parallelism.
 
         Runs in a worker process or in this one, identically. It returns
-        **gradients, not a graph**: one float per latent of one region, so what
-        crosses a process boundary is a few dozen numbers rather than a
-        465-day autograd tape.
+        **gradients, not a graph**: one float per latent of each region the
+        batch carries, so what crosses a process boundary is a few dozen
+        numbers per region rather than a 465-day autograd tape.
 
-        Both penalties are scoped to this batch's region. Summed over every
-        region they would be applied once per *batch* rather than once per
-        *step*, and every batch would touch every region's latents — which is
-        both a bias toward the prior and the reason the batches could not run
-        independently.
+        Both penalties are added once per region **in the batch**, scoped to
+        it. Summed over every region they would be applied to regions the batch
+        carries no evidence for — a bias toward the prior, and the reason two
+        region-packed batches could not run independently.
 
         Returns:
             The :class:`BatchOutcome`, or ``None`` if the loss was not finite.
         """
+        started = self._clock()
         batch = self.dataset.batch(drawn)
         problem.zero_grad(set_to_none=True)
         # Materialized **once** per batch, and the same values are handed to the
         # prior: the forward pass reads the parameter containers, so a second
         # materialize would replace them underneath it and build the penalty on
         # a different graph from the loss.
-        values = problem.materialize(batch.region_id)
-        loss, report = self._batch_loss(batch, stages, weights)
-        penalty = problem.prior_penalty(
-            self.settings.loss.prior_l2, batch.region_id, values
-        ) + problem.pooling_penalty(
-            self.settings.loss.pooling_l2
-            if self.settings.optim.pooling == "hierarchical"
-            else 0.0,
-            batch.region_id,
-        )
+        values = {r: problem.materialize(r) for r in batch.regions}
+        loss, report, per_region = self._batch_loss(batch, stages, weights)
         if not report.get("scored_stages"):
             # No observation in this batch scores any active stage, so the only
             # gradient available is the prior's. Stepping on it would move the
-            # region toward its prior for a batch that carries no evidence at
-            # all — the same failure as applying the penalties once per batch,
-            # arriving by a different route. `scorable_unit_years` keeps these
-            # out of the draw; this is the guard for when one slips through.
+            # regions toward their prior for a batch that carries no evidence
+            # at all. `scorable_unit_years` keeps these out of the draw; this
+            # is the guard for when one slips through.
             logger.debug(
-                "region %d: no active-stage observation in this batch — skipped",
-                batch.region_id,
+                "regions %s: no active-stage observation in this batch — skipped",
+                batch.regions,
             )
             return None
 
-        total = loss + penalty.to(loss.device)
+        pooling = (
+            self.settings.loss.pooling_l2
+            if self.settings.optim.pooling == "hierarchical" else 0.0
+        )
+        # Only regions that scored: a region whose rows carried no evidence
+        # this batch gets no prior-only step, for the reason above.
+        penalty = sum(
+            (
+                problem.prior_penalty(self.settings.loss.prior_l2, r, values[r])
+                + problem.pooling_penalty(pooling, r)
+            ).to(loss.device)
+            for r in per_region
+        )
+        total = loss + penalty
         if not torch.isfinite(total):
             logger.warning(
-                "non-finite loss on region %d (%d unit-years) — skipped",
-                batch.region_id, batch.n_units,
+                "non-finite loss on regions %s (%d unit-years) — skipped",
+                batch.regions, batch.n_units,
             )
             return None
         if total.grad_fn is None:
@@ -473,25 +546,29 @@ class Calibrator:
             # parameters (a batch whose seasons never leave the pre-emergence
             # branch does this). `backward` on it raises "element 0 of tensors
             # does not require grad" and kills the run, so it is skipped the
-            # same way a non-finite one is. `gradient_check` already guards
-            # this; the training path did not.
+            # same way a non-finite one is.
             logger.warning(
-                "region %d: loss carries no gradient path (%d unit-years) — skipped",
-                batch.region_id, batch.n_units,
+                "regions %s: loss carries no gradient path (%d unit-years) — skipped",
+                batch.regions, batch.n_units,
             )
             return None
         total.backward()
 
-        manager = problem.manager(batch.region_id)
         return BatchOutcome(
-            region_id=batch.region_id,
+            regions=list(per_region),
             grads={
-                name: float(p.grad)
-                for name, p in manager._latents.items()
-                if p.grad is not None
+                r: {
+                    name: float(p.grad)
+                    for name, p in problem.manager(r)._latents.items()
+                    if p.grad is not None
+                }
+                for r in per_region
             },
-            loss=float(loss.detach()),
+            loss=_per_region_mean(loss, per_region),
             report=report,
+            per_region=per_region,
+            rows=len(batch.ids),
+            seconds=self._clock() - started,
         )
 
     @torch.no_grad()
@@ -503,15 +580,24 @@ class Calibrator:
         weights: dict[str, float],
     ) -> BatchOutcome | None:
         """One batch's loss and diagnostics, with no gradient — see :meth:`evaluate`."""
+        started = self._clock()
         batch = self.dataset.batch(drawn)
-        problem.materialize(batch.region_id)
-        loss, report = self._batch_loss(batch, stages, weights)
+        for region in batch.regions:
+            problem.materialize(region)
+        loss, report, per_region = self._batch_loss(batch, stages, weights)
         if not torch.isfinite(loss):
             return None
         return BatchOutcome(
-            region_id=batch.region_id, grads={},
-            loss=float(loss), report=report,
+            regions=list(per_region), grads={},
+            loss=_per_region_mean(loss, per_region), report=report, per_region=per_region,
+            rows=len(batch.ids), seconds=self._clock() - started,
         )
+
+    def _clock(self) -> float:
+        """Wall time, synchronised with the device so GPU work is counted."""
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        return time.perf_counter()
 
     def _apply(
         self,
@@ -520,27 +606,69 @@ class Calibrator:
         outcome: BatchOutcome,
         grad_clip: float,
     ) -> None:
-        """Write one region's gradients back and take its Adam step.
+        """Write a batch's per-region gradients back and take one Adam step.
 
-        Adam skips parameters whose ``grad`` is ``None``, so setting only this
-        region's gradients steps only this region — a region no longer takes
-        fifty steps an epoch on prior pull alone, carrying momentum with it.
+        Adam skips parameters whose ``grad`` is ``None``, so setting only the
+        batch's regions' gradients steps only those regions — a region no
+        longer takes fifty steps an epoch on prior pull alone, carrying
+        momentum with it.
         """
         problem.zero_grad(set_to_none=True)
-        manager = problem.manager(outcome["region_id"])
-        touched = []
-        for name, value in outcome["grads"].items():
-            latent = manager._latents[name]
-            latent.grad = torch.full_like(latent, value)
-            touched.append(latent)
-        if not touched:
-            return
-        if grad_clip > 0:
-            # This region's parameters only: over the whole set the norm is
-            # dominated by the 28 regions the batch never touched, so a global
-            # clip would scale the one real gradient by the wrong factor.
-            torch.nn.utils.clip_grad_norm_(touched, grad_clip)
-        optimizer.step()
+        stepped = False
+        for region, grads in outcome["grads"].items():
+            manager = problem.manager(region)
+            touched = []
+            for name, value in grads.items():
+                latent = manager._latents[name]
+                latent.grad = torch.full_like(latent, value)
+                touched.append(latent)
+            if touched and grad_clip > 0:
+                # Per region: over the whole set the norm is dominated by the
+                # regions the batch never touched, so a global clip would scale
+                # each real gradient by the wrong factor.
+                torch.nn.utils.clip_grad_norm_(touched, grad_clip)
+            stepped |= bool(touched)
+        if stepped:
+            optimizer.step()
+
+    def mixes_regions(self, problem: CalibrationProblem) -> bool:
+        """Whether this stage's batches may span regions.
+
+        Needs ``data.mix_regions``, and — when the regions differ in one of
+        :data:`BOOTSTRAP_TABLES` — a torchcrop whose emergence bootstrap takes a
+        per-row table. Otherwise the stage packs by region, which on a global
+        ``start_doy`` still mixes years.
+        """
+        if not self.settings.data.mix_regions:
+            return False
+        crops = list(self.region_crops.values())
+        varying = problem.free_fields() | {
+            entry.name
+            for entry in dataclass_fields(crops[0])
+            if isinstance(getattr(crops[0], entry.name), torch.Tensor)
+            and any(
+                # On CPU: a materialized field lives with the latents (possibly
+                # CUDA) while an untouched one is still the crop file's.
+                not torch.equal(
+                    getattr(crops[0], entry.name).detach().cpu(),
+                    getattr(c, entry.name).detach().cpu(),
+                )
+                for c in crops[1:]
+            )
+        }
+        blocked = sorted(
+            name for name in varying & BOOTSTRAP_TABLES
+            if getattr(crops[0], name).dim() == 2
+        )
+        if blocked and not row_tables_supported():
+            logger.warning(
+                "regions differ in %s, which the installed torchcrop's emergence "
+                "bootstrap cannot take per row (Lintul5Model reshapes it to ()); "
+                "this stage packs batches by region",
+                ", ".join(blocked),
+            )
+            return False
+        return True
 
     def scorable_unit_years(self, stages: tuple[str, ...]) -> pd.DataFrame:
         """The unit-years an objective over ``stages`` can actually score.
@@ -586,10 +714,6 @@ class Calibrator:
         order = list(self.settings.stage_order)
         loss = self.settings.loss
         retention = {"phenology": loss.lambda_phenology, "yield": loss.lambda_yield}
-        if stage not in order:
-            # The joint fine-tune, which is not a stage but every stage: no
-            # term is a retention term there, so all of them weigh 1.
-            return {name: 1.0 for name in order}
         weights = {stage: 1.0}
         for earlier in order[: order.index(stage)]:
             weights[earlier] = retention.get(earlier, 1.0)
@@ -683,7 +807,7 @@ class Calibrator:
 
         problem.zero_grad(set_to_none=True)
         problem.materialize(batch.region_id)
-        loss, report = self._batch_loss(batch, stages, weights)
+        loss, report, _ = self._batch_loss(batch, stages, weights)
         if not report.get("scored_stages") or loss.grad_fn is None:
             # Nothing to differentiate. Reported rather than raised: the check
             # is a diagnostic, and killing a multi-day run over it would be the
@@ -708,12 +832,12 @@ class Calibrator:
                 latent.add_(epsilon)
             problem.materialize(batch.region_id)
             with torch.no_grad():
-                up, _ = self._batch_loss(batch, stages, weights)
+                up, *_ = self._batch_loss(batch, stages, weights)
             with torch.no_grad():
                 latent.copy_(original - epsilon)
             problem.materialize(batch.region_id)
             with torch.no_grad():
-                down, _ = self._batch_loss(batch, stages, weights)
+                down, *_ = self._batch_loss(batch, stages, weights)
             with torch.no_grad():
                 latent.copy_(original)
             numeric = float((up - down) / (2 * epsilon))
@@ -921,12 +1045,10 @@ class Calibrator:
         stage: str,
         problem: CalibrationProblem,
         split: Split,
-        stages: tuple[str, ...] | None = None,
-        lr_scale: float = 1.0,
         freeze: tuple[str, ...] = (),
     ) -> StageResult:
-        """Fit one stage. ``stages`` overrides the accumulated objective."""
-        stages = stages or tuple(
+        """Fit one stage on its accumulated objective."""
+        stages = tuple(
             s for s in self.settings.stage_order
             if self.settings.stage_order.index(s)
             <= self.settings.stage_order.index(stage)
@@ -937,18 +1059,27 @@ class Calibrator:
             if any(f in name for f in freeze):
                 parameter.requires_grad_(False)
         trainable = [p for p in problem.parameters() if p.requires_grad]
+        mixing = self.mixes_regions(problem)
 
         optimizer = torch.optim.Adam(
             trainable,
-            lr=optim_settings.lr * lr_scale,
+            lr=optim_settings.lr,
             betas=optim_settings.betas,
         )
         sampler = StratifiedFractionSampler(
             split.train, self.settings.data.fraction,
             self.settings.data.batch_size, seed=self.settings.data.seed,
+            mix_regions=mixing,
         )
+        workers = self.workers
+        if mixing and workers > 1:
+            # Every mixed batch carries every region, so no two can run in one
+            # wave: the fork pool would idle all but one worker.
+            logger.info("mixed-region batches run in process; %d workers unused", workers)
+            workers = 1
 
         history: list[dict] = []
+        batch_log: list[dict] = []
         best_val, best_state, since_best = float("inf"), None, 0
         # The fork boundary is where the invariant has to hold: a worker
         # inherits the containers as they stand now and keeps them for the
@@ -957,7 +1088,7 @@ class Calibrator:
         # here — harmless only by accident, because this stage happens to
         # rewrite its own targets every batch.
         problem.detach_containers()
-        pool_context = RegionPool(self, problem, stages, weights, self.workers)
+        pool_context = RegionPool(self, problem, stages, weights, workers)
         with pool_context as pool:
           for epoch in range(optim_settings.max_epochs):
             started = time.time()
@@ -968,10 +1099,17 @@ class Calibrator:
                 for outcome in pool.run(wave):
                     self._apply(problem, optimizer, outcome, optim_settings.grad_clip)
                     epoch_loss += outcome["loss"]
+                    batch_log += self._batch_records(
+                        outcome, stage, epoch, "train", n_batches
+                    )
                     n_batches += 1
                     reports.append(outcome["report"])
 
-            validation = self.evaluate(problem, split.val, stages, weights, pool)
+            validation = self.evaluate(
+                problem, split.val, stages, weights, pool, mixing,
+                records=batch_log, tag=(stage, epoch, "val"),
+            )
+            self._write_batch_history(stage, batch_log)
             record = {
                 "epoch": epoch,
                 "train_loss": epoch_loss / max(1, n_batches),
@@ -1002,6 +1140,10 @@ class Calibrator:
         if best_state is not None:
             problem.load_state_dict(best_state)
 
+        test = self.evaluate(
+            problem, split.test, stages, weights, mixing=mixing,
+            records=batch_log, tag=(stage, len(history), "test"),
+        )
         result = StageResult(
             stage=stage,
             epochs=len(history),
@@ -1009,7 +1151,8 @@ class Calibrator:
             history=pd.DataFrame(history),
             parameters=problem.parameter_table(),
             blocked=getattr(problem, "blocked", {}),
-            test=self.evaluate(problem, split.test, stages, weights),
+            test=test,
+            batch_history=pd.DataFrame(batch_log),
         )
         self._write_stage(result, problem)
         return result
@@ -1021,18 +1164,23 @@ class Calibrator:
         stages: tuple[str, ...],
         weights: dict[str, float],
         pool: RegionPool | None = None,
+        mixing: bool = False,
+        records: list[dict] | None = None,
+        tag: tuple[str, int, str] | None = None,
     ) -> dict[str, float]:
         """Mean loss and diagnostics over a held-out set, all of it.
 
         Scored in **full**, not sampled, so it is more batches than a 20 %
         training draw — which makes it the dominant cost once training is one
         parallel wave. ``pool`` scores them concurrently; without one it runs
-        in this process.
+        in this process. With ``records`` and ``tag = (stage, epoch, split)``
+        every batch's per-region scores are appended to the batch history.
         """
         if unit_years.empty:
             return {"loss": float("nan")}
         batches = StratifiedFractionSampler(
-            unit_years, 1.0, self.settings.data.batch_size, seed=0
+            unit_years, 1.0, self.settings.data.batch_size, seed=0,
+            mix_regions=mixing,
         ).epoch(0)
         outcomes = (
             pool.score(batches) if pool is not None
@@ -1041,6 +1189,9 @@ class Calibrator:
                 if (o := self.batch_score(problem, drawn, stages, weights)) is not None
             ]
         )
+        if records is not None and tag is not None:
+            for i, outcome in enumerate(outcomes):
+                records += self._batch_records(outcome, *tag, i)
         if not outcomes:
             return {"loss": float("nan")}
         return {
@@ -1048,11 +1199,35 @@ class Calibrator:
             **_mean_reports([o["report"] for o in outcomes]),
         }
 
+    def _batch_records(
+        self, outcome: BatchOutcome, stage: str, epoch: int, split: str, batch: int
+    ) -> list[dict]:
+        """One long-format row per region and term of one batch."""
+        return [
+            {
+                "stage": stage, "epoch": epoch, "split": split, "batch": batch,
+                "region_id": int(region), "term": term, "value": float(value),
+                "batch_rows": outcome["rows"], "batch_regions": len(outcome["per_region"]),
+                "seconds": outcome["seconds"], "device": self.device.type,
+            }
+            for region, report in outcome["per_region"].items()
+            for term, value in report.items()
+        ]
+
+    def _write_batch_history(self, stage: str, records: list[dict]) -> None:
+        """Rewritten every epoch, so a killed run keeps what it measured."""
+        if not records:
+            return
+        stage_dir = self.out_dir / stage
+        stage_dir.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(records).to_parquet(stage_dir / "batch_history.parquet", index=False)
+
     def _write_stage(self, result: StageResult, problem: CalibrationProblem) -> None:
         """Persist a stage: history, parameters, the blocked reasons, the crops."""
         stage_dir = self.out_dir / result.stage
         stage_dir.mkdir(parents=True, exist_ok=True)
         result.history.to_csv(stage_dir / "history.csv", index=False)
+        self._write_batch_history(result.stage, result.batch_history.to_dict("records"))
         result.parameters.to_csv(stage_dir / "parameters.csv", index=False)
         torch.save(problem.state_dict(), stage_dir / "latents.pt")
         (stage_dir / "summary.json").write_text(
@@ -1101,7 +1276,7 @@ class Calibrator:
             )
 
     def run(self, free_blocked: bool = False) -> list[StageResult]:
-        """Every stage in order, then the joint fine-tune."""
+        """Every stage in order."""
         results: list[StageResult] = []
         for stage in self.settings.stage_order:
             variables = STAGE_VARIABLES[stage]
@@ -1130,6 +1305,9 @@ class Calibrator:
             self.report_split_coverage(split).to_csv(
                 self.out_dir / f"{stage}_split_coverage.csv", index=False
             )
+            _split_table(split).to_parquet(
+                self.out_dir / f"{stage}_split.parquet", index=False
+            )
             first = self.dataset.batch(self._diagnostic_draw(stage, split))
             self.gradient_check(stage, problem, first).to_csv(
                 self.out_dir / f"{stage}_gradient_check.csv", index=False
@@ -1138,22 +1316,6 @@ class Calibrator:
                 self.out_dir / f"{stage}_identifiability.csv", index=False
             )
             results.append(self.run_stage(stage, problem, split))
-
-        if self.settings.joint_finetune and results:
-            stage = self.settings.stage_order[-1]
-            problem = self.build_problem(stage, free_blocked)
-            split = make_split(
-                self.scorable_unit_years(self.settings.stage_order),
-                mode="block", seed=self.settings.data.seed,
-                protect=self.settings.phenology_years,
-            )
-            results.append(
-                self.run_stage(
-                    "joint", problem, split,
-                    stages=self.settings.stage_order,
-                    lr_scale=self.settings.joint_lr_scale,
-                )
-            )
         return results
 
 
@@ -1178,6 +1340,29 @@ def _headline(record: dict) -> str:
         if key in record and np.isfinite(record[key])
     ]
     return f" — {', '.join(parts)}" if parts else ""
+
+
+def _per_region_mean(loss: torch.Tensor, per_region: dict) -> float:
+    """The reported loss: the batch's summed objective over the regions that scored.
+
+    The gradient is taken on the **sum** — that is what gives every region its
+    own single-region gradient — but a sum's scale follows how many regions a
+    batch happens to carry, which would make `history.csv` incomparable with a
+    region-packed run and let validation batches of different breadth weigh
+    differently. The mean restores "one region's loss".
+    """
+    return float(loss.detach()) / max(1, len(per_region))
+
+
+def _split_table(split: Split) -> pd.DataFrame:
+    """``(unit, year, split)`` — which held-out set each unit-year landed in."""
+    return pd.concat(
+        [
+            getattr(split, name)[["unit", "year", "region_id"]].assign(split=name)
+            for name in ("train", "val", "test")
+        ],
+        ignore_index=True,
+    )
 
 
 def _mean_reports(reports: list[dict]) -> dict[str, float]:

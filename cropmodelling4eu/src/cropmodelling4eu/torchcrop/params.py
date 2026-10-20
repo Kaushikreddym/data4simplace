@@ -633,13 +633,47 @@ def write_crop_yaml_from_parameters(
         )
 
     written = 0
+    named: set[str] = set()
     for section in preset.get("sections", {}).values():
         for group in ("scalars", "tables"):
             for name in list(section.get(group, {})):
+                named.add(name)
                 value = current(name)
                 if value is not None:
                     section[group][name] = value
                     written += 1
+
+    # A field the template does not name would otherwise be dropped silently:
+    # the SUSTAg-derived template has no `scale_factor_rue` or
+    # `minimal_vernalisation_factor`, so a calibrated value for either reverted
+    # to the default on reload. Anything that differs from what the template
+    # itself loads to goes into its own section, which `_apply_preset` and
+    # `flatten_crop_yaml` both read like any other.
+    from dataclasses import fields as dataclass_fields
+
+    from torchcrop import CropParameters
+
+    reference = CropParameters(config_file=str(source))
+    extra: dict[str, dict] = {"scalars": {}, "tables": {}}
+    for entry in dataclass_fields(params):
+        name = entry.name
+        value, base = getattr(params, name, None), getattr(reference, name, None)
+        if name in named or not hasattr(value, "detach") or value.ndim not in (0, 2):
+            continue
+        same = (
+            base is not None and hasattr(base, "shape") and base.shape == value.shape
+            and bool((value.detach().cpu() == base.detach().cpu()).all())
+        )
+        if not same:
+            extra["tables" if value.ndim == 2 else "scalars"][name] = current(name)
+    extra = {group: values for group, values in extra.items() if values}
+    if extra:
+        preset.setdefault("sections", {})["Calibrated (not in template)"] = extra
+        written += sum(len(values) for values in extra.values())
+        logger.info(
+            "%s: %s not in the template layout, written to their own section",
+            path, ", ".join(sorted(n for values in extra.values() for n in values)),
+        )
 
     preset |= {
         "crop_name": crop_name,
@@ -731,6 +765,21 @@ def write_simplace_crop_xml(
         return ET.fromstring(xml_text, ET.XMLParser(target=ET.TreeBuilder(insert_comments=True)))
 
     values = flatten_crop_yaml(calibrated) if not isinstance(calibrated, dict) else calibrated
+    # SIMPLACE's crop file has no RUE multiplier, so a calibrated
+    # `scale_factor_rue` would be lost. torchcrop's RUE is
+    # `scale_factor_rue * RUETB(DVS)` (photosynthesis.py), which makes folding
+    # it into the RUETB ordinates exact rather than an approximation.
+    scale = values.get("scale_factor_rue")
+    if isinstance(scale, float) and scale != 1.0 and isinstance(values.get("ruetb"), list):
+        values = {**values, "ruetb": [[x, y * scale] for x, y in values["ruetb"]]}
+        logger.info("%s: scale_factor_rue %.4f folded into RUETB", path, scale)
+    vernalisation_floor = values.get("minimal_vernalisation_factor")
+    if isinstance(vernalisation_floor, float) and vernalisation_floor != 0.0:
+        logger.warning(
+            "%s: minimal_vernalisation_factor %.4f is not written — SIMPLACE binds "
+            "it as the solution constant cMinimalVernalisationFactor, not a crop "
+            "parameter", path, vernalisation_floor,
+        )
     # newline="" turns off universal-newline translation: a stray \r on an
     # unrelated line must not get silently normalised by this round trip.
     with Path(template_crop_xml).open(newline="") as handle:

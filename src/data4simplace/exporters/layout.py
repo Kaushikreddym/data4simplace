@@ -88,10 +88,10 @@ def _cn_ratio(frame: pd.DataFrame) -> np.ndarray:
 def _stock_to_concentration(stock_kg_ha: np.ndarray, frame: pd.DataFrame) -> np.ndarray:
     """kg N/ha in a layer -> mg N/kg soil.
 
-    A hectare of a layer ``t`` cm thick holds ``10^4 * t`` dm3 of soil, so its
-    mass is ``10^4 * t * bulkdensity`` kg and::
+    A hectare of a layer ``t`` cm thick is ``10^8 cm2 * t cm = 10^5 * t`` dm3 of
+    soil, so its mass is ``10^5 * t * bulkdensity`` kg and::
 
-        mg/kg = kg/ha * 10^6 / (10^4 * t * bd) = kg/ha * 100 / (t * bd)
+        mg/kg = kg/ha * 10^6 / (10^5 * t * bd) = kg/ha * 10 / (t * bd)
 
     This inverts the stock the wide export writes, so a long and a wide file
     from the same run describe the same nitrogen.
@@ -104,7 +104,7 @@ def _stock_to_concentration(stock_kg_ha: np.ndarray, frame: pd.DataFrame) -> np.
     )
     with np.errstate(divide="ignore", invalid="ignore"):
         return np.where(
-            (thickness > 0) & (bulk > 0), stock_kg_ha * 100.0 / (thickness * bulk), np.nan
+            (thickness > 0) & (bulk > 0), stock_kg_ha * 10.0 / (thickness * bulk), np.nan
         )
 
 

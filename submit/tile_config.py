@@ -10,6 +10,11 @@ Two overrides are applied to a copy of the base ``config.yaml``:
     Turns every execution flag off except the named ones, so a stage the tiled
     run does not cover (NPK / management) can be run once over the whole grid.
 
+``--set dotted.key=value`` (repeatable)
+    Any other override, the value parsed as YAML (``--set site.co2_hold_year=1850``,
+    ``--set climate.required=[tas,pr]``). How a CMIP6 scenario run is derived
+    from the same ``config.yaml`` as the observational one.
+
 ``soil.wcs_cache_dir`` (only with ``--tile-index``)
     Gives the array task its own SoilGrids WCS cache. This is **required** for a
     parallel tiled run: :meth:`SoilGridsHandler.fetch_wcs` caches a download as
@@ -35,6 +40,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -47,6 +53,7 @@ def build(
     tile_index: int | None,
     cache_root: str | None,
     flags_only: str | None = None,
+    overrides: list[str] | None = None,
 ) -> dict[str, Any]:
     """Return the base config as a dict with the run/tile overrides applied."""
     with base.open("r", encoding="utf-8") as fh:
@@ -64,6 +71,20 @@ def build(
         if unknown:
             raise ValueError(f"unknown flag(s): {', '.join(sorted(unknown))}")
         cfg["flags"] = {name: (name in keep) for name in flags}
+
+    for item in overrides or []:
+        key, sep, raw = item.partition("=")
+        if not sep or not key:
+            raise ValueError(f"--set expects dotted.key=value, got {item!r}")
+        *parents, leaf = key.split(".")
+        node = cfg
+        for part in parents:
+            node = node.setdefault(part, {})
+            if not isinstance(node, dict):
+                raise ValueError(f"--set {key}: {part} is not a mapping")
+        value = yaml.safe_load(raw)
+        # YAML reads 1850-01-01 as a date; the config schema takes ISO strings.
+        node[leaf] = raw if isinstance(value, (date, datetime)) else value
 
     if tile_index is not None:
         if cache_root is None:
@@ -96,6 +117,14 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="Comma-separated flag names to keep true; all others are set false.",
     )
+    parser.add_argument(
+        "--set",
+        dest="overrides",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="Override a dotted config key; the value is parsed as YAML. Repeatable.",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -105,6 +134,7 @@ def main(argv: list[str] | None = None) -> int:
             args.tile_index,
             args.cache_root,
             args.flags_only,
+            args.overrides,
         )
     except (OSError, ValueError, yaml.YAMLError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

@@ -16,6 +16,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 __all__ = [
     "CLMS_HARVEST_OFFSET_DAYS",
+    "DISABLED_STAGES",
     "CalibrationConfig",
     "DataConfig",
     "LossConfig",
@@ -49,6 +50,18 @@ STAGE_PARAMETERS: dict[str, str] = {
     "phenology": "params_phenology.yaml",
     "yield": "params_yield.yaml",
     "lai": "params_lai.yaml",
+}
+
+#: Stages that exist in code but may not run, with the reason the validator
+#: quotes. Remove an entry to re-enable the stage.
+DISABLED_STAGES: dict[str, str] = {
+    "lai": (
+        "no LAI observations: the only canopy reference is CyBench fAPAR, and "
+        "fitting LAI through fAPAR leaves k and LAI exactly degenerate. Its "
+        "senescence term is also broken (sigmoid_fall_day returns ~T/2 at k=1; "
+        "AUTUMN_CUT_DOY puts the June-July decline in the next season), and "
+        "run 829246 dragged test yield bias from +0.01 to -3.24 t/ha"
+    ),
 }
 
 
@@ -159,6 +172,29 @@ class DataConfig(BaseModel):
     #: default window.
     checkpoint_segment: int = Field(21, ge=0)
     seed: int = 0
+    #: Day-of-year every window opens on, shared by the **whole pool**.
+    #: ``None`` keeps the per-region anchor (the region's earliest sower minus
+    #: ``pre_days``). One global start is what lets a batch span regions: the
+    #: engine takes a single ``start_doy``, and each cell still sows on its own
+    #: ``idpl``. European winter wheat sows on DOY 215-366 in the SIMPLACE
+    #: table, so ~200 precedes every sower and the latch never wraps New Year;
+    #: a (cell, season) sowing before it would latch on day 0 and is dropped.
+    start_doy: int | None = Field(None, ge=1, le=365)
+    #: Pack batches across regions (one forward pass, per-row parameters)
+    #: rather than one region per batch. Needs ``start_doy``. Stages whose
+    #: per-region crops differ in a table the installed torchcrop cannot take
+    #: per row fall back to region-packed batches with a warning.
+    mix_regions: bool = False
+
+    @model_validator(mode="after")
+    def _check_mixing(self) -> "DataConfig":
+        if self.mix_regions and self.start_doy is None:
+            raise ValueError(
+                "data.mix_regions needs data.start_doy: regions anchored on "
+                "their own earliest sower open their windows on different days, "
+                "and one forward pass takes one start day"
+            )
+        return self
 
 
 class LossConfig(BaseModel):
@@ -228,19 +264,9 @@ class CalibrationConfig(BaseModel):
     #: Stages in the order they run. They **accumulate** terms rather than
     #: replacing the objective, so stage 3 cannot silently undo stage 2.
     #:
-    #: ``lai`` is switched OFF. Its fAPAR senescence term is broken on both
-    #: sides: ``sigmoid_fall_day`` at k=1 returns ~T/2 regardless of timing (a
-    #: +38 d season shift moved it -5 d), and ``AUTUMN_CUT_DOY = 180`` groups
-    #: the June-July decline into the *next* season, so observed half-fall
-    #: dates land in Nov-Jan. Run 829246 showed the cost: stage 3 dragged test
-    #: yield bias from +0.01 to -3.24 t/ha. Restore
-    #: ``("phenology", "yield", "lai")`` once both are fixed.
+    #: ``lai`` is disabled — see :data:`DISABLED_STAGES` — for want of real LAI
+    #: observations; the validator refuses it until that entry is removed.
     stage_order: tuple[str, ...] = ("phenology", "yield")
-    #: Joint fine-tune at a small learning rate after the staged fits. Its
-    #: reason was stage 3 removing leaf area stage 2 fits yield through, so it
-    #: is off while ``lai`` is; turn both back on together.
-    joint_finetune: bool = False
-    joint_lr_scale: float = Field(0.1, gt=0.0)
 
     regions: RegionConfig = Field(default_factory=RegionConfig)
     data: DataConfig = Field(default_factory=DataConfig)
@@ -261,5 +287,10 @@ class CalibrationConfig(BaseModel):
         if unknown:
             raise ValueError(
                 f"unknown stage(s) {sorted(unknown)}; known: {sorted(STAGE_PARAMETERS)}"
+            )
+        disabled = [s for s in self.stage_order if s in DISABLED_STAGES]
+        if disabled:
+            raise ValueError(
+                "; ".join(f"stage {s!r} is disabled: {DISABLED_STAGES[s]}" for s in disabled)
             )
         return self

@@ -33,6 +33,7 @@ import argparse
 import logging
 import sys
 from pathlib import Path
+from typing import Any
 
 from cropmodelling4eu import __version__
 from cropmodelling4eu.config import RunConfig, load_config
@@ -188,34 +189,58 @@ def _cmd_simplace(args: argparse.Namespace) -> int:
     )
 
 
-def _cmd_calibrate(args: argparse.Namespace) -> int:
-    """Fit torchcrop's crop parameters against the observations, by stage."""
-    from cropmodelling4eu.calibration import CalibrationConfig, prepare
+def _calibration_settings(args: argparse.Namespace) -> tuple[RunConfig, Any]:
+    """The run config and calibration settings ``calibrate`` and ``benchmark`` share."""
+    from cropmodelling4eu.calibration import CalibrationConfig
 
     config = _resolve_config(args)
     settings = CalibrationConfig()
-    if args.fraction is not None:
-        settings = settings.model_copy(
-            update={"data": settings.data.model_copy(update={"fraction": args.fraction})}
+    data = {
+        key: value
+        for key, value in (
+            ("fraction", getattr(args, "fraction", None)),
+            ("batch_size", getattr(args, "batch_size", None)),
+            ("start_doy", args.start_doy),
+            ("mix_regions", getattr(args, "mix_regions", False) or None),
         )
-    if args.epochs is not None:
+        if value is not None
+    }
+    if data:
+        # Validated, not `model_copy`'d: mixing without a start day must fail
+        # here rather than as a collate error an hour into the run.
+        settings = settings.model_copy(
+            update={"data": type(settings.data).model_validate(
+                settings.data.model_dump() | data
+            )}
+        )
+    if getattr(args, "epochs", None) is not None:
         settings = settings.model_copy(
             update={"optim": settings.optim.model_copy(update={"max_epochs": args.epochs})}
         )
-    if args.batch_size is not None:
-        settings = settings.model_copy(
-            update={"data": settings.data.model_copy(update={"batch_size": args.batch_size})}
+    torchcrop = {
+        key: value
+        for key, value in (
+            ("torch_threads", getattr(args, "threads", None)),
+            ("device", getattr(args, "device", None)),
         )
-    if args.threads is not None:
+        if value is not None
+    }
+    if torchcrop:
         config = config.model_copy(
-            update={"torchcrop": config.torchcrop.model_copy(
-                update={"torch_threads": args.threads}
-            )}
+            update={"torchcrop": config.torchcrop.model_copy(update=torchcrop)}
         )
     if args.stage != "all":
         settings = settings.model_copy(
-            update={"stage_order": (args.stage,), "joint_finetune": False}
+            update={"stage_order": (args.stage,)}
         )
+    return config, settings
+
+
+def _cmd_calibrate(args: argparse.Namespace) -> int:
+    """Fit torchcrop's crop parameters against the observations, by stage."""
+    from cropmodelling4eu.calibration import prepare
+
+    config, settings = _calibration_settings(args)
 
     prepared = prepare(
         config,
@@ -244,6 +269,51 @@ def _cmd_calibrate(args: argparse.Namespace) -> int:
             print("  not freed:")
             for name, reason in sorted(result.blocked.items()):
                 print(f"    {name:<34} {reason}")
+    return 0
+
+
+def _cmd_benchmark(args: argparse.Namespace) -> int:
+    """Time torchcrop calibration batches on CPU/GPU; read SIMPLACE's logged times."""
+    import pandas as pd
+
+    from cropmodelling4eu.benchmark import (
+        bench_torchcrop,
+        simplace_bench_rows,
+        simplace_log_timings,
+    )
+
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    frames = []
+    if args.simplace_runs:
+        timings = simplace_log_timings(args.simplace_runs)
+        timings.to_parquet(args.output.with_name(args.output.stem + "_simplace_tasks.parquet"))
+        frames.append(simplace_bench_rows(timings))
+    if args.batch_sizes:
+        from cropmodelling4eu.calibration import prepare
+
+        args.mix_regions = not args.region_packed
+        config, settings = _calibration_settings(args)
+        prepared = prepare(
+            config, settings, crop_file=args.crop_file, sowing_file=args.sowing_file,
+            pep725_root=args.pep725, with_yield=args.stage == "yield",
+            out_dir=args.out_dir,
+        )
+        frames.append(
+            bench_torchcrop(
+                prepared.calibrator, args.stage,
+                sorted(int(b) for b in args.batch_sizes.split(",")),
+                devices=args.devices.split(","), modes=args.modes.split(","),
+                mix=not args.region_packed, repeats=args.repeats,
+            )
+        )
+    if not frames:
+        print("nothing to do: pass --batch-sizes and/or --simplace-runs", file=sys.stderr)
+        return 2
+    table = pd.concat(frames, ignore_index=True)
+    if args.append and args.output.is_file():
+        table = pd.concat([pd.read_parquet(args.output), table], ignore_index=True)
+    table.to_parquet(args.output, index=False)
+    print(table.to_string(index=False))
     return 0
 
 
@@ -282,6 +352,84 @@ def _cmd_export_regions(args: argparse.Namespace) -> int:
     print(f"\n{len(written)} region crop.xml file(s) written, {len(fallback)} uncalibrated "
           f"region(s) fall back to {args.template}, {len(written) + len(fallback)} cell list(s) "
           f"-- all under {out_dir}")
+    return 0
+
+
+def _cmd_workspace(args: argparse.Namespace) -> int:
+    """Write a torchcrop run's workspace: crop file, run config, audit."""
+    from cropmodelling4eu.torchcrop.workspace import prepare_workspace
+
+    workspace = prepare_workspace(
+        load_config(args.config), args.out_dir, args.crop_source,
+        args.crop_xml, args.seeds_xml, args.management_xml,
+        simplace_crop=args.simplace_crop, seeds_crop=args.seeds_crop,
+    )
+    print(workspace.crop_file)
+    return 0
+
+
+def _cmd_smoke(args: argparse.Namespace) -> int:
+    """One step of the German smoke test; see :mod:`cropmodelling4eu.smoke`."""
+    import numpy as np
+    import pandas as pd
+
+    from cropmodelling4eu import smoke
+
+    if args.smoke_command == "config":
+        out = smoke.derive_config(
+            args.config, args.out, args.start_year, args.end_year, args.run_name, args.iopt
+        )
+        print(f"Smoke config: {out}  ({args.start_year}-{args.end_year})")
+        return 0
+
+    if args.smoke_command == "validate":
+        paths = {"simplace": args.simplace}
+        if args.torchcrop is not None:
+            paths["torchcrop"] = args.torchcrop
+        smoke.report(pd.read_csv(args.cells), paths, args.out_dir)
+        return 0
+
+    config = load_config(args.config)
+    if args.smoke_command == "cells":
+        if args.composition is not None:
+            config = config.model_copy(
+                update={"paths": config.paths.model_copy(
+                    update={"composition_file": args.composition}
+                )}
+            )
+        cells = smoke.select_cells(config, args.n_cells)
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        cells.to_csv(args.out, index=False)
+        print(cells.to_string(index=False))
+        return 0
+
+    ids = pd.read_csv(args.cells)["SimplaceID"].to_numpy(np.int64)
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    if args.smoke_command == "simplace":
+        frame = smoke.run_simplace_cells(config, ids, args.out, debug=args.debug)
+        frame.to_parquet(args.out, index=False, compression="zstd")
+        print(f"wrote {args.out}: {len(frame)} rows, {frame['SimplaceID'].nunique()} cells")
+        return 0
+
+    if args.iopt is not None:
+        config = config.model_copy(
+            update={"torchcrop": config.torchcrop.model_copy(update={"iopt": args.iopt})}
+        )
+    mode = "both" if args.daily_out else "daily" if args.daily else "summary"
+    summary, daily = smoke.run_torchcrop_cells(
+        config, ids, args.years,
+        sowing=pd.read_csv(args.sowing_file) if args.sowing_file else None,
+        crop_file=args.crop_file, mode=mode,
+        variables=tuple(args.daily_variables) if args.daily_variables else None,
+    )
+    (summary if summary is not None else daily).to_parquet(
+        args.out, index=False, compression="zstd"
+    )
+    if args.daily_out:
+        args.daily_out.parent.mkdir(parents=True, exist_ok=True)
+        daily.to_parquet(args.daily_out, index=False, compression="zstd")
+    written = summary if summary is not None else daily
+    print(f"wrote {args.out}: {len(written)} rows, {written['SimplaceID'].nunique()} cells")
     return 0
 
 
@@ -384,9 +532,9 @@ def _build_parser() -> argparse.ArgumentParser:
     calibrate.add_argument("--export", type=Path, help="Export directory.")
     calibrate.add_argument("--composition", type=Path)
     calibrate.add_argument(
-        "--stage", default="all", choices=["all", "phenology", "yield", "lai"],
+        "--stage", default="all", choices=["all", "phenology", "yield"],
         help="Run one stage, or every stage in `stage_order` (currently "
-        "phenology and yield; lai and the joint fine-tune are switched off). Stages "
+        "phenology and yield; lai is switched off). Stages "
         "accumulate terms rather than replacing the objective, so running one "
         "alone is a diagnostic, not the plan.",
     )
@@ -441,6 +589,21 @@ def _build_parser() -> argparse.ArgumentParser:
         "[B]-shaped tensors. Ask for cores to run more jobs, not a faster one.",
     )
     calibrate.add_argument(
+        "--start-doy", type=int,
+        help="Day-of-year every pooled window opens on (data.start_doy). One "
+        "global axis instead of each region's earliest sower; ~200 precedes "
+        "every European winter-wheat sowing in the SIMPLACE table.",
+    )
+    calibrate.add_argument(
+        "--mix-regions", action="store_true",
+        help="Pack batches across regions (needs --start-doy): one forward "
+        "pass with per-row parameters, so --batch-size can be thousands. Runs "
+        "in process; --workers then has nothing to parallelise.",
+    )
+    calibrate.add_argument(
+        "--device", help="torch device, e.g. cuda (default from the config).",
+    )
+    calibrate.add_argument(
         "--free-blocked", action="store_true",
         help="Free the parameters the spec files mark blocked. Every current "
         "blocker is a data problem: the N group is unidentifiable at nni 0.985 "
@@ -456,6 +619,51 @@ def _build_parser() -> argparse.ArgumentParser:
         "and stop. What to run first on a new export.",
     )
     calibrate.set_defaults(func=_cmd_calibrate, no_management=False)
+
+    benchmark = sub.add_parser(
+        "benchmark",
+        help="Cell-years per second: torchcrop calibration batches on CPU/GPU, "
+        "SIMPLACE from its own task logs.",
+    )
+    benchmark.add_argument("--config", type=Path, help="Run configuration YAML.")
+    benchmark.add_argument("--export", type=Path, help="Export directory.")
+    benchmark.add_argument("--composition", type=Path)
+    benchmark.add_argument(
+        "--stage", default="phenology", choices=["phenology", "yield"],
+    )
+    benchmark.add_argument("--crop-file", type=Path)
+    benchmark.add_argument("--sowing-file", type=Path)
+    benchmark.add_argument("--pep725", type=Path)
+    benchmark.add_argument(
+        "--out-dir", type=Path,
+        help="Calibration output directory whose weather cache is (re)used.",
+    )
+    benchmark.add_argument(
+        "--start-doy", type=int, default=200,
+        help="Global window start; needed for mixed-region batches (default 200).",
+    )
+    benchmark.add_argument(
+        "--batch-sizes", help="Comma-separated target cell-years, e.g. 64,256,1024,4096.",
+    )
+    benchmark.add_argument("--devices", default="cpu", help="e.g. cpu,cuda")
+    benchmark.add_argument("--modes", default="loader,forward,fwd+bwd")
+    benchmark.add_argument(
+        "--region-packed", action="store_true",
+        help="Time one-region batches instead of mixed ones.",
+    )
+    benchmark.add_argument("--repeats", type=int, default=2)
+    benchmark.add_argument(
+        "--simplace-runs", type=Path, nargs="*",
+        help="<run>/simplace (or simplace_regions/region_NN) directories whose "
+        "log/sp_*.out task timings to read.",
+    )
+    benchmark.add_argument("--output", type=Path, required=True, help="Parquet to write.")
+    benchmark.add_argument(
+        "--append", action="store_true",
+        help="Add to an existing --output, e.g. a GPU job after a CPU one.",
+    )
+    benchmark.add_argument("--threads", type=int)
+    benchmark.set_defaults(func=_cmd_benchmark, no_management=False)
 
     export_regions = sub.add_parser(
         "export-regions",
@@ -484,6 +692,98 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     export_regions.add_argument("--out-dir", type=Path, required=True)
     export_regions.set_defaults(func=_cmd_export_regions)
+
+    workspace = sub.add_parser(
+        "workspace",
+        help="Write a torchcrop run's workspace/: crop_<crop>.yaml, run config "
+        "and the audit against SIMPLACE's crop file.",
+    )
+    workspace.add_argument("--config", type=Path, required=True)
+    workspace.add_argument(
+        "--out-dir", type=Path, required=True, help="workspace/ is created under this."
+    )
+    workspace.add_argument("--crop-source", choices=("torchcrop", "simplace"), default="torchcrop")
+    workspace.add_argument(
+        "--crop-xml", type=Path,
+        help="SIMPLACE crop.xml: the source for --crop-source simplace, and the "
+        "audit either way. Use the SUSTAg LINTUL5_crop.xml with --simplace-crop "
+        "WW; left out, callers fall back to Brandenburg's crop.xml.",
+    )
+    workspace.add_argument(
+        "--simplace-crop",
+        help="The <crop> block in --crop-xml (e.g. WW); required for a multi-crop file.",
+    )
+    workspace.add_argument("--seeds-xml", type=Path)
+    workspace.add_argument(
+        "--seeds-crop",
+        help="The <crop> block in --seeds-xml. It keys on long names "
+        "(winter_wheat) where the crop file uses codes (WW).",
+    )
+    workspace.add_argument("--management-xml", type=Path)
+    workspace.set_defaults(func=_cmd_workspace)
+
+    smoke_parser = sub.add_parser(
+        "smoke",
+        help="The German smoke test: config, cells, both models, validation.",
+    )
+    steps = smoke_parser.add_subparsers(dest="smoke_command", required=True)
+
+    step = steps.add_parser("config", help="Derive the smoke config from the main one.")
+    step.add_argument("--config", type=Path, required=True, help="The main run config.")
+    step.add_argument("--out", type=Path, required=True)
+    step.add_argument("--start-year", type=int, required=True)
+    step.add_argument("--end-year", type=int, required=True)
+    step.add_argument("--run-name", default="de_smoke")
+    step.add_argument(
+        "--iopt", type=int, choices=[1, 2, 3, 4],
+        help="Override both models' iopt; SIMPLACE has no CLI override for it.",
+    )
+
+    step = steps.add_parser("cells", help="Pick a spread of German cropland cells.")
+    step.add_argument("--config", type=Path, required=True)
+    step.add_argument("--n-cells", type=int, default=40)
+    step.add_argument("--out", type=Path, required=True)
+    step.add_argument("--composition", type=Path)
+
+    step = steps.add_parser("simplace", help="Build, run and collect SIMPLACE on a cell list.")
+    step.add_argument("--config", type=Path, required=True)
+    step.add_argument("--cells", type=Path, required=True, help="CSV with a SimplaceID column.")
+    step.add_argument("--out", type=Path, required=True)
+    step.add_argument("--debug", action="store_true")
+
+    step = steps.add_parser("torchcrop", help="Run torchcrop on the same cell list.")
+    step.add_argument("--config", type=Path, required=True)
+    step.add_argument("--cells", type=Path, required=True, help="CSV with a SimplaceID column.")
+    step.add_argument("--out", type=Path, required=True)
+    step.add_argument(
+        "--years", type=int, nargs="+",
+        help="Harvest years; default the config's season.start_year..end_year.",
+    )
+    step.add_argument(
+        "--sowing-file", type=Path,
+        help="(SimplaceID, year, sowing_doy) to sow on instead of the export's calendar.",
+    )
+    step.add_argument(
+        "--crop-file", type=Path,
+        help="A workspace crop_<crop>.yaml; without it torchcrop's bundled preset is used.",
+    )
+    step.add_argument(
+        "--daily", action="store_true",
+        help="Write per-day trajectories to --out instead of summaries.",
+    )
+    step.add_argument(
+        "--daily-out", type=Path,
+        help="Also write per-day trajectories here, from the same simulation.",
+    )
+    step.add_argument("--daily-variables", nargs="+", help="Daily series to keep (default all).")
+    step.add_argument("--iopt", type=int, choices=[1, 2, 3, 4])
+
+    step = steps.add_parser("validate", help="Score the runs against CyBench and PEP725.")
+    step.add_argument("--cells", type=Path, required=True)
+    step.add_argument("--simplace", type=Path, required=True)
+    step.add_argument("--torchcrop", type=Path)
+    step.add_argument("--out-dir", type=Path, required=True)
+    smoke_parser.set_defaults(func=_cmd_smoke)
     return parser
 
 

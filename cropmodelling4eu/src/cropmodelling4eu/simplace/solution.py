@@ -195,6 +195,52 @@ class SolutionDocument:
         statement.text = text
         return text
 
+    def rewire_co2_annual(
+        self, filename: str, scalar: str = "gcm_rcp_scenario.vCO2"
+    ) -> int:
+        """Read CO2 from a ``year,co2_ppm`` table keyed on the simulated year.
+
+        The SUSTAg solutions take CO2 from ``ClimPerCO2.csv`` through a
+        ``frequence="ONCE"`` resource, so one value holds for a whole
+        simulation -- harmless over 1979-2024 at a fixed 360 ppm, wrong for a
+        1850-2014 CMIP6 run whose forcing rose 113 ppm. This adds a ``DAILY``
+        resource keyed on ``CURRENT.YEAR`` and points every consumer of
+        ``scalar`` at it: component ``<input source=...>`` and the
+        ``${...}`` references inside rules and ``skip`` guards.
+
+        Returns the number of references rewired; raises if there were none,
+        since a solution that never read the scalar would ignore the table.
+        """
+        annual = "co2_annual.co2_ppm"
+        interfaces, resources = self.root.find(".//interfaces"), self.root.find(".//resources")
+        if interfaces is None or resources is None:
+            raise KeyError(f"solution {self.path.name} has no <interfaces>/<resources>")
+        if self.root.find(".//resource[@id='co2_annual']") is None:
+            interface = etree.SubElement(interfaces, "interface", id="co2_annual_file", type="CSV")
+            etree.SubElement(interface, "poolsize").text = "1"
+            etree.SubElement(interface, "divider").text = ","
+            etree.SubElement(interface, "filename").text = filename
+            resource = etree.SubElement(
+                resources, "resource", id="co2_annual", interface="co2_annual_file",
+                frequence="DAILY", dbcache="FALSE",
+            )
+            header = etree.SubElement(resource, "header")
+            etree.SubElement(header, "res", id="year", datatype="INT", key="CURRENT.YEAR")
+            etree.SubElement(header, "res", id="co2_ppm", datatype="DOUBLE")
+
+        changed = 0
+        for element in self.root.iter(etree.Element):
+            for attr, value in element.attrib.items():
+                if attr == "source" and value == scalar:
+                    element.set(attr, annual)
+                    changed += 1
+                elif "${" + scalar + "}" in value:
+                    element.set(attr, value.replace("${" + scalar + "}", "${" + annual + "}"))
+                    changed += 1
+        if not changed:
+            raise KeyError(f"solution {self.path.name} never reads {scalar}")
+        return changed
+
     def write(self, path: str | Path) -> Path:
         """Write the (possibly modified) document, keeping its DOCTYPE."""
         out = Path(path)

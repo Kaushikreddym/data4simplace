@@ -61,7 +61,12 @@ from data4simplace.site import (
     write_co2_series,
 )
 from data4simplace.soil import SoilGridsHandler
-from data4simplace.spatial import apply_cell_mask, export_cell_mask, keep_cells
+from data4simplace.spatial import (
+    apply_cell_mask,
+    base_export_cells,
+    export_cell_mask,
+    keep_cells,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -154,6 +159,16 @@ def _run_tile(
             f"Tile {w.name} grid {tgrid.shape} != window {(w.r1 - w.r0, w.c1 - w.c0)}"
         )
 
+    # The base export's cells, cut to this tile. Resolved before any read: a
+    # scenario run over a regional source skips most of the grid, and a tile
+    # holding none of the base cells must not read 165 years of climate first.
+    within = base_export_cells(config)
+    if within is not None:
+        within = within.isel(lat=slice(w.r0, w.r1), lon=slice(w.c0, w.c1))
+        if not within.values.any():
+            logger.info("Tile %s: none of the paths.cell_set_from cells; skipping", w.name)
+            return 0
+
     climate = MSWXHandler(tcfg).load() if flags.run_climate_processing else None
     soil = hydraulic = None
     top_classes = None
@@ -180,7 +195,7 @@ def _run_tile(
     # SimplaceIDs in an existing soil.csv index the whole target grid, so they
     # cannot be unflattened onto it. A tiled run with the soil stage off keeps
     # the cropland-only cell set it has always kept.
-    mask = export_cell_mask(tcfg, tgrid, soil, soil_export_fallback=False)
+    mask = export_cell_mask(tcfg, tgrid, soil, soil_export_fallback=False, within=within)
     climate = apply_cell_mask(climate, mask) if climate is not None else None
     soil = apply_cell_mask(soil, mask) if soil is not None else None
     hydraulic = apply_cell_mask(hydraulic, mask) if hydraulic is not None else None
@@ -215,6 +230,10 @@ def _run_tile(
             nc_dir / f"irrigation_class_{irrigation.crop_group}_{w.name}.nc"
         )
 
+    if flags.export_simplace_weather and climate is None:
+        logger.info("Tile %s: no climate for its %d cells; no weather written", w.name, len(ct))
+        if flags.run_climate_processing and not flags.run_soil_processing:
+            return 0
     if flags.export_simplace_weather and climate is not None:
         WeatherExporter(tcfg, tcfg.reference.weather_dir).export(climate, ct, out_dir)
 
@@ -439,7 +458,9 @@ def combine_tiles(
             site_rows = sum(1 for _ in site_path.open()) - 1
         # The CO2 series is global, so it is written once at combine time
         # rather than sharded and re-written identically by every tile.
-        series, source = load_co2_series(config.paths.co2_file, _simulated_years(config))
+        series, source = load_co2_series(
+            config.paths.co2_file, _simulated_years(config), config.site.co2_hold_year
+        )
         write_co2_series(series, source, out_dir)
 
     weather_files = len(list((out_dir / "weather").glob("*.csv.gz")))
@@ -598,7 +619,9 @@ def run_tiled(
             )
     if config.flags.export_simplace_site:
         _concat_shards(_site_shard_dir(out_dir), out_dir / "site" / "site.csv", label="site")
-        series, source = load_co2_series(config.paths.co2_file, _simulated_years(config))
+        series, source = load_co2_series(
+            config.paths.co2_file, _simulated_years(config), config.site.co2_hold_year
+        )
         write_co2_series(series, source, out_dir)
     if config.flags.export_simplace_management:
         crop = config.npk.simplace_crop

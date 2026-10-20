@@ -184,3 +184,38 @@ Carried over from the notebook's gap analysis — these bound what the maps mean
   so `TC_IOPT=3` behaves much like `TC_IOPT=2` and the NNI map sits near 1.
 - **`TC_IOPT=4` is not data-driven** — no European soil P or K layer exists, so
   it would run on torchcrop's built-in default pools.
+
+## Known torchcrop limitations
+
+Upstream defects that `cropmodelling4eu` works around rather than fixes. Each one names
+its workaround, so the workaround can be deleted when the defect is fixed.
+
+- **Per-row tables fail in the emergence seed bootstrap.**
+  `Lintul5Model._compute_rates_dispatch` (`torchcrop/model.py:879-900`) evaluates
+  `frtb`, `fltb`, `fstb`, `fotb`, `slatb`, `nmxlv`, `pmxlv` and `kmxlv` at the scalar
+  `dvsi` and forces each result to `.reshape(())`. With a `[B, N, 2]` table it raises
+  `batch size mismatch between table (B) and x (1)`. Every other crop field runs per row
+  bit-identically to a per-region pass (checked across all 42 calibrated fields), and
+  `functions/interpolation.py` already takes `[B, N, 2]`, so this one block is the only
+  obstacle.
+  - *Consequence:* calibration batches can mix regions only in a stage whose regions do
+    not differ in those tables. Phenology mixes; yield calibrates `fltb/fstb/fotb` and
+    falls back to region-packed batches on the forked pool.
+  - *Workaround:* `calibration.problem.row_tables_supported()` probes the installed
+    torchcrop, and `Calibrator.mixes_regions()` chooses region-packed batches with a
+    warning. Nothing needs removing once upstream is fixed: the probe flips and the
+    yield stage mixes automatically.
+  - *Fix (upstream, tested in memory):* evaluate at `dvsi` expanded to `[B]` when the
+    table is 3-D, and keep the `reshape(())` path for 2-D tables.
+- **`Lintul5Model.to()` does not move the parameter dataclasses.** The crop, soil and
+  site containers are plain dataclasses, not modules, so a model moved to CUDA keeps CPU
+  parameters. *Workaround:* `calibration.problem.stack_crops` moves every crop field to
+  the batch device, and `RegionManager.materialize` moves its table snapshots alongside
+  the latents.
+- **`CalibrationManager.materialize` leaves autograd graphs in the containers**
+  (scalar targets are never laundered). *Workaround:*
+  `RegionManager.detach_containers`, called at stage boundaries.
+- **The day loop is Python and launch-bound.** Every day launches several hundred
+  `[B]`-shaped kernels, so threads add nothing on CPU, and a V100 at B = 4096 runs about
+  1.8x *slower* than 4 CPU cores (`cm_calib` 858786 vs 858762). A GPU pays off only at
+  much larger B, or once the step is compiled.

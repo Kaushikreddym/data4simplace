@@ -41,7 +41,7 @@ own `management2`/`fertilizerparameters` pair already work.
 
 === Usage ===
   simplace.solution_file: this file
-  simplace.template_dir:  /data01/FDS/muduchuru/Data/SIMPLACE/Rotation_monocrop
+  simplace.template_dir:  /data01/FDS/muduchuru/Data/SIMPLACE/TEMPLATES/Rotation_monocrop
   simplace.weather_contract: null      # the solution reads the export as written
 
 WIKI_END</description>

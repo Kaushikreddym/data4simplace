@@ -8,14 +8,13 @@ area-weights them to the unit mean before comparing.
 
 Two constraints shape everything here.
 
-**A batch may carry one region's parameters and one calendar axis.**
-``torchcrop.calibration.paths.rebuild_table`` assembles an ``[N, 2]`` table
-from *scalar* ordinates, so a table parameter cannot be ``[B]``-shaped the way
-a scalar field can — and every stage calibrates tables. Separately, the
-simulation engine derives day-of-year from a single scalar ``start_doy`` for
-the whole batch. Both are satisfied by batching within one ``(region, year)``,
-which the region-and-year-stratified sampler produces anyway; the region's
-anchor sowing day is the axis, and each cell still latches on its own ``idpl``.
+**A batch shares one calendar axis.** The simulation engine derives
+day-of-year from a single scalar ``start_doy`` for the whole batch, and each
+cell still latches on its own ``idpl``. By default the axis is the region's
+anchor (its earliest sower), which confines a batch to one region; with
+``DataConfig.start_doy`` every window in the pool opens on the same day, and a
+batch may span regions and years — each row then carries its own region's
+parameters (see :meth:`CalibrationProblem.batch_crop`).
 
 **Weather caching is the biggest speed decision.** The production runner reads
 each cell's 46-year gzip once; a calibration run revisits the same cells every
@@ -164,11 +163,31 @@ def build_pool(
             pool.groupby("SimplaceID")["sowing_doy"].std().mean(),
         )
 
-    # One anchor per region, not per cell: the batch's calendar axis has to be
-    # shared, and the earliest sower in the region is the only anchor every
-    # cell in it can latch inside. With a simulated table the minimum is over
-    # (cell, season), so a region's anchor also covers its earliest *year*.
-    pool["anchor_doy"] = pool.groupby("region_id")["sowing_doy"].transform("min")
+    # The engine wraps its calendar at 365, so a DOY-366 sower never latches.
+    pool["sowing_doy"] = pool["sowing_doy"].clip(upper=365)
+
+    if settings.start_doy is None:
+        # One anchor per region, not per cell: the batch's calendar axis has to
+        # be shared, and the earliest sower in the region is the only anchor
+        # every cell in it can latch inside. With a simulated table the minimum
+        # is over (cell, season), so a region's anchor also covers its earliest
+        # *year*.
+        pool["anchor_doy"] = pool.groupby("region_id")["sowing_doy"].transform("min")
+    else:
+        # One axis for the whole pool, so a batch can span regions. A sower
+        # before the window opens would latch on day 0 (``doy >= idpl`` is
+        # already true there) — the January sowing of a December-opened
+        # window — so it is dropped rather than simulated from the wrong day.
+        early = pool["sowing_doy"] < settings.start_doy
+        if early.any():
+            logger.warning(
+                "%d of %d pooled rows sow before data.start_doy %d (earliest "
+                "DOY %d) and are dropped",
+                int(early.sum()), len(pool), settings.start_doy,
+                int(pool.loc[early, "sowing_doy"].min()),
+            )
+            pool = pool[~early].reset_index(drop=True)
+        pool["anchor_doy"] = settings.start_doy + settings.pre_days
 
     # The window has to reach from the anchor to the region's latest sower plus
     # a whole season; if that span eats into `window_days` the late sowers'
@@ -351,24 +370,24 @@ class WeatherCache:
 
 @dataclass(frozen=True, slots=True)
 class RegionBatch:
-    """One forward pass: one region, and the ``(unit, year)`` observations in it.
+    """One forward pass: the ``(unit, year)`` observations drawn, and their cells.
 
-    **One region, several years.** The region is forced — a table ordinate
-    cannot be ``[B]``-shaped. The years are not: every window in a region opens
-    on the same *day-of-year* (the region's anchor sowing day minus
-    ``pre_days``), so seasons from different harvest years share one relative
-    time axis and one scalar ``start_doy`` even though their calendar dates
-    differ. Allowing them into one batch is what makes the batches full: with
-    835 units over 33 regions and 8 seasons, a 20 % draw gives a region-year
-    about five units — some 40 cells against a 192 limit — and LINTUL-5's day
-    loop costs almost the same at 40 cells as at 192, so year-homogeneous
-    batches would waste four fifths of every forward pass.
+    **Several years, and with a global start several regions.** Every window
+    opens on the same *day-of-year*, so seasons from different harvest years
+    share one relative time axis and one scalar ``start_doy`` even though their
+    calendar dates differ. Allowing them into one batch is what makes the
+    batches full: with 835 units over 33 regions and 8 seasons, a 20 % draw
+    gives a region-year about five units — some 40 cells against a 192 limit —
+    and LINTUL-5's day loop costs almost the same at 40 cells as at 192, so
+    year-homogeneous batches would waste four fifths of every forward pass.
+    Under ``DataConfig.start_doy`` the same argument extends across regions,
+    which is what lets a GPU see thousands of rows at once.
 
     ``start_doy`` is still checked, not assumed: a cell whose weather record is
     front-truncated would otherwise be dated against a window it does not have.
 
     Attributes:
-        region_id: The region whose parameter set this batch materialises.
+        region_ids: ``[B]`` region whose parameter set each row runs on.
         ids: ``[B]`` ``SimplaceID`` per simulated cell.
         years: ``[B]`` harvest year per simulated cell. CO2 and the observation
             alignment are per season, so this is per cell, not per batch.
@@ -385,7 +404,7 @@ class RegionBatch:
         unit_years: ``[n_units]`` harvest year per segment.
     """
 
-    region_id: int
+    region_ids: np.ndarray
     ids: np.ndarray
     years: np.ndarray
     weather: np.ndarray
@@ -399,6 +418,34 @@ class RegionBatch:
     @property
     def n_units(self) -> int:
         return len(self.units)
+
+    @property
+    def regions(self) -> tuple[int, ...]:
+        """The distinct regions in the batch, ascending."""
+        return tuple(int(r) for r in np.unique(self.region_ids))
+
+    @property
+    def region_id(self) -> int:
+        """The batch's one region; for the single-region diagnostics.
+
+        Raises:
+            ValueError: If the batch spans more than one region.
+        """
+        regions = self.regions
+        if len(regions) != 1:
+            raise ValueError(f"batch spans regions {regions}, not one")
+        return regions[0]
+
+    @property
+    def unit_regions(self) -> np.ndarray:
+        """``[n_units]`` region of each unit-year segment."""
+        out = np.empty(self.n_units, dtype=np.int64)
+        out[self.unit_index] = self.region_ids
+        return out
+
+    def rows_of(self, region: int) -> np.ndarray:
+        """Row indices of one region, in batch order."""
+        return np.flatnonzero(self.region_ids == region)
 
 
 @dataclass(slots=True)
@@ -448,15 +495,10 @@ def collate_region_batch(
     """Gather the cells of a drawn set of unit-years into one forward pass.
 
     Raises:
-        ValueError: If the draw spans more than one region, or if its windows
-            do not all open on the same day-of-year. Both are checked rather
-            than assumed: the first is the table-ordinate constraint and the
-            second is what a front-truncated weather record looks like.
+        ValueError: If its windows do not all open on the same day-of-year —
+            two regions under per-region anchors, or a front-truncated weather
+            record.
     """
-    regions = unit_years["region_id"].unique()
-    if len(regions) != 1:
-        raise ValueError(f"a batch must be one region; got {regions}")
-
     keys = set(map(tuple, unit_years[["unit", "year"]].to_numpy()))
     rows = dataset.pool[
         [
@@ -491,7 +533,7 @@ def collate_region_batch(
     )
 
     return RegionBatch(
-        region_id=int(regions[0]),
+        region_ids=rows["region_id"].to_numpy(np.int64),
         ids=rows["SimplaceID"].to_numpy(np.int64),
         years=rows["year"].to_numpy(np.int64),
         weather=dataset.weather.block(cache_rows),
@@ -510,8 +552,9 @@ class StratifiedFractionSampler:
     * **Without replacement within an epoch.** An unstratified draw can
       silently produce a "wet years only" epoch, and the parameters will chase
       it.
-    * **Region- and year-homogeneous batches**, which the table-ordinate
-      constraint and the shared calendar axis both force (see the module
+    * **Region-homogeneous batches** under per-region anchors, which the shared
+      calendar axis forces; **mixed-region batches** with ``mix_regions``,
+      which a global ``DataConfig.start_doy`` allows (see the module
       docstring).
     * **Deterministic per-epoch seeding**, so a killed run resumes the
       identical sequence.
@@ -529,6 +572,7 @@ class StratifiedFractionSampler:
         batch_size: int = 192,
         strata: tuple[str, ...] = ("region_id", "year"),
         seed: int = 0,
+        mix_regions: bool = False,
     ) -> None:
         if not 0.0 < fraction <= 1.0:
             raise ValueError(f"fraction must be in (0, 1]; got {fraction}")
@@ -540,6 +584,7 @@ class StratifiedFractionSampler:
         self.batch_size = batch_size
         self.strata = strata
         self.seed = seed
+        self.mix_regions = mix_regions
 
     def epoch(self, epoch: int) -> list[pd.DataFrame]:
         """The batches of one epoch, as drawn ``(unit, year)`` frames."""
@@ -554,11 +599,16 @@ class StratifiedFractionSampler:
             drawn.append(block.iloc[np.sort(picked)])
 
         # Stratify the *draw* by region and year; pack the *batches* by region
-        # only. The year stratification is what stops a "wet years only" epoch;
-        # the region homogeneity is what the table ordinates force. Mixing
-        # years inside a region costs nothing (they share a day-of-year axis,
-        # see `RegionBatch`) and is what keeps a batch full.
+        # only, or not at all. The year stratification is what stops a "wet
+        # years only" epoch; region homogeneity is what a per-region calendar
+        # axis forces. Mixing years (and, on a global axis, regions) costs
+        # nothing — they share a day-of-year axis, see `RegionBatch` — and is
+        # what keeps a batch full.
         pooled = pd.concat(drawn, ignore_index=True) if drawn else self.unit_years
+        if self.mix_regions:
+            batches = self._pack(pooled.sample(frac=1.0, random_state=epoch))
+            rng.shuffle(batches)
+            return batches
         batches = [
             chunk
             for _, block in pooled.groupby("region_id", observed=True, sort=True)

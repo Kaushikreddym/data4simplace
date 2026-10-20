@@ -5,6 +5,7 @@
 #   ./submit/submit_torchcrop.sh              # submit all shards, then maps
 #   ./submit/submit_torchcrop.sh --retry      # submit only the missing shards
 #   ./submit/submit_torchcrop.sh --dry-run    # print the plan, submit nothing
+#   ./submit/submit_torchcrop.sh --prepare    # write workspace/ (crop, config, audit), submit nothing
 #   ./submit/submit_torchcrop.sh --no-maps    # shard array only
 #   ./submit/submit_torchcrop.sh --maps-only  # re-render maps from the shards
 #   ./submit/submit_torchcrop.sh --smoke      # 30 German cells, run here, then evaluate
@@ -33,14 +34,16 @@ RETRY=0
 DO_MAPS=1
 MAPS_ONLY=0
 SMOKE=0
+PREPARE=0
 for arg in "$@"; do
     case "${arg}" in
         --dry-run)   DRY_RUN=1 ;;
+        --prepare)   PREPARE=1 ;;
         --retry)     RETRY=1 ;;
         --no-maps)   DO_MAPS=0 ;;
         --maps-only) MAPS_ONLY=1 ;;
         --smoke)     SMOKE=1 ;;
-        -h|--help)   sed -n '2,23p' "${BASH_SOURCE[0]}"; exit 0 ;;
+        -h|--help)   sed -n '2,24p' "${BASH_SOURCE[0]}"; exit 0 ;;
         *) echo "Unknown option: ${arg}" >&2; exit 2 ;;
     esac
 done
@@ -48,8 +51,8 @@ done
 # The shard flags describe an array job the smoke test does not submit, so a
 # combination is a misunderstanding rather than something to resolve silently.
 if [ "${SMOKE}" -eq 1 ] && { [ "${RETRY}" -eq 1 ] || [ "${MAPS_ONLY}" -eq 1 ] \
-    || [ "${DO_MAPS}" -eq 0 ]; }; then
-    echo "--smoke runs no array and no maps; drop --retry/--maps-only/--no-maps." >&2
+    || [ "${DO_MAPS}" -eq 0 ] || [ "${PREPARE}" -eq 1 ]; }; then
+    echo "--smoke runs no array and no maps; drop --retry/--maps-only/--no-maps/--prepare." >&2
     exit 2
 fi
 
@@ -59,7 +62,7 @@ cd "${TC_PROJECT_DIR}" || exit 1
 # --- Smoke test ---------------------------------------------------------------
 # Runs in the foreground: 30 cells over 3 seasons is seconds of model time, and
 # the point is to look at the answer rather than to queue it. The cells go
-# through scripts/run_cells_torchcrop.py, not run_shard, because a shard deals
+# through cm4eu smoke torchcrop, not run_shard, because a shard deals
 # cells round-robin out of the whole runnable set — right for the array job and
 # wrong here, where the whole point is to run *these* cells, the ones SIMPLACE
 # gets.
@@ -97,13 +100,13 @@ if [ "${SMOKE}" -eq 1 ]; then
     fi
 
     mkdir -p "${TC_SMOKE_DIR}"
-    python scripts/make_smoke_config.py --config "${TC_CONFIG}" \
+    cm4eu smoke config --config "${TC_CONFIG}" \
         --out "${SMOKE_CONFIG}" \
         --start-year "${TC_SMOKE_START}" --end-year "${TC_SMOKE_END}" || exit 1
 
     if [ ! -f "${CELLS}" ]; then
         echo "Selecting ${TC_SMOKE_CELLS} German cells (one per NUTS-3 region)..."
-        python scripts/select_german_cells.py --config "${SMOKE_CONFIG}" \
+        cm4eu smoke cells --config "${SMOKE_CONFIG}" \
             --n-cells "${TC_SMOKE_CELLS}" --out "${CELLS}" || exit 1
     else
         echo "Reusing the cell list at ${CELLS} ($(( $(wc -l < "${CELLS}") - 1 )) cells)."
@@ -114,7 +117,7 @@ if [ "${SMOKE}" -eq 1 ]; then
 TC_CROP_XML_PATH="${TC_CROP_XML:-${TC_TEMPLATE_DATA}/crop/crop.xml}"
 TC_CROP_BLOCK_ARG=()
 [ -n "${TC_SIMPLACE_CROP:-}" ] && TC_CROP_BLOCK_ARG=(--simplace-crop "${TC_SIMPLACE_CROP}")
-    python scripts/prepare_torchcrop_workspace.py --config "${SMOKE_CONFIG}" \
+    cm4eu workspace --config "${SMOKE_CONFIG}" \
         --out-dir "${SMOKE_TC_DIR}" --crop-source "${TC_SMOKE_CROP_SOURCE}" \
         --crop-xml "${TC_CROP_XML_PATH}" \
         ${TC_CROP_BLOCK_ARG[@]:+"${TC_CROP_BLOCK_ARG[@]}"} \
@@ -144,7 +147,7 @@ TC_CROP_BLOCK_ARG=()
         SMOKE_DAILY_OUTS+=("${DAILY_OUT}")
 
         echo "--- iopt=${IOPT} ---"
-        python scripts/run_cells_torchcrop.py --config "${SMOKE_CONFIG}" \
+        cm4eu smoke torchcrop --config "${SMOKE_CONFIG}" \
             --cells "${CELLS}" --crop-file "${SMOKE_CROP_FILE}" --iopt "${IOPT}" \
             --out "${OUT}" --daily-out "${DAILY_OUT}" \
             --daily-variables ${TC_DAILY_VARIABLES} || exit 1
@@ -170,7 +173,7 @@ TC_CROP_BLOCK_ARG=()
         echo "(the CLI takes one torchcrop file; pick the same IOPT SIMPLACE"
         echo "was built with -- 3 below, matching this file's own directory):"
         echo ""
-        echo "  python scripts/validate_germany.py --cells ${CELLS} \\"
+        echo "  cm4eu smoke validate --cells ${CELLS} \\"
         echo "      --torchcrop ${SMOKE_TC_DIR}/de_torchcrop_iopt3.parquet \\"
         echo "      --simplace ${SIMPLACE_OUT} \\"
         echo "      --out-dir ${TC_SMOKE_DIR}/validation"
@@ -178,7 +181,7 @@ TC_CROP_BLOCK_ARG=()
         echo "Or open evaluation/germany_smoke_evaluation.ipynb, which loads all"
         echo "three IOPT runs beside SIMPLACE and plots the sweep."
     else
-        # validate_germany.py takes --simplace as required: the comparison is
+        # `cm4eu smoke validate` takes --simplace as required: the comparison is
         # the deliverable, and a torchcrop-only score answers half the question.
         echo "No SIMPLACE run beside it yet. Produce one on the same cells with:"
         echo ""
@@ -267,7 +270,7 @@ TC_TEMPLATE_DATA="${TC_SIMPLACE_TEMPLATE}/data"
 TC_CROP_XML_PATH="${TC_CROP_XML:-${TC_TEMPLATE_DATA}/crop/crop.xml}"
 TC_CROP_BLOCK_ARG=()
 [ -n "${TC_SIMPLACE_CROP:-}" ] && TC_CROP_BLOCK_ARG=(--simplace-crop "${TC_SIMPLACE_CROP}")
-python scripts/prepare_torchcrop_workspace.py --config "${TC_CONFIG}" \
+cm4eu workspace --config "${TC_CONFIG}" \
     --out-dir "${TC_OUT_DIR}" --crop-source "${TC_CROP_SOURCE}" \
     --crop-xml "${TC_CROP_XML_PATH}" \
         ${TC_CROP_BLOCK_ARG[@]:+"${TC_CROP_BLOCK_ARG[@]}"} \
@@ -275,6 +278,25 @@ python scripts/prepare_torchcrop_workspace.py --config "${TC_CONFIG}" \
         --seeds-crop "${TC_SEEDS_CROP:-winter_wheat}" \
     --management-xml "${TC_TEMPLATE_DATA}/management/management.xml" \
     > /dev/null || { echo "ERROR: could not prepare the workspace" >&2; exit 1; }
+
+# Which SIMPLACE crop file the workspace crop came from. An empty TC_CROP_XML
+# falls back to the Brandenburg template, which is a different crop from the
+# SUSTAg WW block the production SIMPLACE run reads -- how the euval workspace
+# silently regressed on 2026-10-01.
+CROP_SOURCE_FILE=$(sed -n 's/^source_file: *//p' "${TC_CROP_FILE}" 2>/dev/null)
+echo "crop source  : ${CROP_SOURCE_FILE:-unknown}${TC_SIMPLACE_CROP:+ (block ${TC_SIMPLACE_CROP})}"
+case "${CROP_SOURCE_FILE}" in
+    *Brandenburg*)
+        echo "WARNING: ${TC_CROP_FILE} is the Brandenburg crop, not the SUSTAg WW one" >&2
+        echo "         the production SIMPLACE run uses. For a comparable run set" >&2
+        echo "         TC_CROP_XML=/data01/FDS/muduchuru/Data/SIMPLACE/TEMPLATES/Rotation_monocrop/data/crop/LINTUL5_crop.xml TC_SIMPLACE_CROP=WW" >&2
+        ;;
+esac
+
+if [ "${PREPARE}" -eq 1 ]; then
+    echo "--prepare: workspace written to ${TC_WORK_DIR}, nothing submitted."
+    exit 0
+fi
 
 # --- 1. Shard array -----------------------------------------------------------
 ARRAY_JOB=""

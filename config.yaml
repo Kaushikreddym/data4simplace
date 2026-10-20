@@ -98,7 +98,7 @@ reference:
   # columns, and columns SoilGrids cannot derive (alfa, n, ksat, RootingDepth,
   # ...) are carried over from the file's own first row so the output runs.
   # null -> the built-in EU SUSTAg spelling.
-  soil_file_long: "/data01/FDS/muduchuru/Data/SIMPLACE/Rotation_monocrop/data/soil/SLIM_soil_EU_SUSTAg.csv"
+  soil_file_long: "/data01/FDS/muduchuru/Data/SIMPLACE/TEMPLATES/Rotation_monocrop/data/soil/SLIM_soil_EU_SUSTAg.csv"
   management_file_long: null
 
 # --- Export layout -----------------------------------------------------------
@@ -125,6 +125,13 @@ export:
 
 # --- MSWX variable folder -> canonical name mapping --------------------------
 climate:
+  # mswx | cmip6_bc. A CMIP6 run is derived from this file by
+  # submit/submit_cmip6.sh rather than edited here: it sets source, experiment,
+  # layout, required, paths.cmip6_bc_root, paths.cell_set_from and the window.
+  source: mswx
+  experiment: null          # cmip6_bc: <model>_<experiment>, e.g. MIROC6_hist-aer
+  layout: daily             # daily | yearly (climdata's _yearly_cache, ~15x fewer opens)
+  required: []              # canonical names that must load, else --dry-run fails
   variables:
     TASMIN: tasmin      # daily minimum air temperature [degC]
     TASMAX: tasmax      # daily maximum air temperature [degC]

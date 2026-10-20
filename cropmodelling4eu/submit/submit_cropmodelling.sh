@@ -4,6 +4,7 @@
 #
 #   ./submit/submit_cropmodelling.sh              # build, then submit the chain
 #   ./submit/submit_cropmodelling.sh --build-only # build and validate, submit nothing
+#   ./submit/submit_cropmodelling.sh --prepare    # --build-only, plus torchcrop's workspace/
 #   ./submit/submit_cropmodelling.sh --dry-run    # print the plan, submit nothing
 #   ./submit/submit_cropmodelling.sh --status     # what each stage has finished
 #   ./submit/submit_cropmodelling.sh --retry      # rebuild, then re-run what failed
@@ -33,15 +34,17 @@ DRY_RUN=0
 STATUS=0
 RETRY=0
 SMOKE=0
+PREPARE=0
 
 for arg in "$@"; do
     case "${arg}" in
         --build-only) BUILD_ONLY=1 ;;
+        --prepare)    PREPARE=1 ;;
         --dry-run)    DRY_RUN=1 ;;
         --status)     STATUS=1 ;;
         --retry)      RETRY=1 ;;
         --smoke)      SMOKE=1 ;;
-        -h|--help)    sed -n '2,14p' "${BASH_SOURCE[0]}"; exit 0 ;;
+        -h|--help)    sed -n '2,15p' "${BASH_SOURCE[0]}"; exit 0 ;;
         *)            echo "ERROR: Unknown option '${arg}'" >&2; exit 2 ;;
     esac
 done
@@ -85,7 +88,7 @@ if [[ "${SMOKE}" -eq 1 ]]; then
         exit 0
     fi
 
-    python scripts/make_smoke_config.py \
+    cm4eu smoke config \
         --config "${SP_PROJECT_DIR}/config.yaml" \
         --out "${SMOKE_CONFIG}" \
         --start-year "${SP_SMOKE_START}" \
@@ -108,7 +111,7 @@ if [[ "${SMOKE}" -eq 1 ]]; then
     fi
     TC_CROP_BLOCK_ARG=()
     [ -n "${TC_SIMPLACE_CROP:-}" ] && TC_CROP_BLOCK_ARG=(--simplace-crop "${TC_SIMPLACE_CROP}")
-    python scripts/prepare_torchcrop_workspace.py \
+    cm4eu workspace \
         --config "${SMOKE_CONFIG}" \
         --out-dir "${SMOKE_TC_DIR}" \
         --crop-source "${TC_SMOKE_CROP_SOURCE}" \
@@ -146,7 +149,7 @@ if [[ "${SMOKE}" -eq 1 ]]; then
         echo "--- iopt=${IOPT}: torchcrop, on SIMPLACE's simulated sowing ---"
         echo "Handing $(( $(wc -l < "${SOWING}") - 1 )) simulated sowing dates to torchcrop..."
         
-        python scripts/run_cells_torchcrop.py \
+        cm4eu smoke torchcrop \
             --config "${SMOKE_CONFIG}" \
             --cells "${CELLS}" \
             --sowing-file "${SOWING}" \
@@ -175,7 +178,7 @@ if [[ "${SMOKE}" -eq 1 ]]; then
     echo "  audit     : ${SMOKE_TC_DIR}/workspace/crop_parameter_audit.csv"
     echo ""
     echo "Validation command:"
-    echo "  python scripts/validate_germany.py --cells ${CELLS} \\"
+    echo "  cm4eu smoke validate --cells ${CELLS} \\"
     echo "      --torchcrop ${SMOKE_TC_DIR}/de_torchcrop_iopt3.parquet \\"
     echo "      --simplace ${SP_SMOKE_DIR}/simplace_iopt3/simplace_europe.parquet \\"
     echo "      --out-dir ${SP_SMOKE_DIR}/validation"
@@ -250,6 +253,17 @@ if [[ -z "${TC_CROP_XML:-}" ]]; then
         echo "         ${TC_SIMPLACE_TEMPLATE}/data/crop/crop.xml, which is a" >&2
         echo "         different crop than this SIMPLACE run uses." >&2
     fi
+fi
+
+if [[ "${PREPARE}" -eq 1 ]]; then
+    # The torchcrop workspace is written against the crop file this SIMPLACE
+    # build just linked (TC_CROP_XML above), so both models start from one crop.
+    echo ""
+    "${SUBMIT_DIR}/submit_torchcrop.sh" --prepare || exit 1
+    echo ""
+    echo "--prepare: SIMPLACE built in ${RUN_DIR}, torchcrop workspace in ${TC_WORK_DIR};"
+    echo "           nothing submitted."
+    exit 0
 fi
 
 if [[ "${BUILD_ONLY}" -eq 1 ]]; then

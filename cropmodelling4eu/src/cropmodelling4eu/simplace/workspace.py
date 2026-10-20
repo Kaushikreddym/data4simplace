@@ -54,7 +54,7 @@ from typing import Optional
 import numpy as np
 
 from cropmodelling4eu.config import GridConfig, RunConfig, SimplaceConfig
-from cropmodelling4eu.export import ExportBundle
+from cropmodelling4eu.export import ExportBundle, read_co2
 from cropmodelling4eu.export.cells import id_to_rowcol, weather_path
 from cropmodelling4eu.simplace.project import (
     build_location_frame,
@@ -86,6 +86,9 @@ __all__ = ["Workspace", "build_workspace", "WEATHER_CONTRACTS"]
 #: ClimPerCO2.csv, ...) -- distinct from the export's soil.csv/soil_long.csv,
 #: which are linked separately below and always take precedence on a name clash.
 _LINKED_DATA_DIRS = ("crop", "slim", "soilcnp", "soil_cn", "soil", "project")
+
+#: The per-year CO2 table ``simplace.co2: annual`` writes into ``data/project/``.
+_CO2_ANNUAL = "co2_annual.csv"
 
 #: Files of ``data/management/`` taken from the template rather than the export.
 _LINKED_MANAGEMENT = ("management.xml", "fertilizer_composition.xml", "residues.csv")
@@ -392,6 +395,8 @@ def build_workspace(
         logger.info("Project capped to %d cells (even subsample)", ids.size)
 
     _populate_data(template, bundle, work_dir / "data", config.season.crop)
+    if settings.co2 == "annual":
+        _write_co2_annual(bundle.export_dir, settings, work_dir / "data")
 
     conversion = WEATHER_CONTRACTS.get(settings.weather_contract or "")
     convert_files = conversion is not None and settings.weather_conversion == "files"
@@ -541,7 +546,30 @@ def _write_solution_xml(
     )
     if conversion is not None:
         _scale_weather_transform(document, settings, conversion)
+    if settings.co2 == "annual":
+        n = document.rewire_co2_annual(f"${{_WORKDIR_}}/data/project/{_CO2_ANNUAL}")
+        logger.info("CO2 rewired to the per-year table at %d reference(s)", n)
     return document.write(work_dir / "solution" / document.path.name)
+
+
+def _write_co2_annual(export_dir: Path, settings: SimplaceConfig, work_data: Path) -> Path:
+    """``year,co2_ppm`` over the simulation window, from the export's series.
+
+    A plain table: SIMPLACE's CSV reader has no comment syntax, so the export's
+    ``#`` provenance line cannot travel with it.
+    """
+    years = list(range(int(settings.start_date[:4]), int(settings.end_date[:4]) + 1))
+    series = read_co2(export_dir, years)
+    path = work_data / "project" / _CO2_ANNUAL
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.is_symlink():
+        path.unlink()
+    series.round(3).rename("co2_ppm").rename_axis("year").reset_index().to_csv(path, index=False)
+    logger.info(
+        "SIMPLACE CO2 per year: %.1f ppm (%d) .. %.1f ppm (%d)",
+        series.iloc[0], years[0], series.iloc[-1], years[-1],
+    )
+    return path
 
 
 def _scale_weather_transform(

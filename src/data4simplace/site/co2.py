@@ -51,7 +51,9 @@ def _pick_column(frame: pd.DataFrame, candidates: tuple[str, ...], position: int
 
 
 def load_co2_series(
-    path: str | Path | None, years: range | list[int] | None = None
+    path: str | Path | None,
+    years: range | list[int] | None = None,
+    hold_year: int | None = None,
 ) -> tuple[pd.Series, str]:
     """Annual CO2 [ppm] indexed by year, plus the provenance of the series.
 
@@ -64,11 +66,17 @@ def load_co2_series(
         linearly interpolated; years outside it are carried from the nearest
         end and logged, because a crop run that silently drops a season is
         harder to notice than one that reuses a neighbouring year's CO2.
+    hold_year:
+        ``site.co2_hold_year``: every year takes this year's value instead, as
+        in DAMIP hist-aer, whose GCM kept well-mixed GHGs at 1850 levels. It
+        must lie inside the series -- extrapolating the one value a whole run
+        is held at would be a guess presented as forcing.
 
     Returns
     -------
     tuple
-        ``(series, source)`` where ``source`` is ``"file"`` or ``"fallback"``.
+        ``(series, source)`` where ``source`` is ``"file"`` or ``"fallback"``,
+        suffixed ``", held at <year>"`` under ``hold_year``.
 
     Raises
     ------
@@ -117,6 +125,19 @@ def load_co2_series(
         )
 
     series.index.name = "year"
+    if hold_year is not None:
+        if not series.index.min() <= hold_year <= series.index.max():
+            raise ValueError(
+                f"site.co2_hold_year {hold_year} lies outside the CO2 series "
+                f"{int(series.index.min())}-{int(series.index.max())}"
+            )
+        dense = series.reindex(range(int(series.index.min()), int(series.index.max()) + 1))
+        held = float(dense.interpolate().loc[hold_year])
+        index = pd.Index(
+            [int(y) for y in years] if years is not None else series.index, name="year"
+        )
+        logger.info("CO2 held at its %d value, %.2f ppm, for %d years", hold_year, held, len(index))
+        return pd.Series(held, index=index, name="co2_ppm"), f"{source}, held at {hold_year}"
     if years is None:
         return series.sort_index(), source
 

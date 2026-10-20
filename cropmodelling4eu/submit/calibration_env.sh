@@ -34,6 +34,14 @@ export CAL_OUT_DIR="${CAL_OUT_DIR:-${CAL_RUN_DIR}/calibration}"
 # `tsum1`, and no vernalisation block at all. Every number in CALIBRATION.md is
 # against the harmonised SUSTAg WW block, which is what this file is.
 export CAL_CROP_FILE="${CAL_CROP_FILE:-${CAL_RUN_DIR}/torchcrop/workspace/crop_wheat.yaml}"
+# What `submit_calibration.sh` builds CAL_CROP_FILE from when it is missing
+# (any mode but --dry-run): the SUSTAg file and block the production SIMPLACE run reads. Never
+# the Brandenburg template -- an empty crop xml falling back to it is how the
+# euval workspace crop regressed on 2026-10-01. Seeds and management stay on
+# the Brandenburg template, exactly as the production torchcrop workspace has them.
+export CAL_CROP_XML="${CAL_CROP_XML:-/data01/FDS/muduchuru/Data/SIMPLACE/TEMPLATES/Rotation_monocrop/data/crop/LINTUL5_crop.xml}"
+export CAL_SIMPLACE_CROP="${CAL_SIMPLACE_CROP:-WW}"
+export CAL_SEEDS_DATA="${CAL_SEEDS_DATA:-/data01/FDS/muduchuru/codes/SIMPLACE/Brandenburg_1KM_winter_wheat/data}"
 #
 # THE SOWING DATES. A *static* file written by `cm4eu simplace collect` from
 # the finished SIMPLACE run -- nothing here re-runs SIMPLACE. It is the sowing
@@ -42,7 +50,7 @@ export CAL_CROP_FILE="${CAL_CROP_FILE:-${CAL_RUN_DIR}/torchcrop/workspace/crop_w
 # 22 days later and gives every cell ONE fixed date for all seasons, which
 # would leave simulated emergence with no interannual variation at all -- the
 # very thing stage 1 exists to fit.
-export CAL_SOWING_FILE="${CAL_SOWING_FILE:-${CAL_RUN_DIR}/simplace/sowing_from_simplace.csv}"
+export CAL_SOWING_FILE="${CAL_SOWING_FILE:-/data01/FDS/muduchuru/Data/SIMPLACE/cropmodelling4eu_inputs/sowing_from_simplace_euval.csv}"
 
 # --- PEP725, and what it buys ------------------------------------------------
 # The station observations. Empty -> no heading stage and no ground-truth
@@ -53,7 +61,7 @@ export CAL_SOWING_FILE="${CAL_SOWING_FILE:-${CAL_RUN_DIR}/simplace/sowing_from_s
 export CAL_PEP725="${CAL_PEP725:-/data01/FDS/muduchuru/Data/Agri/PEP725}"
 
 # --- What to run -------------------------------------------------------------
-# `all` runs phenology -> yield -> LAI and then the joint fine-tune, carrying
+# `all` runs every stage in `stage_order` (phenology -> yield), carrying
 # each stage's fitted crop into the next. Stages accumulate terms rather than
 # replacing the objective, so running one alone is a diagnostic, not the plan.
 export CAL_STAGE="${CAL_STAGE:-all}"
@@ -105,8 +113,22 @@ export CAL_THREADS="${CAL_THREADS:-1}"
 # identical.
 export CAL_WORKERS="${CAL_WORKERS:-29}"
 
+# --- Mixed-region batches (GPU) ------------------------------------------------
+# One global window start lets a batch span regions *and* years: one forward
+# pass with per-row parameters instead of 29 forked region-batches. Set
+# CAL_MIX_REGIONS=1 with CAL_START_DOY (200 precedes every European winter-
+# wheat sower in the SIMPLACE table) and CAL_DEVICE=cuda, and raise
+# CAL_BATCH_SIZE to thousands; CAL_WORKERS is then unused. Empty keeps the
+# region-packed CPU path above.
+export CAL_START_DOY="${CAL_START_DOY:-}"
+export CAL_MIX_REGIONS="${CAL_MIX_REGIONS:-0}"
+export CAL_DEVICE="${CAL_DEVICE:-}"          # empty -> torchcrop.device (cpu)
+
 # --- SLURM -------------------------------------------------------------------
-export CAL_PARTITION="${CAL_PARTITION:-compute}"
+export CAL_PARTITION="${CAL_PARTITION:-compute}"   # gpu for CAL_DEVICE=cuda
+# The gpu partition defines no GRES (`sinfo -o "%P %G"` prints null), so a node
+# is requested by partition alone; set e.g. gpu:1 if GRES is ever configured.
+export CAL_GRES="${CAL_GRES:-}"
 # One core per worker, plus a few for the parent and the gzip-bound weather
 # cache. Not more: N workers on N cores is the point, and asking for the whole
 # node would keep others off it for no gain.
@@ -118,8 +140,8 @@ export CAL_MEM="${CAL_MEM:-64G}"
 # Every partition on this cluster is `infinite`, so the whole staged run goes
 # in one job and each stage inherits the previous stage's fitted crop in
 # memory. A conservative ceiling: ~15 min an epoch for phenology (8 CLMS
-# seasons) and roughly double that for yield and LAI (CyBench's 25 years make
-# the pool ~2.6x larger), so 80 epochs x 4 stages is a few days. Early stopping
+# seasons) and roughly double that for yield (CyBench's 25 years make the pool
+# ~2.6x larger), so 80 epochs x 2 stages is a day or two. Early stopping
 # (`patience: 12`) usually ends a stage well before its cap.
 export CAL_TIME="${CAL_TIME:-7-00:00:00}"
 export CAL_LOG_DIR="${CAL_LOG_DIR:-${CAL_PROJECT_DIR}/submit/logs}"
@@ -150,11 +172,16 @@ cal_activate() {
 # submitted, not after it has spent an hour building a weather cache.
 cal_check_inputs() {
     local fatal=0
-    if [ ! -f "${CAL_CROP_FILE}" ]; then
+    if [ ! -f "${CAL_CROP_FILE}" ] && [ "${CAL_CROP_WILL_BUILD:-0}" = "1" ]; then
+        # A dry run: the real submission would build it before this check.
+        echo "note: ${CAL_CROP_FILE} is missing and will be built at submission"
+        echo "      from ${CAL_CROP_XML} (block ${CAL_SIMPLACE_CROP})"
+    elif [ ! -f "${CAL_CROP_FILE}" ]; then
         echo "ERROR: no crop file at ${CAL_CROP_FILE}" >&2
         echo "       Without it torchcrop's bundled preset is calibrated, which is" >&2
-        echo "       a different crop from the production run's. Build the" >&2
-        echo "       workspace first (cm4eu torchcrop workspace / prepare_torchcrop_workspace.py)." >&2
+        echo "       a different crop from the production run's. submit_calibration.sh" >&2
+        echo "       builds it when missing (any mode but --dry-run), from" >&2
+        echo "       ${CAL_CROP_XML} (block ${CAL_SIMPLACE_CROP})." >&2
         fatal=1
     fi
     if [ ! -f "${CAL_SOWING_FILE}" ]; then
@@ -169,6 +196,32 @@ cal_check_inputs() {
         echo "WARNING: no PEP725 at ${CAL_PEP725}; tier-2 parameters stay frozen" >&2
     fi
     return "${fatal}"
+}
+
+# Build CAL_CROP_FILE when it is missing (submit_calibration.sh, any mode but
+# --dry-run). The
+# workspace writer names its file workspace/crop_<crop>.yaml, so the target has
+# to have that shape for the build to land where the check looks.
+cal_build_crop() {
+    [ -f "${CAL_CROP_FILE}" ] && return 0
+    case "${CAL_CROP_FILE}" in
+        */workspace/crop_*.yaml) ;;
+        *) echo "ERROR: --prepare builds a crop only at <dir>/workspace/crop_<crop>.yaml," >&2
+           echo "       not ${CAL_CROP_FILE}; set CAL_CROP_FILE to such a path." >&2
+           return 1 ;;
+    esac
+    [ -f "${CAL_CROP_XML}" ] || { echo "ERROR: no SUSTAg crop file ${CAL_CROP_XML}" >&2; return 1; }
+    echo "building ${CAL_CROP_FILE}"
+    echo "  from ${CAL_CROP_XML} (block ${CAL_SIMPLACE_CROP})"
+    cm4eu workspace --config "${CAL_CONFIG}" \
+        --out-dir "$(dirname "$(dirname "${CAL_CROP_FILE}")")" \
+        --crop-source simplace --crop-xml "${CAL_CROP_XML}" \
+        --simplace-crop "${CAL_SIMPLACE_CROP}" \
+        --seeds-xml "${CAL_SEEDS_DATA}/crop/seeds.xml" --seeds-crop winter_wheat \
+        --management-xml "${CAL_SEEDS_DATA}/management/management.xml" > /dev/null \
+        || { echo "ERROR: cm4eu workspace failed" >&2; return 1; }
+    [ -f "${CAL_CROP_FILE}" ] \
+        || { echo "ERROR: workspace built, but ${CAL_CROP_FILE} is not in it" >&2; return 1; }
 }
 
 cal_banner() {

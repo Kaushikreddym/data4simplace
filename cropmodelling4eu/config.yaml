@@ -65,7 +65,7 @@ torchcrop:
 simplace:
   # A working SIMPLACE project: its solution/, project/ and data/. The XML is
   # rewritten into the run workspace, never edited in place.
-  template_dir: "/data01/FDS/muduchuru/Data/SIMPLACE/Rotation_monocrop"
+  template_dir: "/data01/FDS/muduchuru/Data/SIMPLACE/TEMPLATES/Rotation_monocrop"
   # Named explicitly: the folder holds more than one *.sol.xml, and a build that
   # picked one silently would run the wrong science.
   #

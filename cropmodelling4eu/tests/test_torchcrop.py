@@ -245,7 +245,7 @@ def test_run_cells_both_matches_separate_summary_and_daily_calls(run_config):
     """mode="both" shares one _simulate call per batch (see run_shard's own
     daily=True path) -- it must still reproduce exactly what mode="summary"
     and mode="daily" give when run separately, the two-pass smoke test used
-    before run_cells_torchcrop.py --daily-out existed."""
+    before `cm4eu smoke torchcrop --daily-out` existed."""
     ids = np.array(TEST_CELLS)
 
     summary, daily = run_cells(run_config, ids, [2000], mode="both")
@@ -452,3 +452,41 @@ def test_vernalisation_survives_a_preset_with_no_slot_for_it(tmp_path):
     assert float(params.versat) == 70.0
     assert float(params.vbase) == 14.0
     assert float(params.versat) != float(params.vbase)
+
+
+def test_smoke_config_narrows_the_main_config(tmp_path):
+    """`cm4eu smoke config`: one derivation for both models' smoke runs."""
+    import yaml
+
+    from cropmodelling4eu.smoke import derive_config
+
+    source = tmp_path / "config.yaml"
+    source.write_text(yaml.safe_dump({
+        "run_name": "main", "season": {"start_year": 2000, "end_year": 2024},
+        "simplace": {"iopt": 3}, "torchcrop": {"iopt": 3},
+    }))
+    out = derive_config(source, tmp_path / "smoke.yaml", 1989, 2024, iopt=1)
+    config = yaml.safe_load(out.read_text())
+    assert config["run_name"] == "de_smoke"
+    assert config["season"] == {"start_year": 1989, "end_year": 2024}
+    assert config["simplace"]["start_date"] == "1987-01-01"
+    assert config["simplace"]["end_date"] == "2025-12-31"
+    assert config["simplace"]["iopt"] == config["torchcrop"]["iopt"] == 1
+
+
+def test_the_former_scripts_are_cm4eu_subcommands():
+    """scripts/ is gone; every step it held must parse under cm4eu."""
+    from cropmodelling4eu.cli import _build_parser
+
+    parser = _build_parser()
+    for argv in (
+        ["workspace", "--config", "c.yaml", "--out-dir", "o"],
+        ["smoke", "config", "--config", "c.yaml", "--out", "s.yaml",
+         "--start-year", "1989", "--end-year", "2024"],
+        ["smoke", "cells", "--config", "c.yaml", "--out", "cells.csv"],
+        ["smoke", "simplace", "--config", "c.yaml", "--cells", "c.csv", "--out", "s.parquet"],
+        ["smoke", "torchcrop", "--config", "c.yaml", "--cells", "c.csv", "--out", "t.parquet",
+         "--daily-out", "d.parquet", "--iopt", "2"],
+        ["smoke", "validate", "--cells", "c.csv", "--simplace", "s.parquet", "--out-dir", "v"],
+    ):
+        assert parser.parse_args(argv).func is not None

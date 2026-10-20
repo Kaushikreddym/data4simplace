@@ -425,3 +425,18 @@ Two consequences worth knowing before a run:
   `<simmodel skip="check:isNull(${gcm_rcp_scenario.vCO2}) || ...">`. A typo in
   `gcm_rcp` or a mismatched `period` produces no error and no output — check
   this first if a run comes back empty.
+
+## CO2 per year (`simplace.co2: annual`)
+
+The SUSTAg solutions read CO2 from `ClimPerCO2.csv` through a
+`frequence="ONCE"` resource: one value (row `C1`, 360 ppm) for a whole
+simulation. `co2: annual` rewrites the solution at build time instead
+(`SolutionDocument.rewire_co2_annual`): a `DAILY` resource keyed on
+`CURRENT.YEAR` reads `data/project/co2_annual.csv`, written from the export's
+`site/co2.csv`, and all four consumers move to it (the crop's `cCO`, `CO2Tran`'s
+`cStartValue`, the `rcCO2` rule and the `skip` guard). The default stays
+`scenario`, so observational runs are unchanged.
+
+Verified in the container on 3 cells, 1990/91 season: yield 660 / 1089 / 1079
+g m-2 for 284/284, 800/800 and 284→800 ppm tables. The value switches mid-run;
+it is not read once at initialisation. Used by `submit/submit_cmip6_cropmodelling.sh`.

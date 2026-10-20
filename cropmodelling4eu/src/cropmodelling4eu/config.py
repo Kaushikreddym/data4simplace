@@ -190,6 +190,11 @@ class SimplaceConfig(BaseModel):
     #: value selects the wrong parameter set rather than failing — which is why
     #: they are configuration rather than a guess.
     project_constants: dict[str, object] = Field(default_factory=dict)
+    #: Where SIMPLACE's CO2 comes from. ``scenario`` keeps the solution's own
+    #: ``ClimPerCO2.csv`` row -- one value for the whole simulation. ``annual``
+    #: rewires the solution to the export's ``site/co2.csv``, one value per
+    #: year, which a multi-decade CMIP6 run needs and torchcrop already does.
+    co2: Literal["scenario", "annual"] = "scenario"
 
 
 class RunConfig(BaseModel):

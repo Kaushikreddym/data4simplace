@@ -87,6 +87,13 @@ class PathsConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     mswx_root: Path
+    # Parent of the climdata ``<model>_<experiment>/`` folders; climate.source:
+    # cmip6_bc reads paths.cmip6_bc_root/<climate.experiment>.
+    cmip6_bc_root: Optional[Path] = None
+    # A finished export whose cells this run is restricted to. A scenario run
+    # re-exports only the weather; soil, site and management come from that
+    # export (--link-base), so its cells must be the ones weather is written for.
+    cell_set_from: Optional[Path] = None
     soilgrids_root: Optional[Path] = None
     npk_root: Optional[Path] = None
     # PROBA-V LC100 Crops-CoverFraction GeoTIFF: the pipeline's single cropland
@@ -170,10 +177,44 @@ class ExportConfig(BaseModel):
 
 
 class ClimateConfig(BaseModel):
-    """MSWX variable mapping and dask chunk sizes."""
+    """Daily climate source, variable mapping and dask chunk sizes."""
 
     model_config = ConfigDict(extra="forbid")
 
+    # ``mswx``     - the observational archive under paths.mswx_root.
+    # ``cmip6_bc`` - CMIP6 output bias-corrected and downscaled onto MSWX by
+    #                climdata, under paths.cmip6_bc_root/<experiment>. Same
+    #                0.1 deg grid, units and per-day file layout as MSWX, on a
+    #                regional frame (35-70 N, 25 W-45 E): cells outside it get
+    #                no weather and drop out of the run.
+    source: Literal["mswx", "cmip6_bc"] = "mswx"
+    # ``<model>_<experiment>`` folder of a cmip6_bc source, e.g. MIROC6_hist-aer.
+    experiment: Optional[str] = None
+    # ``daily``  - one file per day, ``<FOLDER>/YYYYDDD.nc``: the published layout.
+    # ``yearly`` - one file per year, matched by ``yearly_pattern`` under the
+    #              source's parent root. Both store one compressed chunk per day,
+    #              so the bytes decompressed are identical; yearly saves the
+    #              per-file opens, measured 15x faster for a 5 degree tile.
+    layout: Literal["daily", "yearly"] = "daily"
+    yearly_pattern: str = "_yearly_cache/{experiment}/*/BCSD_{var}_model_scenario_{year}.nc"
+    # Canonical names (values of ``variables``) that must load. A missing one
+    # fails the run at --dry-run rather than leaving its weather column at the
+    # sentinel: a CMIP6 model without rsds is not runnable, and filling it from
+    # MSWX would erase the aerosol-radiation signal a DAMIP run exists to show.
+    required: list[str] = Field(default_factory=list)
+    # Canonical names to fill, **only where the source holds no files for
+    # them**, with the MSWX day-of-year climatology of the same cell: the mean
+    # over climatology_years, smoothed by a circular climatology_window_days
+    # running mean. No interannual variability and no forcing signal -- meant
+    # for a variable a crop model needs but a run does not study (wind for
+    # DAMIP), never for one it does (rsds). A filled variable satisfies
+    # `required`. MSWX's folder is the variable's key in `variables`.
+    climatology_fill: list[str] = Field(default_factory=list)
+    climatology_years: tuple[int, int] = (1979, 2014)
+    climatology_window_days: int = Field(31, ge=1, le=181)
+    # Per-tile climatologies are cached here, keyed by bbox, years and window,
+    # so every experiment of a run reuses one computation. None -> no cache.
+    climatology_cache: Optional[Path] = None
     variables: dict[str, str] = Field(default_factory=dict)
     chunks: dict[str, int] = Field(default_factory=lambda: {"time": 30, "lat": 512, "lon": 512})
     # Worker processes for the per-file MSWX reads. Processes, not threads: the
@@ -181,6 +222,19 @@ class ClimateConfig(BaseModel):
     # *slower* than serial. None -> SLURM_CPUS_PER_TASK (capped at 16, past
     # which the reads stop scaling and only add open() contention).
     read_workers: int | None = None
+
+    @model_validator(mode="after")
+    def _check_required(self) -> "ClimateConfig":
+        if unknown := sorted(
+            (set(self.required) | set(self.climatology_fill)) - set(self.variables.values())
+        ):
+            raise ValueError(
+                f"climate.required/climatology_fill name {', '.join(unknown)}, which climate.variables "
+                f"does not load (it maps to {', '.join(sorted(self.variables.values()))})"
+            )
+        if self.source == "cmip6_bc" and not self.experiment:
+            raise ValueError("climate.source: cmip6_bc requires climate.experiment")
+        return self
 
 
 class NPKConfig(BaseModel):
@@ -323,6 +377,10 @@ class SiteConfig(BaseModel):
     # Terrain variable of paths.dem_path. None -> the first of elevation /
     # surface_altitude / altitude / ... that the file carries.
     dem_variable: Optional[str] = None
+    # Hold CO2 at this year's value of the series for every simulated year.
+    # DAMIP hist-aer keeps well-mixed GHGs at 1850 levels, so a crop driven by
+    # its climate must see 1850 CO2 to stay consistent with how it was forced.
+    co2_hold_year: Optional[int] = None
 
     # --- The planting window written into the fertilizer schedule ------------
     # A rule-based solution sows on the first day inside [start, end] on which a
@@ -508,6 +566,16 @@ class PipelineConfig(BaseModel):
                 "soil.aggregation_method: top3 needs a soil classification; "
                 "set soil.dominant_mode to usda, usda_profile or wrb"
             )
+        return self
+
+    @model_validator(mode="after")
+    def _check_climate_source(self) -> "PipelineConfig":
+        if (
+            self.flags.run_climate_processing
+            and self.climate.source == "cmip6_bc"
+            and self.paths.cmip6_bc_root is None
+        ):
+            raise ValueError("climate.source: cmip6_bc requires paths.cmip6_bc_root")
         return self
 
     @model_validator(mode="after")

@@ -153,7 +153,7 @@ observations by backpropagating through the model's own day loop.
 cm4eu calibrate --config config.yaml --prepare-only \
   --crop-file <TC_OUT_DIR>/workspace/crop_wheat.yaml
 
-# Stage 1 (phenology), then yield, then LAI, then a joint fine-tune.
+# Stage 1 (phenology), then yield. There is no joint stage: phenology stays frozen.
 cm4eu calibrate --config config.yaml \
   --crop-file <TC_OUT_DIR>/workspace/crop_wheat.yaml \
   --pep725 /data01/FDS/muduchuru/Data/Agri/PEP725
@@ -190,9 +190,9 @@ cropmodelling4eu/
 ├── SIMPLACE.md                     # the SIMPLACE run's, and the unit warning
 ├── CALIBRATION.md                  # fitting torchcrop's crop by backprop
 ├── VALIDATION.md                   # the Germany smoke test vs CyBench + PEP725
-├── scripts/                        # cell selection, per-cell runs, validation
 ├── src/cropmodelling4eu/
 │   ├── cli.py                      # cm4eu
+│   ├── smoke.py                    # the German smoke test (cm4eu smoke ...)
 │   ├── config.py                   # pydantic RunConfig
 │   ├── export/                     # the shared reader layer
 │   ├── torchcrop/                  # run.py (one shard) + maps.py (combine, grid, plot)

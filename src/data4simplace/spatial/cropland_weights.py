@@ -304,11 +304,34 @@ def exported_soil_cells(output_dir: Path, grid: TargetGrid) -> xr.DataArray | No
     return None
 
 
+def base_export_cells(config: PipelineConfig) -> xr.DataArray | None:
+    """The cells of ``paths.cell_set_from`` on the **global** target grid.
+
+    A scenario run exports weather alone and borrows soil, site and management
+    from that export, so the weather must be written for exactly its cells.
+
+    Raises
+    ------
+    FileNotFoundError
+        If the configured export holds no soil file to read the cells from: a
+        scenario run that silently fell back to every cropland cell would write
+        weather the borrowed layers do not cover.
+    """
+    base = config.paths.cell_set_from
+    if base is None:
+        return None
+    mask = exported_soil_cells(Path(base), TargetGrid.from_config(config.grid))
+    if mask is None:
+        raise FileNotFoundError(f"paths.cell_set_from {base} holds no soil/soil*.csv")
+    return mask
+
+
 def export_cell_mask(
     config: PipelineConfig,
     grid: TargetGrid,
     soil: xr.Dataset | None = None,
     soil_export_fallback: bool = True,
+    within: xr.DataArray | None = None,
 ) -> xr.DataArray | None:
     """The cells a run exports, as a boolean ``(lat, lon)`` mask.
 
@@ -346,6 +369,10 @@ def export_cell_mask(
         use it: ``SimplaceID`` indexes the full grid, so the identifiers in an
         export cannot be unflattened onto a sub-grid. ``data4simplace.tiling``
         passes ``False`` for exactly that reason.
+    within:
+        A further restriction, e.g. :func:`base_export_cells`, on any grid
+        sharing this one's cell centres; it is aligned by coordinate. When
+        given, it replaces the soil-export fallback.
 
     Returns
     -------
@@ -369,7 +396,7 @@ def export_cell_mask(
         has_soil = valid_soil_cells(soil)
         if has_soil is None:
             logger.warning("Soil dataset carries no lat/lon fields; no soil filtering")
-    elif soil_export_fallback:
+    elif soil_export_fallback and within is None:
         has_soil = exported_soil_cells(config.paths.output_dir, grid)
         if has_soil is None:
             logger.warning(
@@ -386,6 +413,14 @@ def export_cell_mask(
             # Both come from the same TargetGrid, but align defensively: an
             # inner join on mismatched float coords would silently empty the run.
             mask = mask & has_soil.reindex_like(mask, method="nearest")
+
+    if within is not None:
+        res = grid.resolution_deg
+        local = within.reindex(
+            lat=grid.lat_centers, lon=grid.lon_centers,
+            method="nearest", tolerance=res / 2.0, fill_value=False,
+        ).astype(bool)
+        mask = local if mask is None else mask & local
 
     if mask is not None:
         logger.info("Exporting %d/%d target cells", int(mask.values.sum()), mask.size)

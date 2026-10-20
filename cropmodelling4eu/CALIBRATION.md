@@ -381,6 +381,33 @@ engine takes. Batching by region *and* year as well would leave a batch about 40
 against a 192 limit, and LINTUL-5's day loop costs almost the same at either — see
 *The dataloader*.
 
+**Update (2026-10-15): regions can mix too.** The table constraint holds for
+`rebuild_table`'s *output*, not for the model. After each region materializes its own
+`[N, 2]` tables, `problem.stack_crops` stacks every field that differs between the batch's
+regions to `[R, …]` and gathers it to `[B]` / `[B, N, 2]` by row region. torchcrop's
+`interpolate` already takes `[B, N, 2]`, and a mixed forward matches one pass per region
+**bit-identically**, across all 42 calibrated crop fields. Two things make this work:
+
+- **One calendar axis for the pool.** `data.start_doy` opens every window on one day,
+  instead of on each region's earliest sower. The SIMPLACE sowing table spans DOY 215-366,
+  so `200` precedes every sower and the `doy >= idpl` latch never wraps New Year. A row
+  that sows before the start is dropped, and DOY 366 is clipped to 365.
+- **A per-region reduction.** The batch loss is the sum, over regions, of each region's
+  mean, so every latent gets exactly its single-region gradient. Penalties are added once
+  per region that scored.
+
+One exception remains upstream. The emergence bootstrap in
+`Lintul5Model._compute_rates_dispatch` evaluates `frtb/fltb/fstb/fotb/slatb/nmxlv/pmxlv/kmxlv`
+at the scalar `dvsi` and reshapes the result to `()`. A stage whose regions differ in one of
+those tables (yield and lai) therefore falls back to region-packed batches, with a warning,
+until torchcrop evaluates them per row. Phenology mixes today. `row_tables_supported()`
+probes the installed torchcrop, so the fallback lifts itself once torchcrop is fixed.
+
+Switch it on with `--start-doy 200 --mix-regions` (`CAL_START_DOY`, `CAL_MIX_REGIONS`),
+and pick a batch size in the thousands. The fork pool is then unused, because every mixed
+batch touches every region. Each stage also writes `batch_history.parquet`: loss and
+diagnostics per epoch, batch, **region** and term.
+
 ### torchcrop has no gradient checkpointing
 
 `ModelOutput` retains every per-day `ModelState`, rate dict and `DiagnosticState`. At
@@ -562,18 +589,31 @@ objective**:
 | --- | --- | --- |
 | 1 | phenology | `L_phen` |
 | 2 | yield (phenology frozen) | `L_yield + λ₁·L_phen` |
-| 3 | canopy (phenology frozen, yield params free but anchored) | `L_lai + λ₂·L_yield + λ₁·L_phen` |
-| 4 | all | joint fine-tune at small lr |
+| 3 | canopy (phenology frozen, yield params free but anchored) | `L_lai + λ₂·L_yield + λ₁·L_phen` — **disabled** |
+
+**Stage 3 is disabled (2026-10-19) for want of real LAI observations.** The only canopy
+reference is CyBench fAPAR. Fitting a canopy through fAPAR leaves `k` and LAI exactly
+degenerate, and the fAPAR senescence term is broken besides. `DISABLED_STAGES` in
+`calibration/config.py` refuses the stage and quotes this reason. Remove its entry once an
+LAI product is wired into `observations.py`.
+
+**There is no stage 4 (joint fine-tune); it was removed on 2026-10-19.** A
+finite-difference sweep on a 767-row, 24-region batch shows that the coupling runs
+one way. Every yield-stage parameter moves maturity and anthesis by exactly zero, while
+`tsum1`, `tsum2` and `phottb` move yield by 0.1–0.2 t/ha per 5 % of their range. A stage
+that frees both groups would let the yield loss buy yield with harvest dates. Phenology
+is fitted once and then stays frozen.
 
 The retention terms are free: one forward pass produces all three. `stage_order` stays a
 config key so swapping 2 and 3 is a one-line change if the retention weights prove
 insufficient.
 
-**Stage 4 is no longer optional.** The harmonised run puts the canopy 20–60 % *above*
-target rather than below it, so stage 3 removes leaf area that stage 2 was fitting yield
-through. That is a strictly larger perturbation than the one `λ₂` was sized for, and it
-runs the wrong way — a stage 3 that raised a deficient canopy would have pushed yield up,
-toward the −0.68 t/ha bias stage 2 is correcting, not away from it.
+**Stage 3 runs the wrong way for `λ₂`.** The harmonised run puts the canopy 20–60 %
+*above* target rather than below it, so stage 3 removes leaf area that stage 2 was fitting
+yield through. That is a strictly larger perturbation than the one `λ₂` was sized for, and
+it runs the wrong way: a stage 3 that raised a deficient canopy would have pushed yield up,
+toward the −0.68 t/ha bias stage 2 is correcting, not away from it. When LAI is switched
+back on, re-fit stage 2 after it rather than reviving a joint stage.
 
 **Stage 1 also moves more than the order suggests.** `tsumem` going from 60 to ~200 °C·d
 delays emergence by about a month, which removes a month of early growth from every
@@ -807,8 +847,7 @@ median and on the 4–6 share.
 **One consequence for staging.** Stage 3 will *lower* LAI, and lower LAI intercepts less
 light, so the stage-2 yield fit will move down with it. The retention term `λ₂·L_yield`
 was sized for a stage 3 that raised a deficient canopy; sized for one that cuts an
-excessive one it has to be larger, or stage 2 has to be re-fitted after stage 3 (the
-optional stage 4 joint fine-tune, which is now closer to mandatory than optional).
+excessive one it has to be larger, or stage 2 has to be re-fitted after stage 3.
 
 ## Module layout
 

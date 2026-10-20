@@ -30,6 +30,8 @@ anthesis output had to exist before stage 1 could free ``phottb`` or
 
 from __future__ import annotations
 
+import copy
+import functools
 import logging
 from dataclasses import dataclass, fields
 from pathlib import Path
@@ -54,13 +56,84 @@ from torchcrop.calibration.paths import (
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "BOOTSTRAP_TABLES",
     "INIT_MARGIN",
     "CalibrationProblem",
     "RegionManager",
     "SimplexGroup",
     "StageSpecs",
     "load_stage_specs",
+    "row_tables_supported",
+    "stack_crops",
 ]
+
+#: Tables torchcrop's emergence bootstrap evaluates at the scalar ``dvsi`` and
+#: reshapes to ``()`` (``Lintul5Model._compute_rates_dispatch``). It is the one
+#: place the model refuses a per-row ``[B, N, 2]`` table; every other crop
+#: field runs per row bit-identically to a per-region pass.
+BOOTSTRAP_TABLES: frozenset[str] = frozenset(
+    {"frtb", "fltb", "fstb", "fotb", "slatb", "nmxlv", "pmxlv", "kmxlv"}
+)
+
+
+@functools.cache
+def row_tables_supported() -> bool:
+    """Whether the installed torchcrop runs a per-row bootstrap table.
+
+    Probed rather than version-checked: the bootstrap is evaluated every day,
+    gated by the emergence mask, so a three-day forward on two rows answers it.
+    """
+    from torchcrop import CropParameters, Lintul5Model, WeatherDriver
+    from torchcrop.parameters.site_params import SiteParameters
+    from torchcrop.parameters.soil_params import SoilParameters
+
+    from cropmodelling4eu.calibration.checkpointed import run_trajectories
+
+    crop = CropParameters(crop_name="wheat")
+    crop.fltb = torch.stack([crop.fltb, crop.fltb])
+    day = [1.0, 15.0, 10.0, 20.0, 15.0, 2.0, 1.2, 2.0]
+    weather = WeatherDriver(torch.tensor([[day] * 3] * 2))
+    model = Lintul5Model(crop, SoilParameters(), SiteParameters())
+    try:
+        with torch.no_grad():
+            run_trajectories(model, weather, 1, keep=("dvs",), segment=0)
+    except (ValueError, RuntimeError):
+        return False
+    return True
+
+
+def stack_crops(
+    crops: Sequence[Any], index: torch.Tensor, device: torch.device
+) -> Any:
+    """One crop container whose fields carry each row's own region.
+
+    A field identical in every region and carrying no graph stays one shared
+    tensor; anything else — a live latent, or a value an earlier stage left
+    different per region — is stacked to ``[R, ...]`` and gathered to
+    ``[B, ...]`` by ``index``, so the gradient of row ``b`` reaches only region
+    ``index[b]``'s latent. Every tensor is moved to ``device``: the model's
+    ``.to()`` does not move its dataclass containers.
+
+    Args:
+        crops: One materialized ``CropParameters`` per region in the batch.
+        index: ``[B]`` position of each row's region in ``crops``.
+        device: Where the forward pass runs.
+    """
+    out = copy.copy(crops[0])
+    for entry in fields(out):
+        values = [getattr(crop, entry.name) for crop in crops]
+        if not isinstance(values[0], torch.Tensor):
+            continue
+        shared = len(values) == 1 or (
+            not any(v.requires_grad for v in values)
+            and all(torch.equal(values[0].cpu(), v.cpu()) for v in values[1:])
+        )
+        setattr(
+            out, entry.name,
+            values[0].to(device) if shared
+            else torch.stack([v.to(device) for v in values])[index],
+        )
+    return out
 
 
 @dataclass(frozen=True, slots=True)
@@ -260,7 +333,13 @@ class RegionManager(CalibrationManager):
             original = self._table_originals.get(table_key)
             if original is None:
                 original = getattr(self._containers[container], field).detach().clone()
-                self._table_originals[table_key] = original
+            # The snapshot is taken from the CPU crop file while the latents may
+            # live on a GPU; `rebuild_table` stacks the two, so the abscissae
+            # follow the ordinates — moved once and cached there.
+            device = next(iter(updates.values())).device
+            if original.device != device:
+                original = original.to(device)
+            self._table_originals[table_key] = original
             setattr(self._containers[container], field,
                     rebuild_table(original, updates))
         return values
@@ -373,6 +452,22 @@ class CalibrationProblem(nn.Module):
         return {
             int(region): {k: float(v) for k, v in manager.materialize().items()}
             for region, manager in self.managers.items()
+        }
+
+    def free_fields(self) -> set[str]:
+        """Crop fields any region writes, simplex-derived tables included."""
+        return {
+            target.field
+            for manager in self.managers.values()
+            for target in (
+                *manager._targets.values(),
+                *(
+                    parse_path(group.derived, manager._containers)
+                    for group in manager._simplex
+                    if group.derived is not None
+                ),
+            )
+            if target.container == "crop"
         }
 
     def detach_containers(self) -> None:

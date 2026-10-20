@@ -429,6 +429,7 @@ class YieldLoss:
             )
             if n:
                 parts["yield_level"] = self.settings.yield_level * loss
+                report["yield_rmse_t_ha"] = float(loss.detach().sqrt())
                 report["yield_bias_t_ha"] = float(
                     (value - targets["yield_level"])[
                         valid & torch.isfinite(targets["yield_level"])

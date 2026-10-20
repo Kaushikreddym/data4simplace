@@ -26,6 +26,8 @@ conventions required by the **SIMPLACE** crop-model simulation framework.
 | Purpose | Path |
 | --- | --- |
 | Climate input (MSWX) | `/data01/FDS/muduchuru/Atmos/MSWX` |
+| Climate input (CMIP6 historical/DAMIP, bias-corrected to MSWX by climdata) | `/data01/FDS/muduchuru/Atmos/CMIP6_MSWX_BC` |
+| CMIP6 historical CO₂ (input4MIPs UoM-CMIP-1-2-0, global annual) | `/data01/FDS/muduchuru/Atmos/CMIP6_forcing/input4MIPs_UoM-CMIP-1-2-0` |
 | Cropland cover (Copernicus PROBA-V LC100) | `/data01/FDS/muduchuru/Land/LULC/CopernicusLandCover` |
 | Harvested area — MIRCA-OS (irrigated + rainfed) | `/data01/FDS/muduchuru/Land/MIRCA-OS/data/contents/Monthly Growing Area Grids/Monthly Growing Area Grids` |
 | Harvested area — ECIRA (irrigated + growing) | `/data01/FDS/muduchuru/Land/ECIRA` |

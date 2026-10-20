@@ -4,6 +4,7 @@
 #
 #   ./submit/submit_simplace.sh              # build, then submit the array
 #   ./submit/submit_simplace.sh --build-only # build and validate, submit nothing
+#   ./submit/submit_simplace.sh --prepare    # the same as --build-only
 #   ./submit/submit_simplace.sh --dry-run    # print the plan, submit nothing
 #   ./submit/submit_simplace.sh --status     # what an existing run has finished
 #   ./submit/submit_simplace.sh --retry      # rebuild, then re-run what failed
@@ -38,7 +39,9 @@ SMOKE=0
 PASS_THROUGH=()
 for arg in "$@"; do
     case "${arg}" in
-        --build-only) BUILD_ONLY=1 ;;
+        # --prepare is the name every submit script shares for "make and
+        # check every input, run nothing"; for SIMPLACE that is the build.
+        --build-only|--prepare) BUILD_ONLY=1 ;;
         --smoke)      SMOKE=1 ;;
         --dry-run|--status|--retry|--local) PASS_THROUGH+=("${arg}") ;;
         -h|--help)    sed -n '2,28p' "${BASH_SOURCE[0]}"; exit 0 ;;
@@ -75,14 +78,14 @@ if [ "${SMOKE}" -eq 1 ]; then
     # must get the same cells and the same seasons to be comparable.
     IOPT_ARG=()
     [ -n "${SP_IOPT}" ] && IOPT_ARG=(--iopt "${SP_IOPT}")
-    python scripts/make_smoke_config.py --config "${SP_PROJECT_DIR}/config.yaml" \
+    cm4eu smoke config --config "${SP_PROJECT_DIR}/config.yaml" \
         --out "${SP_CONFIG}" \
         --start-year "${SP_SMOKE_START}" --end-year "${SP_SMOKE_END}" \
         ${IOPT_ARG[@]:+"${IOPT_ARG[@]}"} || exit 1
 
     if [ ! -f "${CELLS}" ]; then
         echo "Selecting ${SP_SMOKE_CELLS} German cells (one per NUTS-3 region)..."
-        python scripts/select_german_cells.py --config "${SP_CONFIG}" \
+        cm4eu smoke cells --config "${SP_CONFIG}" \
             --n-cells "${SP_SMOKE_CELLS}" --out "${CELLS}" || exit 1
     else
         echo "Reusing the cell list at ${CELLS} ($(( $(wc -l < "${CELLS}") - 1 )) cells)."
@@ -159,9 +162,9 @@ SMOKE TEST READY TO EVALUATE
 ${IOPT_LINE}
 Score it against CyBench yields and PEP725 phenology:
 
-  python scripts/run_cells_torchcrop.py --config ${SP_CONFIG} \
+  cm4eu smoke torchcrop --config ${SP_CONFIG} \
       --cells ${CELLS} ${IOPT_CLI} --out ${TC_OUT}
-  python scripts/validate_germany.py --cells ${CELLS} \
+  cm4eu smoke validate --cells ${CELLS} \
       --torchcrop ${TC_OUT} \
       --simplace ${BUILT_DIR}/simplace_europe.parquet \
       --out-dir ${SP_SMOKE_DIR}/validation

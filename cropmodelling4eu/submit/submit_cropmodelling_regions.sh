@@ -60,7 +60,7 @@ STAGE="yield"
 # template torchcrop's *standalone* comparison runs use, and relinking a
 # region onto the wrong template would silently build every region from a
 # different crop than the one calibrated.
-TEMPLATE="/data01/FDS/muduchuru/Data/SIMPLACE/Rotation_monocrop/data/crop/LINTUL5_crop.xml"
+TEMPLATE="/data01/FDS/muduchuru/Data/SIMPLACE/TEMPLATES/Rotation_monocrop/data/crop/LINTUL5_crop.xml"
 SIMPLACE_CROP="WW"
 JOBS="${SP_REGION_JOBS:-6}"
 # Keyed by TC_RUN_NAME, not SP_RUN_NAME: the two env files default those

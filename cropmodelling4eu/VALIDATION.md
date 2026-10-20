@@ -7,14 +7,14 @@ NUTS-3 regions), winter wheat, harvest years 2000–2010. Both models run the
 ```bash
 ./submit/submit_simplace.sh  --smoke          # cells, config, SIMPLACE run, collect
 ./submit/submit_torchcrop.sh --smoke          # the same cells through torchcrop
-python scripts/validate_germany.py --cells cells.csv --torchcrop tc.parquet \
+cm4eu smoke validate --cells cells.csv --torchcrop tc.parquet \
     --simplace sp.parquet --out-dir validation/
 ```
 
 Both `--smoke` flags derive one config and share one cell list, so the models
 cannot drift onto different cells or seasons. The steps they wrap
-(`select_german_cells.py`, `run_cells_torchcrop.py`, `run_cells_simplace.py`)
-are still there to be run individually.
+are `cm4eu smoke config | cells | simplace | torchcrop | validate`, each runnable
+on its own (logic in `src/cropmodelling4eu/smoke.py`).
 
 Artefacts: `/data01/FDS/muduchuru/Data/SIMPLACE/cropmodelling4eu/de_smoke/`.
 

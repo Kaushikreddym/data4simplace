@@ -5,6 +5,9 @@
 #   ./submit/submit_calibration.sh                 # the full staged run
 #   ./submit/submit_calibration.sh --prepare       # regions + observations +
 #                                                  # weather cache, then stop
+#
+# Every mode except --dry-run first builds CAL_CROP_FILE here if it is missing,
+# from the SUSTAg LINTUL5_crop.xml WW block (CAL_CROP_XML / CAL_SIMPLACE_CROP).
 #   ./submit/submit_calibration.sh --stage phenology
 #   ./submit/submit_calibration.sh --smoke         # 3 epochs, run here, ~1 h
 #   ./submit/submit_calibration.sh --dry-run       # print the plan, submit nothing
@@ -33,7 +36,7 @@ while [ $# -gt 0 ]; do
         --smoke)    SMOKE=1 ;;
         --stage)    shift; export CAL_STAGE="${1:?--stage needs a value}" ;;
         --stage=*)  export CAL_STAGE="${1#*=}" ;;
-        -h|--help)  sed -n '2,20p' "${BASH_SOURCE[0]}"; exit 0 ;;
+        -h|--help)  sed -n '2,22p' "${BASH_SOURCE[0]}"; exit 0 ;;
         *) echo "Unknown option: $1" >&2; exit 2 ;;
     esac
     shift
@@ -41,6 +44,17 @@ done
 
 export CAL_PREPARE_ONLY="${CAL_PREPARE_ONLY:-0}"
 mkdir -p "${CAL_LOG_DIR}"
+
+# Every mode but --dry-run makes the one input that is cheap to make: the
+# SUSTAg crop file, in seconds, here -- as submit_torchcrop.sh always writes its
+# own workspace. The sowing table is not made; it needs a finished SIMPLACE run.
+if [ "${DRY_RUN}" = "0" ] && [ ! -f "${CAL_CROP_FILE}" ]; then
+    cal_activate
+    cal_build_crop || exit 1
+elif [ "${DRY_RUN}" = "1" ]; then
+    # Report the build instead of failing on it, so the dry run shows the plan.
+    export CAL_CROP_WILL_BUILD=1
+fi
 
 # Checked here as well as in the job: a typo in a path should cost a second at
 # the prompt, not a place in the queue and an hour of weather-cache building.
@@ -86,8 +100,9 @@ CMD=(sbatch
     # --error is omitted.
     --output="${CAL_LOG_DIR}/cm_calib_%j.log"
     --export=ALL
-    "${SUBMIT_DIR}/calibrate.sh"
 )
+[ -n "${CAL_GRES:-}" ] && CMD+=(--gres="${CAL_GRES}")
+CMD+=("${SUBMIT_DIR}/calibrate.sh")
 
 if [ "${DRY_RUN}" = "1" ]; then
     printf '%q ' "${CMD[@]}"; echo

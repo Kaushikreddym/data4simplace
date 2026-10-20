@@ -77,7 +77,7 @@ def test_read_window_returns_none_on_corrupt(tmp_path):
     """The worker swallows a bad file rather than killing the pool."""
     bad = tmp_path / "bad.nc"
     bad.touch()
-    assert _read_window((str(bad), 0, 5, 0, 5)) is None
+    assert _read_window((str(bad), 0, 5, 0, 5, "lat", "lon")) is None
 
 
 def test_window_clips_to_tile_bbox(mswx_root):

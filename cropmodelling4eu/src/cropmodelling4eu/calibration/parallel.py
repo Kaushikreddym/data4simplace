@@ -52,11 +52,12 @@ _STATE: dict[str, Any] = {}
 
 
 class BatchOutcome(dict):
-    """``{grads, loss, report, region_id}`` — what one worker sends back.
+    """``{regions, grads, loss, report, per_region, rows, seconds}`` — what one
+    worker sends back.
 
-    A plain dict so it pickles cheaply: the gradients are one float per latent
-    of one region, which is the whole point of returning them rather than the
-    graph.
+    A plain dict so it pickles cheaply: ``grads`` is ``{region: {latent:
+    float}}``, one float per latent of each region the batch carries, which is
+    the whole point of returning them rather than the graph.
     """
 
 
@@ -75,9 +76,14 @@ def waves(batches: list[pd.DataFrame]) -> list[list[pd.DataFrame]]:
         seen: set[int] = set()
         wave, deferred = [], []
         for drawn in remaining:
-            region = int(drawn["region_id"].iloc[0])
-            (deferred if region in seen else wave).append(drawn)
-            seen.add(region)
+            regions = set(drawn["region_id"].astype(int))
+            if regions & seen:
+                deferred.append(drawn)
+            else:
+                wave.append(drawn)
+            # Claimed even when deferred, so a later batch cannot overtake a
+            # deferred one of the same region and reorder its updates.
+            seen |= regions
         grouped.append(wave)
         remaining = deferred
     return grouped

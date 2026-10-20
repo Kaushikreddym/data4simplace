@@ -10,6 +10,7 @@ from data4simplace.spatial.area import (
 from data4simplace.spatial.cropland_weights import (
     CroplandWeights,
     apply_cell_mask,
+    base_export_cells,
     export_cell_mask,
     exported_soil_cells,
     keep_cells,
@@ -20,6 +21,7 @@ __all__ = [
     "EARTH_RADIUS_KM",
     "HECTARES_PER_KM2",
     "apply_cell_mask",
+    "base_export_cells",
     "export_cell_mask",
     "exported_soil_cells",
     "keep_cells",

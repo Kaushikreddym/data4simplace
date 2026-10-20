@@ -1702,7 +1702,7 @@ above are — neither is re-derived by this notebook:
   and `load_simplace_daily` says so rather than dropping the rest silently.
 * **torchcrop** keeps every per-day state in memory, so `submit_cropmodelling.sh
   --smoke` / `submit_torchcrop.sh --smoke` read the summary and the daily
-  trajectory off *one* simulation per swept IOPT (`run_cells_torchcrop.py
+  trajectory off *one* simulation per swept IOPT (`cm4eu smoke torchcrop
   --daily-out`, `run_cells(..., mode="both")`) rather than running the cells
   twice, and write `torchcrop/de_torchcrop_daily_iopt<1,2,3>.parquet`. These
   trajectories are therefore not just comparable to but *literally* the same
