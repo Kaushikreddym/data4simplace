@@ -167,6 +167,12 @@ class DataConfig(BaseModel):
     #: Cell-years per forward pass. Not 2048: ``ModelOutput`` retains every
     #: per-day state and there is no gradient checkpointing upstream.
     batch_size: int = Field(192, ge=1)
+    #: Per-stage override of ``batch_size``, e.g. ``{"yield": 1024}``. Memory is
+    #: rows per process times processes at once: the region-packed yield stage
+    #: runs ``workers`` batches together (~0.5 GB + ~1.1 MB per cell-year each),
+    #: so the in-process phenology batch can be 4096 while yield must not --
+    #: 29 workers x ~5 GB killed job 861301 at its 64 GB limit.
+    stage_batch_size: dict[str, int] = Field(default_factory=dict)
     #: Segment length for the checkpointed forward; 0 disables checkpointing.
     #: ``sqrt(pre_days + window_days)`` is the memory optimum, so ~21 at the
     #: default window.
@@ -185,6 +191,25 @@ class DataConfig(BaseModel):
     #: per-region crops differ in a table the installed torchcrop cannot take
     #: per row fall back to region-packed batches with a warning.
     mix_regions: bool = False
+    #: Compute each mixed batch as region pieces on the CPU worker pool and
+    #: merge them back into one step. Same losses and gradients, but measured
+    #: slower (121.5 s vs 102 s per phenology epoch): a torchcrop pass costs
+    #: about the same at any row count, so the pieces gain nothing. Kept for a
+    #: model step whose cost does scale with rows (e.g. a compiled day loop).
+    split_mixed_batches: bool = False
+
+    @model_validator(mode="after")
+    def _check_stage_batch_size(self) -> "DataConfig":
+        unknown = set(self.stage_batch_size) - set(STAGE_PARAMETERS)
+        if unknown:
+            raise ValueError(
+                f"stage_batch_size names unknown stage(s) {sorted(unknown)}; "
+                f"known: {sorted(STAGE_PARAMETERS)}"
+            )
+        small = {k: v for k, v in self.stage_batch_size.items() if v < 1}
+        if small:
+            raise ValueError(f"stage_batch_size values must be >= 1; got {small}")
+        return self
 
     @model_validator(mode="after")
     def _check_mixing(self) -> "DataConfig":

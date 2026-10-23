@@ -38,6 +38,8 @@ from __future__ import annotations
 import logging
 import multiprocessing as mp
 import os
+from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from typing import Any
 
 import pandas as pd
@@ -99,6 +101,26 @@ def _initialise(calibrator: Any, problem: Any, stages: tuple, weights: dict) -> 
     torch.set_num_threads(1)
 
 
+def _in_worker(function: Any, payload: tuple) -> BatchOutcome | None:
+    """Run one batch on the parent's latents **and** climatology, return both.
+
+    The anomaly terms read a per-unit running climatology that every batch
+    updates. A forked worker's updates would otherwise stay in the worker, so
+    each worker drifted on its own partial copy. The parent's state is shipped
+    in, and the outcome carries the state back for :meth:`RegionPool._map` to
+    merge.
+    """
+    drawn, latents, climatology = payload
+    calibrator = _STATE["calibrator"]
+    problem = _STATE["problem"]
+    problem.load_state_dict(latents)
+    calibrator.climatology.load_state_dict(climatology)
+    outcome = function(calibrator)(problem, drawn, _STATE["stages"], _STATE["weights"])
+    if outcome is not None:
+        outcome["climatology"] = calibrator.climatology.state_dict()
+    return outcome
+
+
 def _score_batch(payload: tuple) -> BatchOutcome | None:
     """Forward-only scoring in a worker — the validation and test passes.
 
@@ -108,23 +130,25 @@ def _score_batch(payload: tuple) -> BatchOutcome | None:
     steps, and no waves — nothing here writes a parameter, so every batch is
     independent of every other regardless of region.
     """
-    drawn, latents = payload
-    problem = _STATE["problem"]
-    problem.load_state_dict(latents)
-    return _STATE["calibrator"].batch_score(
-        problem, drawn, _STATE["stages"], _STATE["weights"]
-    )
+    return _in_worker(lambda calibrator: calibrator.batch_score, payload)
 
 
 def _run_batch(payload: tuple) -> BatchOutcome | None:
     """Compute one batch's gradients in a worker; ``None`` if it was not finite."""
-    drawn, latents = payload
+    return _in_worker(lambda calibrator: calibrator.batch_gradients, payload)
+
+
+def _perturbed_value(payload: tuple) -> Any:
+    """One finite-difference evaluation for the pre-stage diagnostics."""
+    evaluate, stage, batch, name, delta, latents, climatology = payload
     calibrator = _STATE["calibrator"]
     problem = _STATE["problem"]
     problem.load_state_dict(latents)
-    return calibrator.batch_gradients(
-        problem, drawn, _STATE["stages"], _STATE["weights"]
-    )
+    calibrator.climatology.load_state_dict(climatology)
+    with torch.no_grad():
+        problem.manager(batch.region_id)._latents[name].add_(delta)
+        problem.materialize(batch.region_id)
+        return calibrator.diagnostic_value(evaluate, batch, stage)
 
 
 class RegionPool:
@@ -154,9 +178,14 @@ class RegionPool:
             # Fork so the children inherit the calibrator, the problem and the
             # memmap as they stand now. Spawn would re-import and re-open
             # everything, and would need all of it picklable.
-            context = mp.get_context("fork")
-            self._pool = context.Pool(
-                processes=self.workers,
+            #
+            # An executor, not `multiprocessing.Pool`: when the kernel kills a
+            # worker (job 861301: the 64 GB cgroup, 29 workers x ~5 GB) a Pool
+            # starts a replacement and `map` waits forever for the lost task --
+            # that run sat idle for 31 h. The executor raises BrokenProcessPool.
+            self._pool = ProcessPoolExecutor(
+                max_workers=self.workers,
+                mp_context=mp.get_context("fork"),
                 initializer=_initialise,
                 initargs=(self.calibrator, self.problem, self.stages, self.weights),
             )
@@ -180,8 +209,7 @@ class RegionPool:
 
     def __exit__(self, *exc: Any) -> None:
         if self._pool is not None:
-            self._pool.terminate()
-            self._pool.join()
+            self._pool.shutdown(wait=False, cancel_futures=True)
             self._pool = None
 
     def run(self, wave: list[pd.DataFrame]) -> list[BatchOutcome]:
@@ -212,7 +240,45 @@ class RegionPool:
             ]
         return self._map(_score_batch, batches)
 
+    @property
+    def parallel(self) -> bool:
+        """Whether work goes to forked workers rather than this process."""
+        return self._pool is not None
+
+    def map_payloads(self, function: Any, payloads: list) -> list:
+        """``function`` over ``payloads`` on the workers, in order, failing fast."""
+        try:
+            return list(self._pool.map(function, payloads))
+        except BrokenProcessPool as error:
+            raise RuntimeError(
+                f"a calibration worker died ({self.workers} workers) -- most often "
+                "the job's memory limit (check `dmesg` for an oom-kill)"
+            ) from error
+
     def _map(self, function: Any, batches: list[pd.DataFrame]) -> list[BatchOutcome]:
+        """One call's batches in parallel, then their climatology updates merged.
+
+        Every batch of one call covers different observation units — a wave
+        never repeats a region, a held-out set never repeats a unit, and the
+        pieces of a split mixed batch are region-disjoint — so each touches
+        only its own climatology entries and the merge is exact.
+        """
         latents = {k: v.detach().clone() for k, v in self.problem.state_dict().items()}
-        payloads = [(drawn, latents) for drawn in batches]
-        return [o for o in self._pool.map(function, payloads) if o is not None]
+        before = self.calibrator.climatology.state_dict()
+        payloads = [(drawn, latents, before) for drawn in batches]
+        try:
+            results = list(self._pool.map(function, payloads))
+        except BrokenProcessPool as error:
+            raise RuntimeError(
+                f"a calibration worker died mid-batch ({self.workers} workers) -- "
+                "most often the job's memory limit (check `dmesg` for an oom-kill). "
+                "Lower that stage's batch size (CAL_STAGE_BATCH_SIZE, e.g. "
+                "yield=1024), run fewer workers (CAL_WORKERS), or raise CAL_MEM"
+            ) from error
+        outcomes = [o for o in results if o is not None]
+        merged = dict(before)
+        for outcome in outcomes:
+            after = outcome.pop("climatology", {})
+            merged |= {k: v for k, v in after.items() if before.get(k) != v}
+        self.calibrator.climatology.load_state_dict(merged)
+        return outcomes

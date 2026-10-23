@@ -439,4 +439,4 @@ simulation. `co2: annual` rewrites the solution at build time instead
 
 Verified in the container on 3 cells, 1990/91 season: yield 660 / 1089 / 1079
 g m-2 for 284/284, 800/800 and 284→800 ppm tables. The value switches mid-run;
-it is not read once at initialisation. Used by `submit/submit_cmip6_cropmodelling.sh`.
+it is not read once at initialisation. Used by `submit/submit_production.sh` for every CMIP6 run.

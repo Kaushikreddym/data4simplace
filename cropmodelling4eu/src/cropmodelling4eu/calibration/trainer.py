@@ -631,6 +631,11 @@ class Calibrator:
         if stepped:
             optimizer.step()
 
+    def batch_size(self, stage: str) -> int:
+        """Cell-years per batch for ``stage``: its override, else ``data.batch_size``."""
+        data = self.settings.data
+        return data.stage_batch_size.get(stage, data.batch_size)
+
     def mixes_regions(self, problem: CalibrationProblem) -> bool:
         """Whether this stage's batches may span regions.
 
@@ -792,7 +797,7 @@ class Calibrator:
 
     def gradient_check(
         self, stage: str, problem: CalibrationProblem, batch: RegionBatch,
-        epsilon: float = 1e-3,
+        epsilon: float = 1e-3, pool: RegionPool | None = None,
     ) -> pd.DataFrame:
         """Finite-difference check of every free parameter on one batch.
 
@@ -826,20 +831,10 @@ class Calibrator:
         }
 
         rows = []
-        for name, latent in manager._latents.items():
-            original = latent.detach().clone()
-            with torch.no_grad():
-                latent.add_(epsilon)
-            problem.materialize(batch.region_id)
-            with torch.no_grad():
-                up, *_ = self._batch_loss(batch, stages, weights)
-            with torch.no_grad():
-                latent.copy_(original - epsilon)
-            problem.materialize(batch.region_id)
-            with torch.no_grad():
-                down, *_ = self._batch_loss(batch, stages, weights)
-            with torch.no_grad():
-                latent.copy_(original)
+        perturbed = self._perturbed(
+            problem, batch, stage, "loss", list(manager._latents), epsilon, pool
+        )
+        for name, (up, down) in perturbed.items():
             numeric = float((up - down) / (2 * epsilon))
             exact = analytic.get(name)
             # A parameter is judged on the **analytic** gradient. The finite
@@ -858,7 +853,6 @@ class Calibrator:
                     "relative_error": abs((exact or 0.0) - numeric) / scale,
                 }
             )
-        problem.materialize(batch.region_id)
 
         frame = pd.DataFrame(rows)
         dead = frame.loc[~frame["live"], "parameter"].tolist()
@@ -882,7 +876,7 @@ class Calibrator:
 
     def identifiability(
         self, stage: str, problem: CalibrationProblem, batch: RegionBatch,
-        epsilon: float = 1e-2,
+        epsilon: float = 1e-2, pool: RegionPool | None = None,
     ) -> pd.DataFrame:
         """Per-unit sensitivity Jacobian, its condition number and correlations.
 
@@ -901,22 +895,8 @@ class Calibrator:
         """
         manager = problem.manager(batch.region_id)
         names = list(manager._latents)
-        columns = []
-        for name in names:
-            latent = manager._latents[name]
-            original = latent.detach().clone()
-            responses = []
-            for delta in (epsilon, -epsilon):
-                with torch.no_grad():
-                    latent.copy_(original + delta)
-                problem.materialize(batch.region_id)
-                with torch.no_grad():
-                    trajectories, tsumem = self._forward(batch, stage)
-                responses.append(self._signature(trajectories, tsumem))
-            with torch.no_grad():
-                latent.copy_(original)
-            columns.append((responses[0] - responses[1]) / (2 * epsilon))
-        problem.materialize(batch.region_id)
+        perturbed = self._perturbed(problem, batch, stage, "signature", names, epsilon, pool)
+        columns = [(up - down) / (2 * epsilon) for up, down in perturbed.values()]
 
         jacobian = np.column_stack(columns)
         finite = np.isfinite(jacobian).all(axis=1)
@@ -954,6 +934,63 @@ class Calibrator:
                 "them; freeze one", row.a, row.b, row.correlation,
             )
         return frame
+
+    def _perturbed(
+        self,
+        problem: CalibrationProblem,
+        batch: RegionBatch,
+        stage: str,
+        evaluate: str,
+        names: list[str],
+        epsilon: float,
+        pool: RegionPool | None = None,
+    ) -> dict[str, tuple[Any, Any]]:
+        """``{latent: (value at +epsilon, value at -epsilon)}`` on one batch.
+
+        The finite differences behind both pre-stage diagnostics. Every
+        perturbation is independent, so with a forking ``pool`` they all run at
+        once: each worker starts from the parent's latents and climatology,
+        moves one latent, and evaluates. Serially the latents are restored after
+        each pair, so the problem leaves as it came in either way.
+        """
+        if pool is not None and pool.parallel:
+            from cropmodelling4eu.calibration.parallel import _perturbed_value
+
+            latents = {k: v.detach().clone() for k, v in problem.state_dict().items()}
+            climatology = self.climatology.state_dict()
+            payloads = [
+                (evaluate, stage, batch, name, delta, latents, climatology)
+                for name in names
+                for delta in (epsilon, -epsilon)
+            ]
+            values = pool.map_payloads(_perturbed_value, payloads)
+            return {name: (values[2 * i], values[2 * i + 1]) for i, name in enumerate(names)}
+
+        manager = problem.manager(batch.region_id)
+        out = {}
+        for name in names:
+            latent = manager._latents[name]
+            original = latent.detach().clone()
+            pair = []
+            for delta in (epsilon, -epsilon):
+                with torch.no_grad():
+                    latent.copy_(original + delta)
+                problem.materialize(batch.region_id)
+                with torch.no_grad():
+                    pair.append(self.diagnostic_value(evaluate, batch, stage))
+            with torch.no_grad():
+                latent.copy_(original)
+            out[name] = tuple(pair)
+        problem.materialize(batch.region_id)
+        return out
+
+    def diagnostic_value(self, evaluate: str, batch: RegionBatch, stage: str) -> Any:
+        """The stage-alone loss (``"loss"``) or the response vector (``"signature"``)."""
+        if evaluate == "loss":
+            loss, *_ = self._batch_loss(batch, (stage,), {stage: 1.0})
+            return float(loss)
+        trajectories, tsumem = self._forward(batch, stage)
+        return self._signature(trajectories, tsumem)
 
     @staticmethod
     def _signature(trajectories: dict[str, torch.Tensor], tsumem: torch.Tensor) -> np.ndarray:
@@ -1066,17 +1103,37 @@ class Calibrator:
             lr=optim_settings.lr,
             betas=optim_settings.betas,
         )
+        batch_size = self.batch_size(stage)
+        logger.info("%s: batches of up to %d cell-years", stage, batch_size)
         sampler = StratifiedFractionSampler(
             split.train, self.settings.data.fraction,
-            self.settings.data.batch_size, seed=self.settings.data.seed,
+            batch_size, seed=self.settings.data.seed,
             mix_regions=mixing,
         )
         workers = self.workers
-        if mixing and workers > 1:
-            # Every mixed batch carries every region, so no two can run in one
-            # wave: the fork pool would idle all but one worker.
-            logger.info("mixed-region batches run in process; %d workers unused", workers)
+        # A mixed batch's per-region losses share no gradient path (the pooling
+        # mean is detached), so it *can* be computed as region pieces on the
+        # fork pool and merged back into the same step. Off by default: a pass
+        # costs about the same at 150 rows as at 4096 (the 465-day loop, not
+        # the rows), so the pieces take as long as the whole batch and the
+        # shipping makes it slower -- 121.5 s vs 102 s per phenology epoch,
+        # identical losses. On a GPU it is never split.
+        by_region = (
+            self.settings.data.split_mixed_batches
+            and mixing and workers > 1 and self.device.type == "cpu"
+        )
+        # Forking after CUDA is initialised is unsafe, so a GPU run has no pool.
+        if self.device.type != "cpu":
             workers = 1
+        # A mixed batch trains in this process (every batch touches every
+        # region, so there is nothing to run beside it); the pool stays up to
+        # score the held-out batches in parallel.
+        train_here = mixing and not by_region
+        if train_here and workers > 1:
+            logger.info("mixed-region batches train in process; %d workers score "
+                        "validation", workers)
+        elif by_region:
+            logger.info("mixed-region batches split by region over %d workers", workers)
 
         history: list[dict] = []
         batch_log: list[dict] = []
@@ -1096,7 +1153,12 @@ class Calibrator:
             epoch_loss, n_batches = 0.0, 0
             reports: list[dict] = []
             for wave in waves(batches):
-                for outcome in pool.run(wave):
+                outcomes = (
+                    [o for drawn in wave
+                     if (o := self.batch_gradients(problem, drawn, stages, weights)) is not None]
+                    if train_here else self._gradients(pool, wave, by_region)
+                )
+                for outcome in outcomes:
                     self._apply(problem, optimizer, outcome, optim_settings.grad_clip)
                     epoch_loss += outcome["loss"]
                     batch_log += self._batch_records(
@@ -1107,7 +1169,8 @@ class Calibrator:
 
             validation = self.evaluate(
                 problem, split.val, stages, weights, pool, mixing,
-                records=batch_log, tag=(stage, epoch, "val"),
+                records=batch_log, tag=(stage, epoch, "val"), by_region=by_region,
+                batch_size=batch_size,
             )
             self._write_batch_history(stage, batch_log)
             record = {
@@ -1143,6 +1206,7 @@ class Calibrator:
         test = self.evaluate(
             problem, split.test, stages, weights, mixing=mixing,
             records=batch_log, tag=(stage, len(history), "test"),
+            batch_size=batch_size,
         )
         result = StageResult(
             stage=stage,
@@ -1167,6 +1231,8 @@ class Calibrator:
         mixing: bool = False,
         records: list[dict] | None = None,
         tag: tuple[str, int, str] | None = None,
+        by_region: bool = False,
+        batch_size: int | None = None,
     ) -> dict[str, float]:
         """Mean loss and diagnostics over a held-out set, all of it.
 
@@ -1175,15 +1241,22 @@ class Calibrator:
         parallel wave. ``pool`` scores them concurrently; without one it runs
         in this process. With ``records`` and ``tag = (stage, epoch, split)``
         every batch's per-region scores are appended to the batch history.
+        ``by_region`` scores each mixed batch as region pieces on the pool and
+        merges them back, so the reported batch is the one that was drawn.
         """
         if unit_years.empty:
             return {"loss": float("nan")}
         batches = StratifiedFractionSampler(
-            unit_years, 1.0, self.settings.data.batch_size, seed=0,
+            unit_years, 1.0, batch_size or self.settings.data.batch_size, seed=0,
             mix_regions=mixing,
         ).epoch(0)
         outcomes = (
-            pool.score(batches) if pool is not None
+            [
+                merged for drawn in batches
+                if (merged := _merge_outcomes(pool.score(_by_region(drawn)))) is not None
+            ]
+            if by_region and pool is not None
+            else pool.score(batches) if pool is not None
             else [
                 o for drawn in batches
                 if (o := self.batch_score(problem, drawn, stages, weights)) is not None
@@ -1198,6 +1271,27 @@ class Calibrator:
             "loss": sum(o["loss"] for o in outcomes) / len(outcomes),
             **_mean_reports([o["report"] for o in outcomes]),
         }
+
+    def _gradients(
+        self, pool: RegionPool, wave: list[pd.DataFrame], by_region: bool
+    ) -> list[BatchOutcome]:
+        """One wave's outcomes; with ``by_region`` each batch runs as region pieces.
+
+        A mixed batch carries every region, so its wave is that one batch. Its
+        pieces are region-disjoint, so they run together on the pool, and
+        :func:`_merge_outcomes` rebuilds the one outcome -- and hence the one
+        Adam step -- the whole batch would have produced.
+        """
+        if not by_region:
+            return pool.run(wave)
+        outcomes = []
+        for drawn in wave:
+            started = self._clock()
+            merged = _merge_outcomes(pool.run(_by_region(drawn)))
+            if merged is not None:
+                merged["seconds"] = self._clock() - started
+                outcomes.append(merged)
+        return outcomes
 
     def _batch_records(
         self, outcome: BatchOutcome, stage: str, epoch: int, split: str, batch: int
@@ -1309,12 +1403,20 @@ class Calibrator:
                 self.out_dir / f"{stage}_split.parquet", index=False
             )
             first = self.dataset.batch(self._diagnostic_draw(stage, split))
-            self.gradient_check(stage, problem, first).to_csv(
-                self.out_dir / f"{stage}_gradient_check.csv", index=False
-            )
-            self.identifiability(stage, problem, first).to_csv(
-                self.out_dir / f"{stage}_identifiability.csv", index=False
-            )
+            # The ~70 finite-difference passes are independent: on the fork pool
+            # they cost about one pass of wall time instead of ~8 minutes.
+            problem.detach_containers()
+            started = time.time()
+            diag_workers = self.workers if self.device.type == "cpu" else 1
+            with RegionPool(self, problem, (stage,), {stage: 1.0}, diag_workers) as pool:
+                self.gradient_check(stage, problem, first, pool=pool).to_csv(
+                    self.out_dir / f"{stage}_gradient_check.csv", index=False
+                )
+                self.identifiability(stage, problem, first, pool=pool).to_csv(
+                    self.out_dir / f"{stage}_identifiability.csv", index=False
+                )
+            logger.info("%s diagnostics: %.0f s on %d worker(s)",
+                        stage, time.time() - started, diag_workers)
             results.append(self.run_stage(stage, problem, split))
         return results
 
@@ -1352,6 +1454,37 @@ def _per_region_mean(loss: torch.Tensor, per_region: dict) -> float:
     differently. The mean restores "one region's loss".
     """
     return float(loss.detach()) / max(1, len(per_region))
+
+
+def _by_region(drawn: pd.DataFrame) -> list[pd.DataFrame]:
+    """A drawn batch's unit-years, one frame per region."""
+    return [block for _, block in drawn.groupby("region_id", sort=True)]
+
+
+def _merge_outcomes(outcomes: list[BatchOutcome]) -> BatchOutcome | None:
+    """Region pieces of one batch, back into the outcome of the whole batch.
+
+    Exact, not approximate: the whole batch's objective is the sum of its
+    regions' terms and penalties, none of which reaches another region's latent,
+    so the gradients are the union of the pieces'. The reported loss is the
+    per-region mean, as :meth:`Calibrator.batch_gradients` reports it.
+    """
+    if not outcomes:
+        return None
+    per_region = {r: rep for o in outcomes for r, rep in o["per_region"].items()}
+    report = _mean_reports(list(per_region.values()))
+    report.pop("loss", None)
+    report.pop("rows", None)
+    report["scored_stages"] = max(r["scored_stages"] for r in per_region.values())
+    return BatchOutcome(
+        regions=list(per_region),
+        grads={r: g for o in outcomes for r, g in o["grads"].items()},
+        loss=sum(o["loss"] * len(o["per_region"]) for o in outcomes) / len(per_region),
+        report=report,
+        per_region=per_region,
+        rows=sum(o["rows"] for o in outcomes),
+        seconds=max(o["seconds"] for o in outcomes),
+    )
 
 
 def _split_table(split: Split) -> pd.DataFrame:

@@ -84,6 +84,12 @@ export CAL_FRACTION="${CAL_FRACTION:-}"    # empty -> data.fraction (0.20)
 # (~29) however large the batch is. Raising `fraction` is what fills those
 # batches, and it is close to free for the same reason.
 export CAL_BATCH_SIZE="${CAL_BATCH_SIZE:-768}"
+# Per-stage overrides of CAL_BATCH_SIZE, space-separated STAGE=N. Memory is rows
+# per worker x workers (~0.5 GB + ~1.1 MB per cell-year each): the yield stage
+# runs CAL_WORKERS region batches at once, so 29 x 4096-row batches (~5 GB
+# each) blew the 64 GB limit of job 861301, while in-process phenology can take
+# 4096. 1024 keeps 29 yield workers near 45 GB.
+export CAL_STAGE_BATCH_SIZE="${CAL_STAGE_BATCH_SIZE:-yield=1024}"
 #
 # THREADS. Measured to make no difference whatsoever -- 1, 4, 10 and 20 threads
 # all land within noise of each other, at both B=192 and B=768, because each
@@ -236,7 +242,7 @@ cal_banner() {
     echo "  sowing      : ${CAL_SOWING_FILE}"
     echo "  pep725      : ${CAL_PEP725:-(none -- tier 2 frozen)}"
     echo "  stage(s)    : ${CAL_STAGE}"
-    echo "  batch/threads: ${CAL_BATCH_SIZE} / ${CAL_THREADS}"
+    echo "  batch/threads: ${CAL_BATCH_SIZE} / ${CAL_THREADS}${CAL_STAGE_BATCH_SIZE:+  (per stage: ${CAL_STAGE_BATCH_SIZE})}"
     echo "  workers     : ${CAL_WORKERS} (ceiling is the region count, ~29)"
     echo "  output      : ${CAL_OUT_DIR}"
     echo "  started     : $(date)"

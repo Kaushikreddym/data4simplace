@@ -27,8 +27,8 @@ set -uo pipefail
 SUBMIT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "${SUBMIT_DIR}")"
 
-SRC_EXPORT="${NFIX_SRC_EXPORT:-/data01/FDS/muduchuru/Data/SIMPLACE/EU_val}"
-DST_EXPORT="${NFIX_DST_EXPORT:-/data01/FDS/muduchuru/Data/SIMPLACE/EU_val_nfix}"
+SRC_EXPORT="${NFIX_SRC_EXPORT:-/data01/FDS/muduchuru/Data/SIMPLACE/cropmodelling4eu_inputs/exports/mswx/EU_val}"
+DST_EXPORT="${NFIX_DST_EXPORT:-/data01/FDS/muduchuru/Data/SIMPLACE/cropmodelling4eu_inputs/exports/mswx/EU_val_nfix}"
 NFIX_RUN_NAME="${NFIX_RUN_NAME:-winter_wheat_2000_2024_euval_nfix}"
 NFIX_CONFIG="${NFIX_CONFIG:-${SUBMIT_DIR}/config_nfix.yaml}"
 

@@ -58,6 +58,8 @@ ARGS=(
 [ -n "${CAL_START_DOY:-}" ] && ARGS+=(--start-doy "${CAL_START_DOY}")
 [ "${CAL_MIX_REGIONS:-0}" = "1" ] && ARGS+=(--mix-regions)
 [ -n "${CAL_DEVICE:-}" ] && ARGS+=(--device "${CAL_DEVICE}")
+for _pair in ${CAL_STAGE_BATCH_SIZE:-}; do ARGS+=(--stage-batch-size "${_pair}"); done
+[ -n "${CAL_SEED:-}" ] && ARGS+=(--seed "${CAL_SEED}")
 [ "${CAL_PREPARE_ONLY:-0}" = "1" ] && ARGS+=(--prepare-only)
 
 echo "cm4eu calibrate ${ARGS[*]}"

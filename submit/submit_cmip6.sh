@@ -8,7 +8,7 @@
 #   CMIP6_EXPERIMENTS="MIROC6_historical MIROC6_hist-aer" ./submit/submit_cmip6.sh
 #   CMIP6_SERIAL=1 D4S_MAX_CONCURRENT=15 ./submit/submit_cmip6.sh   # <=15 jobs at once
 #
-# One export per <model>_<experiment> under ${CMIP6_OUT_ROOT}. Each exports
+# One export per <model>/<experiment> under ${CMIP6_OUT_ROOT}. Each exports
 # weather ONLY, for exactly the cells of ${CMIP6_BASE_EXPORT}; a dependent job
 # then links that export's soil, site.csv and wide fertilizer schedule and
 # writes the experiment's own site/co2.csv (data4simplace --link-base). Soil
@@ -24,7 +24,7 @@
 # series, hist-aer (and hist-nat) stay at 1850, as their GCMs were forced.
 #
 # Afterwards, crop-model each finished export with
-#   cropmodelling4eu/submit/submit_cmip6_cropmodelling.sh
+#   cropmodelling4eu/submit/submit_production.sh cmip6
 # =============================================================================
 
 set -uo pipefail
@@ -35,8 +35,9 @@ source "${SUBMIT_DIR}/env.sh"
 
 export CMIP6_ROOT="${CMIP6_ROOT:-/data01/FDS/muduchuru/Atmos/CMIP6_MSWX_BC}"
 # EU_val_nfix, not EU_val: its soil_long.csv carries the corrected mineral N.
-export CMIP6_BASE_EXPORT="${CMIP6_BASE_EXPORT:-/data01/FDS/muduchuru/Data/SIMPLACE/EU_val_nfix}"
-export CMIP6_OUT_ROOT="${CMIP6_OUT_ROOT:-/data01/FDS/muduchuru/Data/SIMPLACE/CMIP6_BC}"
+export CMIP6_BASE_EXPORT="${CMIP6_BASE_EXPORT:-/data01/FDS/muduchuru/Data/SIMPLACE/cropmodelling4eu_inputs/exports/mswx/EU_val_nfix}"
+# One export per <model>/<experiment>, beside the observed (mswx/) ones.
+export CMIP6_OUT_ROOT="${CMIP6_OUT_ROOT:-/data01/FDS/muduchuru/Data/SIMPLACE/cropmodelling4eu_inputs/exports/cmip6}"
 export CMIP6_START="${CMIP6_START:-1850-01-01}"
 export CMIP6_END="${CMIP6_END:-2014-12-31}"
 # yearly reads climdata's _yearly_cache: identical values, ~15x fewer opens.
@@ -92,7 +93,7 @@ SUBMITTED=()
 REFUSED=()
 PREV_JOB=""
 for EXP in ${EXPERIMENTS}; do
-    OUT="${CMIP6_OUT_ROOT}/${EXP}"
+    OUT="${CMIP6_OUT_ROOT}/${EXP%%_*}/${EXP#*_}"     # <model>_<exp> -> <model>/<exp>
     WORK="${OUT}/_work"
     RUN_CONFIG="${WORK}/config_run.yaml"
     mkdir -p "${WORK}/configs"
@@ -175,5 +176,5 @@ echo "=================================================="
 echo "  submitted : ${#SUBMITTED[@]}  ${SUBMITTED[*]:-}"
 echo "  refused   : ${#REFUSED[@]}  ${REFUSED[*]:-}"
 [ "${#REFUSED[@]}" -gt 0 ] && echo "              (missing a climate.required variable; see above)"
-echo "  done when : ${CMIP6_OUT_ROOT}/<experiment>/scenario.json exists"
+echo "  done when : ${CMIP6_OUT_ROOT}/<model>/<experiment>/scenario.json exists"
 echo "=================================================="

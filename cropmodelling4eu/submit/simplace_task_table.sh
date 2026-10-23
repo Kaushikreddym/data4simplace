@@ -5,7 +5,7 @@
 # Each row is "<built SIMPLACE workspace> <first line> <last line>". It lets
 # many per-region builds share ONE array -- and so one %N concurrency limit --
 # where each build's own submit.sh would submit an array of its own and the
-# per-array limits would add up. Submitted by submit_euval_calibrated.sh.
+# per-array limits would add up. Submitted by submit_production.sh.
 # =============================================================================
 #SBATCH --job-name=sp_tasktable
 set -uo pipefail

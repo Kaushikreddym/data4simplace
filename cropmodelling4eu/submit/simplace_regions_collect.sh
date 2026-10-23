@@ -7,7 +7,7 @@
 #
 # A region that fails to collect is named and skipped rather than aborting the
 # merge, so one bad task range never costs the other 26 regions their output.
-# Submitted by submit_euval_calibrated.sh after the SIMPLACE array.
+# Submitted by submit_production.sh after the SIMPLACE array.
 # =============================================================================
 #SBATCH --job-name=sp_regions_collect
 set -uo pipefail
@@ -41,5 +41,14 @@ table = pd.concat(
 table.to_parquet(merged, index=False)
 print(f"merged {len(files)} regions, {len(table):,} cell-seasons, "
       f"{table['SimplaceID'].nunique():,} cells -> {merged}")
+
+# The run's own simulated sowing, the handoff a torchcrop run on the same
+# forcing sows on; regions partition the cells, so the tables just stack.
+sowing = sorted(root.glob("region_*/sowing_from_simplace.csv"))
+if sowing:
+    out = merged.parent / "sowing_from_simplace.csv"
+    frame = pd.concat([pd.read_csv(f) for f in sowing], ignore_index=True)
+    frame.sort_values(["SimplaceID", "year"]).to_csv(out, index=False)
+    print(f"merged {len(sowing)} sowing tables, {len(frame):,} cell-seasons -> {out}")
 EOF
 [ "${#FAILED[@]}" -eq 0 ] || { echo "collect FAILED for: ${FAILED[*]}" >&2; exit 1; }

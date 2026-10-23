@@ -148,7 +148,7 @@ CYBENCH_CROP_MASK_TEMPLATE: Final[str] = "crop_mask_{crop}_{country}.csv"
 
 CLMS_PHENOLOGY_DIR: Final[Path] = _env_path(
     "CLMS_PHENOLOGY_DIR",
-    "/data01/FDS/muduchuru/Data/SIMPLACE/EU_val/validation/phenology",
+    "/data01/FDS/muduchuru/Data/SIMPLACE/cropmodelling4eu_inputs/exports/mswx/EU_val/validation/phenology",
 )
 
 #: ``phenology_adm.parquet`` keys on ``adm_id`` (the CyBench reporting units);

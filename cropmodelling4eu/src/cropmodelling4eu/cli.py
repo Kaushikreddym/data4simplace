@@ -189,6 +189,19 @@ def _cmd_simplace(args: argparse.Namespace) -> int:
     )
 
 
+def _stage_sizes(pairs: list[str] | None) -> dict[str, int] | None:
+    """``["yield=1024", ...]`` -> ``{"yield": 1024}``; ``None`` when not given."""
+    if not pairs:
+        return None
+    sizes = {}
+    for pair in pairs:
+        stage, _, value = pair.partition("=")
+        if not value.isdigit():
+            raise ValueError(f"--stage-batch-size wants STAGE=N, got {pair!r}")
+        sizes[stage.strip()] = int(value)
+    return sizes
+
+
 def _calibration_settings(args: argparse.Namespace) -> tuple[RunConfig, Any]:
     """The run config and calibration settings ``calibrate`` and ``benchmark`` share."""
     from cropmodelling4eu.calibration import CalibrationConfig
@@ -200,6 +213,8 @@ def _calibration_settings(args: argparse.Namespace) -> tuple[RunConfig, Any]:
         for key, value in (
             ("fraction", getattr(args, "fraction", None)),
             ("batch_size", getattr(args, "batch_size", None)),
+            ("stage_batch_size", _stage_sizes(getattr(args, "stage_batch_size", None))),
+            ("seed", getattr(args, "seed", None)),
             ("start_doy", args.start_doy),
             ("mix_regions", getattr(args, "mix_regions", False) or None),
         )
@@ -571,6 +586,18 @@ def _build_parser() -> argparse.ArgumentParser:
         "1.33x the wall time of 192 for 4x the cells, at 1.3 GB — the day loop "
         "is per-day, not per-cell. The floor on batch *count* is the region "
         "count, since a batch carries one region's parameters.",
+    )
+    calibrate.add_argument(
+        "--seed", type=int,
+        help="data.seed: the split, the per-epoch draws and the batch order. "
+        "An ensemble runs one member per seed (submit_calibration_ensemble.sh).",
+    )
+    calibrate.add_argument(
+        "--stage-batch-size", action="append", metavar="STAGE=N",
+        help="Override --batch-size for one stage; repeatable, e.g. "
+        "--stage-batch-size yield=1024. Memory is rows per worker x workers "
+        "(~0.5 GB + ~1.1 MB per cell-year each), so the region-packed yield "
+        "stage on 29 workers needs far smaller batches than in-process phenology.",
     )
     calibrate.add_argument(
         "--workers", type=int, default=1,

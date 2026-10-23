@@ -21,7 +21,7 @@ export TC_PROJECT_DIR="${TC_PROJECT_DIR:-/data01/FDS/muduchuru/codes/GITHUB/data
 export TC_CONDA_ENV="${TC_CONDA_ENV:-sdba}"   # holds torch + the torchcrop install
 
 # --- Input & output ----------------------------------------------------------
-export TC_DATA_DIR="${TC_DATA_DIR:-/data01/FDS/muduchuru/Data/SIMPLACE/EU_val}"
+export TC_DATA_DIR="${TC_DATA_DIR:-/data01/FDS/muduchuru/Data/SIMPLACE/cropmodelling4eu_inputs/exports/mswx/EU_val}"
 export TC_RUN_NAME="${TC_RUN_NAME:-winter_wheat_2000_2024_euval}"
 # Sibling of the SIMPLACE run's own <output_dir>/<run_name>/simplace (see
 # simplace_env.sh's resolve_run_dir), so one run directory holds both models'

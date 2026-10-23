@@ -1407,3 +1407,100 @@ def test_scale_factor_rue_is_folded_into_ruetb_for_simplace(tmp_path):
     text = out.read_text()
     assert "2.7" in text and "1.8" in text, text
     assert ">1000<" in text
+
+
+def test_region_pieces_merge_back_into_the_whole_batch():
+    """Split-by-region must report the loss and step the whole batch would."""
+    from cropmodelling4eu.calibration.parallel import BatchOutcome
+    from cropmodelling4eu.calibration.trainer import _merge_outcomes
+
+    def piece(region, loss, grad, rmse):
+        return BatchOutcome(
+            regions=[region], grads={region: {"crop__tsum1": grad}}, loss=loss,
+            report={}, rows=10 * region, seconds=float(region),
+            per_region={region: {"loss": loss, "rows": 10 * region, "scored_stages": 1,
+                                 "phenology/harvest_date_rmse_d": rmse}},
+        )
+
+    merged = _merge_outcomes([piece(1, 4.0, 0.5, 2.0), piece(2, 8.0, -1.0, 6.0)])
+    assert merged["loss"] == pytest.approx(6.0), "per-region mean, as batch_gradients reports"
+    assert merged["grads"] == {1: {"crop__tsum1": 0.5}, 2: {"crop__tsum1": -1.0}}
+    assert merged["report"]["phenology/harvest_date_rmse_d"] == pytest.approx(4.0)
+    assert merged["rows"] == 30 and merged["seconds"] == 2.0
+    assert _merge_outcomes([]) is None
+
+
+def test_the_pool_brings_each_piece_s_climatology_back():
+    """A forked worker's anomaly climatology must reach the parent, not stay there."""
+    from cropmodelling4eu.calibration import parallel
+
+    climatology = RunningClimatology()
+    climatology.load_state_dict({"harvest_date|A": 100.0, "harvest_date|B": 200.0})
+
+    class _Problem:
+        def state_dict(self):
+            return {}
+
+        def load_state_dict(self, state):
+            pass
+
+    class _Calibrator:
+        def __init__(self):
+            self.climatology = RunningClimatology()
+
+        def batch_gradients(self, problem, drawn, stages, weights):
+            unit = drawn["unit"].iloc[0]
+            self.climatology.values[("harvest_date", unit)] = torch.tensor(
+                float(drawn["value"].iloc[0])
+            )
+            return parallel.BatchOutcome(regions=[], grads={}, loss=0.0, report={},
+                                         per_region={}, rows=0, seconds=0.0)
+
+    worker = _Calibrator()
+    parallel._STATE.update(calibrator=worker, problem=_Problem(), stages=(), weights={})
+    pool = parallel.RegionPool(
+        type("Parent", (), {"climatology": climatology})(), _Problem(), (), {}, workers=2
+    )
+    pool._pool = type("Serial", (), {"map": staticmethod(lambda f, xs: [f(x) for x in xs])})()
+    pieces = [pd.DataFrame({"unit": ["A"], "value": [110.0]}),
+              pd.DataFrame({"unit": ["C"], "value": [300.0]})]
+    pool.run(pieces)
+    state = climatology.state_dict()
+    assert state["harvest_date|A"] == pytest.approx(110.0), "piece 1's update kept"
+    assert state["harvest_date|C"] == pytest.approx(300.0), "piece 2's new unit kept"
+    assert state["harvest_date|B"] == pytest.approx(200.0), "untouched unit unchanged"
+    pool._pool = None
+
+
+def test_a_stage_batch_size_overrides_only_its_stage():
+    from cropmodelling4eu.calibration.config import DataConfig
+
+    data = DataConfig(batch_size=4096, stage_batch_size={"yield": 1024})
+    assert data.stage_batch_size.get("yield", data.batch_size) == 1024
+    assert data.stage_batch_size.get("phenology", data.batch_size) == 4096
+    with pytest.raises(ValueError, match="unknown stage"):
+        DataConfig(stage_batch_size={"yeild": 1024})
+
+
+def test_a_worker_killed_mid_batch_raises_instead_of_hanging():
+    """Job 861301: an oom-killed worker left multiprocessing.Pool.map waiting 31 h."""
+    import os
+
+    from cropmodelling4eu.calibration import parallel
+
+    class _Problem:
+        def state_dict(self):
+            return {}
+
+        def load_state_dict(self, state):
+            pass
+
+    class _Calibrator:
+        climatology = RunningClimatology()
+
+        def batch_gradients(self, problem, drawn, stages, weights):
+            os._exit(9)            # what the kernel's oom-killer does to a worker
+
+    with parallel.RegionPool(_Calibrator(), _Problem(), (), {}, workers=2) as pool:
+        with pytest.raises(RuntimeError, match="worker died"):
+            pool.run([pd.DataFrame({"region_id": [1]})])
