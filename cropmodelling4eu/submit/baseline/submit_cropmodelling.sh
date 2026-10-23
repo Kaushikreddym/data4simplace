@@ -2,16 +2,16 @@
 # =============================================================================
 # Both models, in the order that lets the second use the first's answer.
 #
-#   ./submit/submit_cropmodelling.sh              # build, then submit the chain
-#   ./submit/submit_cropmodelling.sh --build-only # build and validate, submit nothing
-#   ./submit/submit_cropmodelling.sh --prepare    # --build-only, plus torchcrop's workspace/
-#   ./submit/submit_cropmodelling.sh --dry-run    # print the plan, submit nothing
-#   ./submit/submit_cropmodelling.sh --status     # what each stage has finished
-#   ./submit/submit_cropmodelling.sh --retry      # rebuild, then re-run what failed
-#   ./submit/submit_cropmodelling.sh --smoke      # 30 German cells, run here, then evaluate
+#   ./submit/baseline/submit_cropmodelling.sh              # build, then submit the chain
+#   ./submit/baseline/submit_cropmodelling.sh --build-only # build and validate, submit nothing
+#   ./submit/baseline/submit_cropmodelling.sh --prepare    # --build-only, plus torchcrop's workspace/
+#   ./submit/baseline/submit_cropmodelling.sh --dry-run    # print the plan, submit nothing
+#   ./submit/baseline/submit_cropmodelling.sh --status     # what each stage has finished
+#   ./submit/baseline/submit_cropmodelling.sh --retry      # rebuild, then re-run what failed
+#   ./submit/baseline/submit_cropmodelling.sh --smoke      # 30 German cells, run here, then evaluate
 #
 # Tunables come from BOTH environment files, unchanged:
-#   submit/simplace_env.sh   (SP_*)   and   submit/torchcrop_env.sh   (TC_*)
+#   submit/utils/simplace_env.sh   (SP_*)   and   submit/utils/torchcrop_env.sh   (TC_*)
 # =============================================================================
 
 # No `-e`: sp_activate sources ~/.bashrc, which reaches
@@ -22,12 +22,12 @@
 # script uses exactly this line.
 set -uo pipefail
 
-SUBMIT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SUBMIT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # shellcheck disable=SC1091
-source "${SUBMIT_DIR}/simplace_env.sh"
+source "${SUBMIT_DIR}/utils/simplace_env.sh"
 # shellcheck disable=SC1091
-source "${SUBMIT_DIR}/torchcrop_env.sh"
+source "${SUBMIT_DIR}/utils/torchcrop_env.sh"
 
 BUILD_ONLY=0
 DRY_RUN=0
@@ -129,7 +129,7 @@ if [[ "${SMOKE}" -eq 1 ]]; then
     for IOPT in ${TC_SMOKE_IOPTS}; do
         echo ""
         echo "--- iopt=${IOPT}: SIMPLACE ---"
-        SP_IOPT="${IOPT}" "${SUBMIT_DIR}/submit_simplace.sh" --smoke || exit 1
+        SP_IOPT="${IOPT}" "${SUBMIT_DIR}/baseline/submit_simplace.sh" --smoke || exit 1
 
         SP_OUT_DIR="${SP_SMOKE_DIR}/simplace_iopt${IOPT}"
         SOWING="${SP_OUT_DIR}/sowing_from_simplace.csv"
@@ -215,7 +215,7 @@ if [[ "${STATUS}" -eq 1 ]]; then
     echo "=================================================="
     echo "3. TORCHCROP — ${TC_SHARD_DIR}"
     echo "=================================================="
-    "${SUBMIT_DIR}/torchcrop_status.sh"
+    "${SUBMIT_DIR}/baseline/torchcrop_status.sh"
     exit 0
 fi
 
@@ -259,7 +259,7 @@ if [[ "${PREPARE}" -eq 1 ]]; then
     # The torchcrop workspace is written against the crop file this SIMPLACE
     # build just linked (TC_CROP_XML above), so both models start from one crop.
     echo ""
-    "${SUBMIT_DIR}/submit_torchcrop.sh" --prepare || exit 1
+    "${SUBMIT_DIR}/baseline/submit_torchcrop.sh" --prepare || exit 1
     echo ""
     echo "--prepare: SIMPLACE built in ${RUN_DIR}, torchcrop workspace in ${TC_WORK_DIR};"
     echo "           nothing submitted."
@@ -270,7 +270,7 @@ if [[ "${BUILD_ONLY}" -eq 1 ]]; then
     echo ""
     echo "--build-only: built and validated, nothing submitted."
     echo "  ${RUN_DIR}/submit.sh"
-    echo "  then: TC_SOWING_FILE=${SOWING_FILE} ./submit/submit_torchcrop.sh"
+    echo "  then: TC_SOWING_FILE=${SOWING_FILE} ./submit/baseline/submit_torchcrop.sh"
     exit 0
 fi
 
@@ -286,7 +286,7 @@ echo "=================================================="
 if [[ "${DRY_RUN}" -eq 1 ]]; then
     "${RUN_DIR}/submit.sh" --dry-run
     echo ""
-    TC_SOWING_FILE="${SOWING_FILE}" "${SUBMIT_DIR}/submit_torchcrop.sh" --dry-run
+    TC_SOWING_FILE="${SOWING_FILE}" "${SUBMIT_DIR}/baseline/submit_torchcrop.sh" --dry-run
     echo ""
     echo "--dry-run: nothing submitted."
     exit 0
@@ -313,7 +313,7 @@ if [[ -z "${SP_JOB}" ]]; then
         echo "       cm4eu simplace collect --config ${SP_CONFIG} --out-dir ${RUN_DIR}" >&2
         exit 1
     fi
-    TC_SOWING_FILE="${SOWING_FILE}" exec "${SUBMIT_DIR}/submit_torchcrop.sh" \
+    TC_SOWING_FILE="${SOWING_FILE}" exec "${SUBMIT_DIR}/baseline/submit_torchcrop.sh" \
         "${SP_ARGS[@]+"${SP_ARGS[@]}"}"
 fi
 
@@ -326,7 +326,7 @@ if ! HANDOFF_JOB=$(sbatch --parsable \
     --mem="${SP_MEM}" \
     --time=01:00:00 \
     --export=ALL,SP_PROJECT_DIR,SP_CONFIG,SP_CONDA_ENV,CM_RUN_DIR="${RUN_DIR}" \
-    "${SUBMIT_DIR}/cropmodelling_handoff.sh"); then
+    "${SUBMIT_DIR}/utils/cropmodelling_handoff.sh"); then
     echo "ERROR: handoff submission failed" >&2
     exit 1
 fi
@@ -336,7 +336,7 @@ echo "Handoff submitted     : ${HANDOFF_JOB}  (afterany:${SP_JOB})"
 # --- 3. torchcrop on SIMPLACE's dates -----------------------------------------
 TC_SOWING_FILE="${SOWING_FILE}" \
 TC_DEPENDENCY="afterok:${HANDOFF_JOB}" \
-    "${SUBMIT_DIR}/submit_torchcrop.sh" "${SP_ARGS[@]+"${SP_ARGS[@]}"}" || exit 1
+    "${SUBMIT_DIR}/baseline/submit_torchcrop.sh" "${SP_ARGS[@]+"${SP_ARGS[@]}"}" || exit 1
 
 cat <<EOF
 
@@ -347,7 +347,7 @@ CHAIN SUBMITTED
   handoff  : ${HANDOFF_JOB}   afterany:${SP_JOB}
   torchcrop: queued behind the handoff (see above)
 
-  progress : ./submit/submit_cropmodelling.sh --status
+  progress : ./submit/baseline/submit_cropmodelling.sh --status
   cancel   : scancel ${SP_JOB} ${HANDOFF_JOB}
 ==================================================
 EOF

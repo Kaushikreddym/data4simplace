@@ -2,7 +2,7 @@
 # =============================================================================
 # SLURM array job: one task = one shard of the runnable cell set.
 #
-# Submitted by submit/submit_torchcrop.sh, which supplies --array from
+# Submitted by submit/baseline/submit_torchcrop.sh, which supplies --array from
 # TC_N_SHARDS. Do not sbatch this directly unless you also pass --array.
 #
 # Each task is fully independent: it reads only its own round-robin slice of
@@ -17,12 +17,12 @@
 
 set -uo pipefail
 
-for _d in "${TC_PROJECT_DIR:-}/submit" "${SLURM_SUBMIT_DIR:-}/submit" \
+for _d in "${TC_PROJECT_DIR:-}/submit/utils" "${SLURM_SUBMIT_DIR:-}/submit/utils" \
           "$(dirname "${BASH_SOURCE[0]}")"; do
     [ -f "${_d}/torchcrop_env.sh" ] && { TC_SUBMIT_DIR="${_d}"; break; }
 done
 if [ -z "${TC_SUBMIT_DIR:-}" ]; then
-    echo "ERROR: cannot locate submit/torchcrop_env.sh. Set TC_PROJECT_DIR or" >&2
+    echo "ERROR: cannot locate submit/utils/torchcrop_env.sh. Set TC_PROJECT_DIR or" >&2
     echo "       sbatch from the project root so SLURM_SUBMIT_DIR resolves it." >&2
     exit 1
 fi
@@ -99,7 +99,7 @@ if [ ${STATUS} -eq 0 ]; then
     echo "OK   shard ${SHARD} finished at $(date -Is)"
 else
     # No Parquet is written on failure, so the shard stays in the retry set
-    # reported by submit/torchcrop_status.sh.
+    # reported by submit/baseline/torchcrop_status.sh.
     echo "FAIL shard ${SHARD} exited ${STATUS} at $(date -Is)" >&2
 fi
 exit ${STATUS}

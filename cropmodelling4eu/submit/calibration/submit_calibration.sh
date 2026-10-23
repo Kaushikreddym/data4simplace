@@ -2,18 +2,18 @@
 # =============================================================================
 # Driver for the torchcrop calibration over Europe.
 #
-#   ./submit/submit_calibration.sh                 # the full staged run
-#   ./submit/submit_calibration.sh --prepare       # regions + observations +
+#   ./submit/calibration/submit_calibration.sh                 # the full staged run
+#   ./submit/calibration/submit_calibration.sh --prepare       # regions + observations +
 #                                                  # weather cache, then stop
 #
 # Every mode except --dry-run first builds CAL_CROP_FILE here if it is missing,
 # from the SUSTAg LINTUL5_crop.xml WW block (CAL_CROP_XML / CAL_SIMPLACE_CROP).
-#   ./submit/submit_calibration.sh --stage phenology
-#   ./submit/submit_calibration.sh --smoke         # 3 epochs, run here, ~1 h
-#   ./submit/submit_calibration.sh --dry-run       # print the plan, submit nothing
+#   ./submit/calibration/submit_calibration.sh --stage phenology
+#   ./submit/calibration/submit_calibration.sh --smoke         # 3 epochs, run here, ~1 h
+#   ./submit/calibration/submit_calibration.sh --dry-run       # print the plan, submit nothing
 #
-# Tunables live in submit/calibration_env.sh and can be overridden per call:
-#   CAL_EPOCHS=20 CAL_FRACTION=0.4 ./submit/submit_calibration.sh
+# Tunables live in submit/utils/calibration_env.sh and can be overridden per call:
+#   CAL_EPOCHS=20 CAL_FRACTION=0.4 ./submit/calibration/submit_calibration.sh
 #
 # RUN --prepare FIRST on a new export. It is where a missing reference, an
 # empty cell set or a region that no observation reaches shows up -- in minutes
@@ -23,9 +23,9 @@
 
 set -uo pipefail
 
-SUBMIT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SUBMIT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck disable=SC1091
-source "${SUBMIT_DIR}/calibration_env.sh"
+source "${SUBMIT_DIR}/utils/calibration_env.sh"
 
 DRY_RUN=0
 SMOKE=0
@@ -85,7 +85,7 @@ if [ "${SMOKE}" = "1" ]; then
     export CAL_STAGE="${CAL_STAGE:-phenology}"
     echo "SMOKE: ${CAL_EPOCHS} epochs of ${CAL_STAGE}, here, ~1 h"
     [ "${DRY_RUN}" = "1" ] && { echo "(dry run)"; exit 0; }
-    exec bash "${SUBMIT_DIR}/calibrate.sh"
+    exec bash "${SUBMIT_DIR}/utils/calibrate.sh"
 fi
 
 CMD=(sbatch
@@ -102,7 +102,7 @@ CMD=(sbatch
     --export=ALL
 )
 [ -n "${CAL_GRES:-}" ] && CMD+=(--gres="${CAL_GRES}")
-CMD+=("${SUBMIT_DIR}/calibrate.sh")
+CMD+=("${SUBMIT_DIR}/utils/calibrate.sh")
 
 if [ "${DRY_RUN}" = "1" ]; then
     printf '%q ' "${CMD[@]}"; echo

@@ -2,17 +2,17 @@
 # =============================================================================
 # Master driver for the torchcrop / LINTUL-5 Europe run.
 #
-#   ./submit/submit_torchcrop.sh              # submit all shards, then maps
-#   ./submit/submit_torchcrop.sh --retry      # submit only the missing shards
-#   ./submit/submit_torchcrop.sh --dry-run    # print the plan, submit nothing
-#   ./submit/submit_torchcrop.sh --prepare    # write workspace/ (crop, config, audit), submit nothing
-#   ./submit/submit_torchcrop.sh --no-maps    # shard array only
-#   ./submit/submit_torchcrop.sh --maps-only  # re-render maps from the shards
-#   ./submit/submit_torchcrop.sh --smoke      # 30 German cells, run here, then evaluate
+#   ./submit/baseline/submit_torchcrop.sh              # submit all shards, then maps
+#   ./submit/baseline/submit_torchcrop.sh --retry      # submit only the missing shards
+#   ./submit/baseline/submit_torchcrop.sh --dry-run    # print the plan, submit nothing
+#   ./submit/baseline/submit_torchcrop.sh --prepare    # write workspace/ (crop, config, audit), submit nothing
+#   ./submit/baseline/submit_torchcrop.sh --no-maps    # shard array only
+#   ./submit/baseline/submit_torchcrop.sh --maps-only  # re-render maps from the shards
+#   ./submit/baseline/submit_torchcrop.sh --smoke      # 30 German cells, run here, then evaluate
 #
-# Tunables live in submit/torchcrop_env.sh and can be overridden per call:
-#   TC_START_YEAR=1980 TC_TIME=12:00:00 ./submit/submit_torchcrop.sh
-#   TC_RUN_NAME=test TC_END_YEAR=2001 ./submit/submit_torchcrop.sh
+# Tunables live in submit/utils/torchcrop_env.sh and can be overridden per call:
+#   TC_START_YEAR=1980 TC_TIME=12:00:00 ./submit/baseline/submit_torchcrop.sh
+#   TC_RUN_NAME=test TC_END_YEAR=2001 ./submit/baseline/submit_torchcrop.sh
 #
 # Submits
 #   1. torchcrop_array.sh - array job, one task per shard (throttled)
@@ -25,9 +25,9 @@
 
 set -uo pipefail
 
-SUBMIT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SUBMIT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck disable=SC1091
-source "${SUBMIT_DIR}/torchcrop_env.sh"
+source "${SUBMIT_DIR}/utils/torchcrop_env.sh"
 
 DRY_RUN=0
 RETRY=0
@@ -185,7 +185,7 @@ TC_CROP_BLOCK_ARG=()
         # the deliverable, and a torchcrop-only score answers half the question.
         echo "No SIMPLACE run beside it yet. Produce one on the same cells with:"
         echo ""
-        echo "  ./submit/submit_simplace.sh --smoke"
+        echo "  ./submit/baseline/submit_simplace.sh --smoke"
     fi
     echo "=================================================="
     exit 0
@@ -216,7 +216,7 @@ elif [ "${RETRY}" -eq 1 ]; then
     ARRAY_SPEC="$(missing_shards)"
     if [ -z "${ARRAY_SPEC}" ]; then
         echo "All ${TC_N_SHARDS} shards already have a Parquet file - nothing to retry."
-        [ "${DO_MAPS}" -eq 1 ] && echo "Run 'sbatch submit/torchcrop_maps.sh' to re-render maps."
+        [ "${DO_MAPS}" -eq 1 ] && echo "Run 'sbatch submit/utils/torchcrop_maps.sh' to re-render maps."
         exit 0
     fi
 else
@@ -314,14 +314,14 @@ if [ -n "${ARRAY_SPEC}" ]; then
         --time="${TC_TIME}" \
         --array="${ARRAY_SPEC}%${TC_MAX_CONCURRENT}" \
         --export="${EXPORT_VARS}" \
-        submit/torchcrop_array.sh) \
+        submit/utils/torchcrop_array.sh) \
         || { echo "ERROR: shard array submission failed" >&2; exit 1; }
     echo "Shard array submitted : ${ARRAY_JOB}"
 fi
 
 if [ "${DO_MAPS}" -eq 0 ]; then
     echo "Maps skipped (--no-maps). Run them later with:"
-    echo "  sbatch --export=${EXPORT_VARS} submit/torchcrop_maps.sh"
+    echo "  sbatch --export=${EXPORT_VARS} submit/utils/torchcrop_maps.sh"
     exit 0
 fi
 
@@ -338,7 +338,7 @@ MAPS_JOB=$(sbatch --parsable \
     --time="${TC_MAPS_TIME}" \
     "${DEP[@]}" \
     --export="${EXPORT_VARS}" \
-    submit/torchcrop_maps.sh) \
+    submit/utils/torchcrop_maps.sh) \
     || { echo "ERROR: maps submission failed" >&2; exit 1; }
 echo "Maps submitted        : ${MAPS_JOB}${ARRAY_JOB:+  (afterany:${ARRAY_JOB})}"
 
@@ -348,11 +348,11 @@ cat <<EOF
 MONITOR
 ==================================================
   squeue -u \$USER
-  ./submit/torchcrop_status.sh
+  ./submit/baseline/torchcrop_status.sh
   tail -f ${TC_LOG_DIR}/tc_shard_${ARRAY_JOB:-JOBID}_0.out
 
 RETRY missing shards once the array drains:
-  ./submit/submit_torchcrop.sh --retry
+  ./submit/baseline/submit_torchcrop.sh --retry
 
 RESULTS:
   ${TC_OUT_DIR}/torchcrop_europe.parquet

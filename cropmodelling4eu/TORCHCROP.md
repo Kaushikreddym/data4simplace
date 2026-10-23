@@ -16,11 +16,11 @@ list of inputs the export cannot supply are derived in
 Chained behind SIMPLACE, which is how the two are meant to be compared:
 
 ```bash
-./submit/submit_cropmodelling.sh --dry-run    # print the plan, submit nothing
-./submit/submit_cropmodelling.sh              # simplace array -> handoff -> torchcrop
-./submit/submit_cropmodelling.sh --status     # what each of the three stages has finished
-./submit/submit_cropmodelling.sh --retry      # re-run what failed, in order
-./submit/submit_cropmodelling.sh --smoke      # 30 German cells, both models here
+./submit/baseline/submit_cropmodelling.sh --dry-run    # print the plan, submit nothing
+./submit/baseline/submit_cropmodelling.sh              # simplace array -> handoff -> torchcrop
+./submit/baseline/submit_cropmodelling.sh --status     # what each of the three stages has finished
+./submit/baseline/submit_cropmodelling.sh --retry      # re-run what failed, in order
+./submit/baseline/submit_cropmodelling.sh --smoke      # 30 German cells, both models here
 ```
 
 Chaining matters because SIMPLACE's sowing date is a *result*: the rule-based
@@ -33,12 +33,12 @@ calendars.
 
 
 ```bash
-./submit/submit_torchcrop.sh --dry-run    # show the plan, submit nothing
-./submit/submit_torchcrop.sh              # shard array + combine + maps
-./submit/torchcrop_status.sh              # progress, queue, failed shards
-./submit/submit_torchcrop.sh --retry      # resubmit only the missing shards
-./submit/submit_torchcrop.sh --smoke      # 30 German cells here, then evaluate
-./submit/submit_torchcrop.sh --maps-only  # re-render maps from existing shards
+./submit/baseline/submit_torchcrop.sh --dry-run    # show the plan, submit nothing
+./submit/baseline/submit_torchcrop.sh              # shard array + combine + maps
+./submit/baseline/torchcrop_status.sh              # progress, queue, failed shards
+./submit/baseline/submit_torchcrop.sh --retry      # resubmit only the missing shards
+./submit/baseline/submit_torchcrop.sh --smoke      # 30 German cells here, then evaluate
+./submit/baseline/submit_torchcrop.sh --maps-only  # re-render maps from existing shards
 ```
 
 Defaults (all overridable, see [`torchcrop_env.sh`](torchcrop_env.sh)):
@@ -56,9 +56,9 @@ Defaults (all overridable, see [`torchcrop_env.sh`](torchcrop_env.sh)):
 | env | conda `sdba` (holds `torch`, `torchcrop` and this package) |
 
 ```bash
-TC_START_YEAR=1980 TC_TIME=12:00:00 ./submit/submit_torchcrop.sh   # all 45 seasons
-TC_RUN_NAME=potential TC_IOPT=1 ./submit/submit_torchcrop.sh       # potential yield
-TC_RUN_NAME=test TC_END_YEAR=2001 ./submit/submit_torchcrop.sh     # 2 seasons
+TC_START_YEAR=1980 TC_TIME=12:00:00 ./submit/baseline/submit_torchcrop.sh   # all 45 seasons
+TC_RUN_NAME=potential TC_IOPT=1 ./submit/baseline/submit_torchcrop.sh       # potential yield
+TC_RUN_NAME=test TC_END_YEAR=2001 ./submit/baseline/submit_torchcrop.sh     # 2 seasons
 ```
 
 ## The working directory

@@ -3,15 +3,15 @@
 # Progress of a torchcrop Europe run: which shards are done, which are queued,
 # which failed.
 #
-#   ./submit/torchcrop_status.sh
-#   TC_RUN_NAME=other ./submit/torchcrop_status.sh
+#   ./submit/baseline/torchcrop_status.sh
+#   TC_RUN_NAME=other ./submit/baseline/torchcrop_status.sh
 # =============================================================================
 
 set -uo pipefail
 
-SUBMIT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SUBMIT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck disable=SC1091
-source "${SUBMIT_DIR}/torchcrop_env.sh"
+source "${SUBMIT_DIR}/utils/torchcrop_env.sh"
 
 echo "=================================================="
 echo "TORCHCROP RUN STATUS: ${TC_RUN_NAME}"
@@ -55,5 +55,5 @@ grep -l "^FAIL" "${TC_LOG_DIR}"/tc_shard_*.out 2>/dev/null | tail -10 \
 if [ "${#MISSING[@]}" -gt 0 ]; then
     echo ""
     echo "Re-submit the missing shards with:"
-    echo "  ./submit/submit_torchcrop.sh --retry"
+    echo "  ./submit/baseline/submit_torchcrop.sh --retry"
 fi

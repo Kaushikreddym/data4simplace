@@ -80,7 +80,7 @@ def load_shards(shard_dir: Path, n_shards: int) -> pd.DataFrame:
         raise FileNotFoundError(
             f"{len(missing)} of {n_shards} shards missing from {shard_dir}: "
             f"{missing}. Re-run them with "
-            f"'./submit/submit_torchcrop.sh --retry' before mapping."
+            f"'./submit/baseline/submit_torchcrop.sh --retry' before mapping."
         )
     logger.info("loading %d shards from %s", len(paths), shard_dir)
     frame = pd.concat((pd.read_parquet(p) for p in paths), ignore_index=True)

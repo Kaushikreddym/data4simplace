@@ -8,7 +8,7 @@
 # Python beyond this package's CLI.
 #
 # Override anything from the environment before submitting, e.g.
-#   SP_LINES_PER_TASK=5000 ./submit/submit_simplace.sh
+#   SP_LINES_PER_TASK=5000 ./submit/baseline/submit_simplace.sh
 # =============================================================================
 
 # Every SP_* setting is exported, not just assigned: submit_simplace.sh passes
@@ -30,7 +30,7 @@ export SP_LOG_DIR="${SP_LOG_DIR:-${SP_PROJECT_DIR}/submit/logs}"
 export SP_RUN_DIR="${SP_RUN_DIR:-}"
 
 # --- Smoke test ---------------------------------------------------------------
-# `./submit/submit_simplace.sh --smoke` runs a small, evaluable subset instead of
+# `./submit/baseline/submit_simplace.sh --smoke` runs a small, evaluable subset instead of
 # the continent: N cells spread over Germany, each inside a distinct CyBench
 # NUTS-3 region so the yields can be scored against a statistic, and near enough
 # to PEP725 stations that the phenology can be scored too. Germany because it is
@@ -51,7 +51,7 @@ export SP_SMOKE_END="${SP_SMOKE_END:-2024}"
 # solution under its own simplace_iopt<n>/ directory (see --smoke below)
 # rather than patching one run. submit_cropmodelling.sh --smoke sets this
 # once per value in TC_SMOKE_IOPTS to sweep both models together; set by hand
-# for a single other value, e.g. SP_IOPT=2 ./submit/submit_simplace.sh --smoke.
+# for a single other value, e.g. SP_IOPT=2 ./submit/baseline/submit_simplace.sh --smoke.
 export SP_IOPT="${SP_IOPT:-}"
 
 # --- Sharding ----------------------------------------------------------------

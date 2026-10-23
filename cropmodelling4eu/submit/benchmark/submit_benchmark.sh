@@ -3,8 +3,8 @@
 # Throughput benchmark: torchcrop calibration batches on a CPU node, then on a
 # GPU node, appended into one parquet; SIMPLACE read from its own task logs.
 #
-#   ./submit/submit_benchmark.sh              # CPU job, then GPU job after it
-#   ./submit/submit_benchmark.sh --dry-run    # print the sbatch commands
+#   ./submit/benchmark/submit_benchmark.sh              # CPU job, then GPU job after it
+#   ./submit/benchmark/submit_benchmark.sh --dry-run    # print the sbatch commands
 #
 # The GPU job depends on the CPU one (afterany) because both append to the
 # same file. The weather cache must already exist under BENCH_CACHE_FROM — a
@@ -21,8 +21,8 @@
 # =============================================================================
 set -euo pipefail
 
-SUBMIT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "${SUBMIT_DIR}/calibration_env.sh"
+SUBMIT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "${SUBMIT_DIR}/utils/calibration_env.sh"
 
 DRY_RUN=0
 [ "${1:-}" = "--dry-run" ] && DRY_RUN=1
@@ -43,7 +43,7 @@ if grep -q "^source_file: .*Brandenburg" "${CAL_CROP_FILE}"; then
     exit 1
 fi
 
-common="cd '${CAL_PROJECT_DIR}' && source '${SUBMIT_DIR}/calibration_env.sh' && cal_activate && \
+common="cd '${CAL_PROJECT_DIR}' && source '${SUBMIT_DIR}/utils/calibration_env.sh' && cal_activate && \
 cm4eu benchmark --config '${CAL_CONFIG}' --stage '${BENCH_STAGE}' \
 --crop-file '${CAL_CROP_FILE}' --sowing-file '${CAL_SOWING_FILE}' \
 --pep725 '${CAL_PEP725}' --out-dir '${BENCH_CACHE_FROM}' \

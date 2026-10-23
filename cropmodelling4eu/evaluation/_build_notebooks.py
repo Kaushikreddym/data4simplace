@@ -1560,7 +1560,7 @@ Neither pairing is exact, and the spread that comes from the mismatch is not
 model error. Produce the inputs with:
 
 ```bash
-./submit/submit_cropmodelling.sh --smoke
+./submit/baseline/submit_cropmodelling.sh --smoke
 ```
 
 which, once per swept IOPT (`TC_SMOKE_IOPTS`, default `1 2 3`), builds and
@@ -1827,7 +1827,7 @@ The smoke test asks *how close to observations* each model gets and accepts
 that they differ in every respect. This asks the narrower question that one
 cannot answer: **with every difference that is not the model itself removed, do
 the two agree?** The run is produced by
-[`submit/submit_stresstest.py`](../submit/submit_stresstest.py), which removes
+[`submit/benchmark/submit_stresstest.py`](../submit/benchmark/submit_stresstest.py), which removes
 them one at a time:
 
 | Confound | How it is removed |
@@ -1846,8 +1846,8 @@ not the same model; it does not say which is right. For that, read
 [`germany_smoke_evaluation.ipynb`](germany_smoke_evaluation.ipynb).
 
 ```bash
-./submit/submit_stresstest.py                 # both scenarios, both seasons
-./submit/submit_stresstest.py --dry-run       # audit the parameters, run nothing
+./submit/benchmark/submit_stresstest.py                 # both scenarios, both seasons
+./submit/benchmark/submit_stresstest.py --dry-run       # audit the parameters, run nothing
 ```
 """),
     md("## 0. Setup"),
@@ -2132,7 +2132,7 @@ full_run_cells = [
 
 **What this notebook does.** It reads each model's own `winter_wheat_2000_2024`
 production run exactly as
-[`submit/submit_cropmodelling.sh`](../submit/submit_cropmodelling.sh) writes
+[`submit/baseline/submit_cropmodelling.sh`](../submit/baseline/submit_cropmodelling.sh) writes
 it — `cm4eu simplace collect`'s `simplace_europe.parquet` and the shard
 combine's `torchcrop_europe.parquet` — compares both against the CyBench
 national yield and phenology statistics (§4-5), and then compares the two
@@ -2609,7 +2609,7 @@ summary
   disagreement in §6 can come from the sowing date, the crop parameters, the
   year range, or the model physics — this notebook does not separate them.
   `stresstest_evaluation.ipynb` is where that separation is done.
-* **Re-run once both arrays finish.** `submit/submit_cropmodelling.sh --status`
+* **Re-run once both arrays finish.** `submit/baseline/submit_cropmodelling.sh --status`
   reports what each stage has completed; §2's model list is this notebook's
   own record of what it actually saw.
 """),

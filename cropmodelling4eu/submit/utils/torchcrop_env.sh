@@ -9,7 +9,7 @@
 # `data4simplace` being on PATH.
 #
 # Override anything from the environment before submitting, e.g.
-#   TC_START_YEAR=1990 TC_N_SHARDS=20 ./submit/submit_torchcrop.sh
+#   TC_START_YEAR=1990 TC_N_SHARDS=20 ./submit/baseline/submit_torchcrop.sh
 # =============================================================================
 
 # Every TC_* setting is exported, not just assigned: submit_torchcrop.sh passes
@@ -38,7 +38,7 @@ export TC_COMPOSITION_XML="${TC_COMPOSITION_XML:-/beegfs/muduchuru/simplace/Bran
 # Empty -> torchcrop sows on the export's own calendar. Set to the
 # sowing_from_simplace.csv a collected SIMPLACE run writes and every shard sows
 # on SIMPLACE's *simulated* dates instead, which is what
-# submit/submit_cropmodelling.sh chains. A (cell, season) missing from the file
+# submit/baseline/submit_cropmodelling.sh chains. A (cell, season) missing from the file
 # is dropped rather than falling back, so the two models never end up on two
 # different sowing conventions inside one output.
 export TC_SOWING_FILE="${TC_SOWING_FILE:-}"
@@ -47,7 +47,7 @@ export TC_SOWING_FILE="${TC_SOWING_FILE:-}"
 export TC_DEPENDENCY="${TC_DEPENDENCY:-}"
 
 # --- Smoke test ---------------------------------------------------------------
-# `./submit/submit_torchcrop.sh --smoke` runs a small, evaluable subset instead
+# `./submit/baseline/submit_torchcrop.sh --smoke` runs a small, evaluable subset instead
 # of the continent: N cells spread over Germany, each inside a distinct CyBench
 # NUTS-3 region so the yields can be scored against a statistic, and near enough
 # to PEP725 stations that the phenology can be scored too.
@@ -207,11 +207,11 @@ tc_banner() {
 # env.sh next to it.
 tc_find_submit_dir() {
     local d
-    for d in "${TC_PROJECT_DIR:-}/submit" "${SLURM_SUBMIT_DIR:-}/submit" \
+    for d in "${TC_PROJECT_DIR:-}/submit/utils" "${SLURM_SUBMIT_DIR:-}/submit/utils" \
              "$(dirname "${BASH_SOURCE[1]}")"; do
         [ -f "${d}/torchcrop_env.sh" ] && { echo "${d}"; return 0; }
     done
-    echo "ERROR: cannot locate submit/torchcrop_env.sh. Set TC_PROJECT_DIR or" >&2
+    echo "ERROR: cannot locate submit/utils/torchcrop_env.sh. Set TC_PROJECT_DIR or" >&2
     echo "       sbatch from the project root so SLURM_SUBMIT_DIR resolves it." >&2
     return 1
 }

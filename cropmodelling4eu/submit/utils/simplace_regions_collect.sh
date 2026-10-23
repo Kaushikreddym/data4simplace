@@ -15,7 +15,7 @@ set -uo pipefail
 : "${SP_CONFIG:?}" "${CM_REGIONS_ROOT:?}" "${CM_MERGED:?}"
 SUBMIT_DIR="${CM_SUBMIT_DIR:?}"
 # shellcheck disable=SC1091
-source "${SUBMIT_DIR}/simplace_env.sh"
+source "${SUBMIT_DIR}/utils/simplace_env.sh"
 sp_activate
 cd "${SP_PROJECT_DIR}" || exit 1
 

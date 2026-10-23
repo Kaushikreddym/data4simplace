@@ -1,6 +1,6 @@
 """Read and plot a stress-test run — SIMPLACE against torchcrop, same inputs.
 
-The inputs are what ``submit/submit_stresstest.py`` writes under
+The inputs are what ``submit/benchmark/submit_stresstest.py`` writes under
 ``<output_dir>/stresstest``. That run removes every difference between the two
 models that is not the model itself (crop parameters, sowing date, spin-up,
 irrigation, CO2 — see the script's docstring), so unlike

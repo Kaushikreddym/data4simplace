@@ -2,16 +2,16 @@
 # =============================================================================
 # Build a SIMPLACE run from a config, then hand over to the run's own scripts.
 #
-#   ./submit/submit_simplace.sh              # build, then submit the array
-#   ./submit/submit_simplace.sh --build-only # build and validate, submit nothing
-#   ./submit/submit_simplace.sh --prepare    # the same as --build-only
-#   ./submit/submit_simplace.sh --dry-run    # print the plan, submit nothing
-#   ./submit/submit_simplace.sh --status     # what an existing run has finished
-#   ./submit/submit_simplace.sh --retry      # rebuild, then re-run what failed
-#   ./submit/submit_simplace.sh --smoke      # 30 German cells, run here, then evaluate
+#   ./submit/baseline/submit_simplace.sh              # build, then submit the array
+#   ./submit/baseline/submit_simplace.sh --build-only # build and validate, submit nothing
+#   ./submit/baseline/submit_simplace.sh --prepare    # the same as --build-only
+#   ./submit/baseline/submit_simplace.sh --dry-run    # print the plan, submit nothing
+#   ./submit/baseline/submit_simplace.sh --status     # what an existing run has finished
+#   ./submit/baseline/submit_simplace.sh --retry      # rebuild, then re-run what failed
+#   ./submit/baseline/submit_simplace.sh --smoke      # 30 German cells, run here, then evaluate
 #
-# Cluster defaults live in submit/simplace_env.sh and can be overridden:
-#   SP_LINES_PER_TASK=5000 SP_TIME=24:00:00 ./submit/submit_simplace.sh
+# Cluster defaults live in submit/utils/simplace_env.sh and can be overridden:
+#   SP_LINES_PER_TASK=5000 SP_TIME=24:00:00 ./submit/baseline/submit_simplace.sh
 #
 # This script exists only to get from a *config* to a built run directory. Once
 # that exists it is self-driving: `cm4eu simplace build` writes submit.sh and
@@ -30,9 +30,9 @@
 
 set -uo pipefail
 
-SUBMIT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SUBMIT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck disable=SC1091
-source "${SUBMIT_DIR}/simplace_env.sh"
+source "${SUBMIT_DIR}/utils/simplace_env.sh"
 
 BUILD_ONLY=0
 SMOKE=0

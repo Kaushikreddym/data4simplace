@@ -1,7 +1,7 @@
 #!/bin/bash
 # =============================================================================
 # Shared settings for the torchcrop calibration over Europe.
-# Sourced by submit/submit_calibration.sh and submit/calibrate.sh.
+# Sourced by submit/calibration/submit_calibration.sh and submit/utils/calibrate.sh.
 #
 # Separate from torchcrop_env.sh because this run consumes the *finished*
 # outputs of both models rather than producing one: it needs a completed
@@ -10,7 +10,7 @@
 # inherit the shard array's settings, which describe a production run.
 #
 # Override anything from the environment before submitting, e.g.
-#   CAL_STAGE=phenology CAL_EPOCHS=20 ./submit/submit_calibration.sh
+#   CAL_STAGE=phenology CAL_EPOCHS=20 ./submit/calibration/submit_calibration.sh
 # =============================================================================
 
 # Every CAL_* setting is exported, not just assigned: submit_calibration.sh

@@ -1,6 +1,6 @@
 """Run torchcrop (LINTUL-5) over the export, one shard per job.
 
-Library and ``python -m`` entry point behind ``submit/torchcrop_array.sh``.
+Library and ``python -m`` entry point behind ``submit/utils/torchcrop_array.sh``.
 Everything about *reading* the export lives in
 :mod:`cropmodelling4eu.export`; this module is only the modelling.
 
@@ -905,7 +905,7 @@ def run_shard(
     """Run one shard over every requested season and write its Parquet.
 
     ``sowing`` replaces the export's calendar with another model's simulated
-    dates — what ``submit/submit_cropmodelling.sh`` hands over from a finished
+    dates — what ``submit/baseline/submit_cropmodelling.sh`` hands over from a finished
     SIMPLACE run. It changes the batching as well as the dates: see
     :func:`sowing_plan`.
 

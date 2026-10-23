@@ -24,7 +24,7 @@
 # series, hist-aer (and hist-nat) stay at 1850, as their GCMs were forced.
 #
 # Afterwards, crop-model each finished export with
-#   cropmodelling4eu/submit/submit_production.sh cmip6
+#   cropmodelling4eu/submit/production/submit_production.sh cmip6
 # =============================================================================
 
 set -uo pipefail

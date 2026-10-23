@@ -2,9 +2,9 @@
 # =============================================================================
 # Run N independent torchcrop calibrations side by side on ONE node.
 #
-#   ./submit/submit_calibration_ensemble.sh --dry-run   # print the plan
-#   ./submit/submit_calibration_ensemble.sh             # one SLURM job, N members
-#   ./submit/submit_calibration_ensemble.sh --local     # run here (this node)
+#   ./submit/calibration/submit_calibration_ensemble.sh --dry-run   # print the plan
+#   ./submit/calibration/submit_calibration_ensemble.sh             # one SLURM job, N members
+#   ./submit/calibration/submit_calibration_ensemble.sh --local     # run here (this node)
 #
 # One calibration is a chain of Adam steps and cannot use more than about one
 # core (the day loop is sequential; splitting a batch across workers measured
@@ -31,14 +31,14 @@
 set -uo pipefail
 
 # Inside the job SLURM runs a spooled copy of this file, so its own directory
-# does not hold calibration_env.sh; CAL_PROJECT_DIR (exported) does.
-for _d in "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" \
+# is not under submit/; CAL_PROJECT_DIR (exported) locates it.
+for _d in "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)" \
           "${CAL_PROJECT_DIR:-}/submit" "${SLURM_SUBMIT_DIR:-}/submit"; do
-    [ -f "${_d}/calibration_env.sh" ] && { SUBMIT_DIR="${_d}"; break; }
+    [ -f "${_d}/utils/calibration_env.sh" ] && { SUBMIT_DIR="${_d}"; break; }
 done
-[ -n "${SUBMIT_DIR:-}" ] || { echo "ERROR: cannot locate submit/calibration_env.sh" >&2; exit 1; }
+[ -n "${SUBMIT_DIR:-}" ] || { echo "ERROR: cannot locate submit/utils/calibration_env.sh" >&2; exit 1; }
 # shellcheck disable=SC1091
-source "${SUBMIT_DIR}/calibration_env.sh"
+source "${SUBMIT_DIR}/utils/calibration_env.sh"
 
 MODE=submit
 for arg in "$@"; do
@@ -66,7 +66,7 @@ run_members() {
     mkdir -p "${shared}"
     echo "=== building the shared caches in ${shared} $(date -Is)"
     CAL_OUT_DIR="${shared}" CAL_PREPARE_ONLY=1 CAL_WORKERS=1 \
-        bash "${SUBMIT_DIR}/calibrate.sh" > "${shared}/prepare.log" 2>&1 \
+        bash "${SUBMIT_DIR}/utils/calibrate.sh" > "${shared}/prepare.log" 2>&1 \
         || { echo "ERROR: shared prepare failed; see ${shared}/prepare.log" >&2; return 1; }
 
     local pids=() seed out
@@ -78,7 +78,7 @@ run_members() {
         done
         CAL_OUT_DIR="${out}" CAL_SEED="${seed}" CAL_WORKERS="${CAL_MEMBER_WORKERS}" \
         CAL_PREPARE_ONLY=0 OMP_NUM_THREADS="${CAL_THREADS}" \
-            bash "${SUBMIT_DIR}/calibrate.sh" > "${out}/calibrate.log" 2>&1 &
+            bash "${SUBMIT_DIR}/utils/calibrate.sh" > "${out}/calibrate.log" 2>&1 &
         pids+=("$!:${seed}")
         echo "member seed ${seed}: pid $! -> ${out}"
     done
@@ -130,7 +130,7 @@ mkdir -p "${CAL_LOG_DIR}"
 JOB=$(sbatch --parsable --job-name=cm_calib_ens --partition="${CAL_ENS_PARTITION}" \
     --nodes=1 --ntasks=1 --cpus-per-task="${CPUS}" --mem="${CAL_ENS_MEM}" \
     --time="${CAL_ENS_TIME}" --output="${CAL_LOG_DIR}/cm_calib_ens_%j.log" \
-    --export=ALL "${SUBMIT_DIR}/submit_calibration_ensemble.sh" --run) \
+    --export=ALL "${SUBMIT_DIR}/calibration/submit_calibration_ensemble.sh" --run) \
     || { echo "sbatch failed" >&2; exit 1; }
 echo "submitted job ${JOB}"
 echo "  members : ${CAL_ENS_DIR}/member_<seed>/calibrate.log"

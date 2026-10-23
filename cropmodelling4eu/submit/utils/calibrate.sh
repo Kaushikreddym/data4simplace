@@ -2,8 +2,8 @@
 # =============================================================================
 # SLURM job: the whole staged torchcrop calibration, in one process.
 #
-# Submitted by submit/submit_calibration.sh. Safe to sbatch directly if the
-# CAL_* environment is already set (source submit/calibration_env.sh first).
+# Submitted by submit/calibration/submit_calibration.sh. Safe to sbatch directly if the
+# CAL_* environment is already set (source submit/utils/calibration_env.sh first).
 #
 # ONE job, not a chain, for a reason: `Calibrator.run()` carries each stage's
 # fitted crop into the next *in memory* -- stage 2 starts from stage 1's
@@ -23,12 +23,12 @@
 
 set -uo pipefail
 
-for _d in "${CAL_PROJECT_DIR:-}/submit" "${SLURM_SUBMIT_DIR:-}/submit" \
+for _d in "${CAL_PROJECT_DIR:-}/submit/utils" "${SLURM_SUBMIT_DIR:-}/submit/utils" \
           "$(dirname "${BASH_SOURCE[0]}")"; do
     [ -f "${_d}/calibration_env.sh" ] && { CAL_SUBMIT_DIR="${_d}"; break; }
 done
 if [ -z "${CAL_SUBMIT_DIR:-}" ]; then
-    echo "ERROR: cannot locate submit/calibration_env.sh. Set CAL_PROJECT_DIR or" >&2
+    echo "ERROR: cannot locate submit/utils/calibration_env.sh. Set CAL_PROJECT_DIR or" >&2
     echo "       sbatch from the project root so SLURM_SUBMIT_DIR resolves it." >&2
     exit 1
 fi

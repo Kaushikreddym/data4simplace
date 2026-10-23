@@ -1,8 +1,9 @@
+#!/usr/bin/env python3
 """Independent stress test: SIMPLACE and torchcrop on one crop, one sowing date.
 
-    ./submit/submit_stresstest.py --dry-run     # audit the parameters, run nothing
-    ./submit/submit_stresstest.py               # both scenarios, both seasons
-    ./submit/submit_stresstest.py --scenarios limited --years 2003
+    ./submit/benchmark/submit_stresstest.py --dry-run     # audit the parameters, run nothing
+    ./submit/benchmark/submit_stresstest.py               # both scenarios, both seasons
+    ./submit/benchmark/submit_stresstest.py --scenarios limited --years 2003
 
 This is not the smoke test with different settings. The smoke test asks *how
 close to observations* each model gets and accepts that they differ in every
@@ -427,7 +428,7 @@ def write_workspace_config(
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--config", type=Path,
-                        default=Path(__file__).resolve().parents[1] / "config.yaml")
+                        default=Path(__file__).resolve().parents[2] / "config.yaml")
     parser.add_argument("--cells", type=Path, default=DEFAULT_CELLS)
     parser.add_argument("--out-dir", type=Path)
     parser.add_argument("--years", type=int, nargs="+", default=[2003, 2005])

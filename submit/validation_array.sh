@@ -15,7 +15,7 @@
 # design exists to remove.
 #
 # SLURM_ARRAY_TASK_ID *is* the tile index, exactly as it is the shard index in
-# cropmodelling4eu/submit/torchcrop_array.sh.
+# cropmodelling4eu/submit/utils/torchcrop_array.sh.
 # =============================================================================
 #SBATCH --job-name=d4s_val
 #SBATCH --output=submit/logs/val_%A_%a.out

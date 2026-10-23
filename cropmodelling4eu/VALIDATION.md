@@ -5,8 +5,8 @@ NUTS-3 regions), winter wheat, harvest years 2000–2010. Both models run the
 **same cells** from the same export, so they differ only in the model.
 
 ```bash
-./submit/submit_simplace.sh  --smoke          # cells, config, SIMPLACE run, collect
-./submit/submit_torchcrop.sh --smoke          # the same cells through torchcrop
+./submit/baseline/submit_simplace.sh  --smoke          # cells, config, SIMPLACE run, collect
+./submit/baseline/submit_torchcrop.sh --smoke          # the same cells through torchcrop
 cm4eu smoke validate --cells cells.csv --torchcrop tc.parquet \
     --simplace sp.parquet --out-dir validation/
 ```

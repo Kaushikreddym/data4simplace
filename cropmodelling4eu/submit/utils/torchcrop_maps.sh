@@ -17,12 +17,12 @@
 
 set -uo pipefail
 
-for _d in "${TC_PROJECT_DIR:-}/submit" "${SLURM_SUBMIT_DIR:-}/submit" \
+for _d in "${TC_PROJECT_DIR:-}/submit/utils" "${SLURM_SUBMIT_DIR:-}/submit/utils" \
           "$(dirname "${BASH_SOURCE[0]}")"; do
     [ -f "${_d}/torchcrop_env.sh" ] && { TC_SUBMIT_DIR="${_d}"; break; }
 done
 if [ -z "${TC_SUBMIT_DIR:-}" ]; then
-    echo "ERROR: cannot locate submit/torchcrop_env.sh. Set TC_PROJECT_DIR or" >&2
+    echo "ERROR: cannot locate submit/utils/torchcrop_env.sh. Set TC_PROJECT_DIR or" >&2
     echo "       sbatch from the project root so SLURM_SUBMIT_DIR resolves it." >&2
     exit 1
 fi

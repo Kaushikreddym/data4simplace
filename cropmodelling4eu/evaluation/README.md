@@ -21,7 +21,7 @@ The last two evaluate **two models**, not one, and they ask different questions
 of the same pair. `germany_smoke_evaluation.ipynb` asks how close to
 observations each gets, and accepts that they differ in every respect.
 `stresstest_evaluation.ipynb` reads the run
-[`submit/submit_stresstest.py`](../submit/submit_stresstest.py) produces, in
+[`submit/benchmark/submit_stresstest.py`](../submit/benchmark/submit_stresstest.py) produces, in
 which every difference that is not the model itself has been removed — crop
 parameters, sowing date, spin-up, irrigation, CO₂ — so it can ask whether the
 two then agree. **It contains no observation**: every number in it is signed

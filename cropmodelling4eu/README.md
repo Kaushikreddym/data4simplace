@@ -73,11 +73,11 @@ rather than dropping out.
 
 ```bash
 # Chained: SIMPLACE first, torchcrop on its simulated sowing dates
-./submit/submit_cropmodelling.sh --dry-run    # print the plan, submit nothing
-./submit/submit_cropmodelling.sh              # simplace array -> handoff -> torchcrop
-./submit/submit_cropmodelling.sh --status     # what each of the three stages has finished
-./submit/submit_cropmodelling.sh --retry      # re-run what failed, in order
-./submit/submit_cropmodelling.sh --smoke      # 30 German cells, both models here
+./submit/baseline/submit_cropmodelling.sh --dry-run    # print the plan, submit nothing
+./submit/baseline/submit_cropmodelling.sh              # simplace array -> handoff -> torchcrop
+./submit/baseline/submit_cropmodelling.sh --status     # what each of the three stages has finished
+./submit/baseline/submit_cropmodelling.sh --retry      # re-run what failed, in order
+./submit/baseline/submit_cropmodelling.sh --smoke      # 30 German cells, both models here
 ```
 
 Chaining matters because SIMPLACE's sowing date is a *result*: the rule-based
@@ -91,11 +91,11 @@ calendars.
 ## Running torchcrop alone
 
 ```bash
-./submit/submit_torchcrop.sh --dry-run    # show the plan, submit nothing
-./submit/submit_torchcrop.sh              # shard array + combine + maps
-./submit/torchcrop_status.sh              # progress, queue, failed shards
-./submit/submit_torchcrop.sh --retry      # resubmit only the missing shards
-./submit/submit_torchcrop.sh --smoke      # 30 German cells here, then evaluate
+./submit/baseline/submit_torchcrop.sh --dry-run    # show the plan, submit nothing
+./submit/baseline/submit_torchcrop.sh              # shard array + combine + maps
+./submit/baseline/torchcrop_status.sh              # progress, queue, failed shards
+./submit/baseline/submit_torchcrop.sh --retry      # resubmit only the missing shards
+./submit/baseline/submit_torchcrop.sh --smoke      # 30 German cells here, then evaluate
 ```
 
 See [TORCHCROP.md](TORCHCROP.md) for the sharding, batching and I/O design, and
@@ -178,7 +178,7 @@ Three things are worth knowing before reading a result:
   single 80-core node already covers; extra nodes would idle, and threads do
   nothing because the day loop holds the GIL.
 
-Submit it with `./submit/submit_calibration.sh` (see `--help`); run
+Submit it with `./submit/calibration/submit_calibration.sh` (see `--help`); run
 `--prepare` first on a new export.
 
 ## Layout

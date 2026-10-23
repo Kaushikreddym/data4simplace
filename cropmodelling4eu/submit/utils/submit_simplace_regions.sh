@@ -3,10 +3,10 @@
 # Build + submit one SIMPLACE run per calibration region, each on its own
 # calibrated crop.xml, --jobs regions at a time.
 #
-#   ./submit/submit_simplace_regions.sh --export-dir <cm4eu export-regions dir>
-#   ./submit/submit_simplace_regions.sh --export-dir <dir> --dry-run
-#   ./submit/submit_simplace_regions.sh --export-dir <dir> --build-only
-#   ./submit/submit_simplace_regions.sh --export-dir <dir> --jobs 12
+#   ./submit/utils/submit_simplace_regions.sh --export-dir <cm4eu export-regions dir>
+#   ./submit/utils/submit_simplace_regions.sh --export-dir <dir> --dry-run
+#   ./submit/utils/submit_simplace_regions.sh --export-dir <dir> --build-only
+#   ./submit/utils/submit_simplace_regions.sh --export-dir <dir> --jobs 12
 #
 # --export-dir is a `cm4eu export-regions` output directory:
 #   cells_region_<NN>.csv   -- that region's SimplaceID list
@@ -16,7 +16,7 @@
 #                              the template's own crop.xml, unchanged)
 #
 # Each region is its own `cm4eu simplace build --cells-file ...`, i.e. exactly
-# what submit/submit_simplace.sh does, restricted to one region's cells, with
+# what submit/baseline/submit_simplace.sh does, restricted to one region's cells, with
 # that region's crop.xml *copied* into the built workspace afterwards (a
 # solution reads SIMPLACE's crop parameters from one project-wide file, so a
 # per-region run means a per-region *build*, not a per-region flag). It is a
@@ -43,14 +43,14 @@
 # concurrency (TC_MAX_CONCURRENT / SP_MAX_CONCURRENT), which --jobs does not
 # touch -- this only parallelises the login-node build step.
 #
-# Cluster settings come from submit/simplace_env.sh, same as submit_simplace.sh.
+# Cluster settings come from submit/utils/simplace_env.sh, same as submit_simplace.sh.
 # =============================================================================
 
 set -uo pipefail
 
-SUBMIT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SUBMIT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck disable=SC1091
-source "${SUBMIT_DIR}/simplace_env.sh"
+source "${SUBMIT_DIR}/utils/simplace_env.sh"
 
 EXPORT_DIR=""
 OUT_ROOT="${SP_REGIONS_OUT_ROOT:-}"

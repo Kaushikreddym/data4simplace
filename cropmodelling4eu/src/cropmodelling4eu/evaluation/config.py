@@ -96,7 +96,7 @@ SIM_PARQUET: Final[Path] = _env_path(
 )
 
 #: A finished SIMPLACE run directory, written by ``cm4eu simplace collect``
-#: (see ``submit/submit_cropmodelling.sh``). Sibling of TORCHCROP_RUN_DIR under
+#: (see ``submit/baseline/submit_cropmodelling.sh``). Sibling of TORCHCROP_RUN_DIR under
 #: the same ``.../cropmodelling4eu/<run>/`` root (``simplace/`` next to
 #: ``torchcrop/``), kept as its own variable rather than derived from
 #: TORCHCROP_RUN_DIR since a run is routinely evaluated with one side finished

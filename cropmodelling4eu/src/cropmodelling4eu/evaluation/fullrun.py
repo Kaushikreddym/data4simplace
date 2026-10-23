@@ -13,7 +13,7 @@ against CyBench and against each other. Unlike
 :mod:`~cropmodelling4eu.evaluation.germany` (a matched 30-cell smoke test) or
 :mod:`~cropmodelling4eu.evaluation.stresstest` (every non-model input forced
 equal), this reads each pipeline's *delivered* production output as
-``submit/submit_cropmodelling.sh`` writes it -- whatever inputs actually
+``submit/baseline/submit_cropmodelling.sh`` writes it -- whatever inputs actually
 differ between the two runs (sowing date, year coverage, cell set) stay in.
 """
 

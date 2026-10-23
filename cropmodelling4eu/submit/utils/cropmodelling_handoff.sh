@@ -3,7 +3,7 @@
 # The join between the two models: collect the finished SIMPLACE run and write
 # the sowing dates torchcrop is then to sow on.
 #
-# Submitted by submit/submit_cropmodelling.sh with a dependency on the SIMPLACE
+# Submitted by submit/baseline/submit_cropmodelling.sh with a dependency on the SIMPLACE
 # array. It exists as its own job because the sowing table cannot be written
 # until every SIMPLACE task has finished, and the torchcrop array cannot start
 # until it has been.
@@ -21,12 +21,12 @@
 
 set -uo pipefail
 
-for _d in "${SP_PROJECT_DIR:-}/submit" "${SLURM_SUBMIT_DIR:-}/submit" \
+for _d in "${SP_PROJECT_DIR:-}/submit/utils" "${SLURM_SUBMIT_DIR:-}/submit/utils" \
           "$(dirname "${BASH_SOURCE[0]}")"; do
     [ -f "${_d}/simplace_env.sh" ] && { SUBMIT_DIR="${_d}"; break; }
 done
 if [ -z "${SUBMIT_DIR:-}" ]; then
-    echo "ERROR: cannot locate submit/simplace_env.sh. Set SP_PROJECT_DIR." >&2
+    echo "ERROR: cannot locate submit/utils/simplace_env.sh. Set SP_PROJECT_DIR." >&2
     exit 1
 fi
 # shellcheck disable=SC1091

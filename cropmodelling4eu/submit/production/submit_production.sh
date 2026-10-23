@@ -4,13 +4,13 @@
 # forcing: the MSWX reanalysis and every bias-corrected, downscaled CMIP6
 # model x experiment.
 #
-#   ./submit/submit_production.sh --dry-run mswx cmip6     # checks + plan only
-#   ./submit/submit_production.sh mswx                     # the EU validation run
-#   ./submit/submit_production.sh cmip6                    # every finished export
-#   ./submit/submit_production.sh cmip6/MIROC6             # one model, all experiments
-#   ./submit/submit_production.sh cmip6/MIROC6/ssp370      # one experiment
-#   ./submit/submit_production.sh --after 861500 cmip6     # hold the chain behind a job
-#   ./submit/submit_production.sh --torchcrop-only mswx | --simplace-only ...
+#   ./submit/production/submit_production.sh --dry-run mswx cmip6     # checks + plan only
+#   ./submit/production/submit_production.sh mswx                     # the EU validation run
+#   ./submit/production/submit_production.sh cmip6                    # every finished export
+#   ./submit/production/submit_production.sh cmip6/MIROC6             # one model, all experiments
+#   ./submit/production/submit_production.sh cmip6/MIROC6/ssp370      # one experiment
+#   ./submit/production/submit_production.sh --after 861500 cmip6     # hold the chain behind a job
+#   ./submit/production/submit_production.sh --torchcrop-only mswx | --simplace-only ...
 #
 # Naming: one directory per forcing, no dates --
 #   <output_dir>/runs/<crop>/calibrated/mswx
@@ -45,11 +45,11 @@
 # =============================================================================
 set -uo pipefail
 
-SUBMIT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SUBMIT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PROJECT_DIR="$(cd "${SUBMIT_DIR}/.." && pwd)"
 INPUTS=/data01/FDS/muduchuru/Data/SIMPLACE/cropmodelling4eu_inputs
 
-BASE_CONFIG="${BASE_CONFIG:-${SUBMIT_DIR}/config_nfix.yaml}"
+BASE_CONFIG="${BASE_CONFIG:-${SUBMIT_DIR}/production/config_production.yaml}"
 CROP_NAME="${CROP_NAME:-winter_wheat}"
 OUTPUT_DIR=$(python3 -c "import yaml,sys; print(yaml.safe_load(open(sys.argv[1]))['paths']['output_dir'])" "${BASE_CONFIG}")
 CAL_DIR="${CAL_DIR:-${OUTPUT_DIR}/winter_wheat_2000_2024_euval/calibration}"
@@ -96,7 +96,7 @@ for F in "${FORCINGS[@]}"; do
 done
 
 # shellcheck disable=SC1091
-source "${SUBMIT_DIR}/simplace_env.sh"
+source "${SUBMIT_DIR}/utils/simplace_env.sh"
 sp_activate
 cd "${PROJECT_DIR}" || exit 1
 
@@ -228,7 +228,7 @@ for KEY in "${KEYS[@]}"; do
     if [ "${DO_SP}" -eq 1 ]; then
         (
             export SP_CONFIG="${CONFIG}" SP_RUN_NAME="${RUN_NAME}" SP_RUN_DIR="" SP_LINES_PER_TASK="${LINES}"
-            "${SUBMIT_DIR}/submit_simplace_regions.sh" --export-dir "${REGIONS_EXPORT}" \
+            "${SUBMIT_DIR}/utils/submit_simplace_regions.sh" --export-dir "${REGIONS_EXPORT}" \
                 --out-root "${SP_ROOT_DIR}" --build-only > "${LOGS}/region_builds.log" 2>&1
         ) || { echo "  SKIP: region builds failed (see ${LOGS}/region_builds.log)" >&2; STATUS=1; continue; }
 
@@ -251,14 +251,14 @@ for KEY in "${KEYS[@]}"; do
             --partition="${SP_PARTITION}" --cpus-per-task="${SP_CPUS}" \
             --mem="${SP_MEM}" --time="${SP_TIME}" --array="0-$((N_TASKS - 1))%${SP_SLOTS}" \
             --output="${LOGS}/sp_%A_%a.out" --error="${LOGS}/sp_%A_%a.err" \
-            --export="ALL,SP_TASK_TABLE=${TABLE}" "${SUBMIT_DIR}/simplace_task_table.sh") \
+            --export="ALL,SP_TASK_TABLE=${TABLE}" "${SUBMIT_DIR}/utils/simplace_task_table.sh") \
             || die "SIMPLACE array submission failed for ${KEY}"
         PREV_SP="${SP_JOB}"
         SP_COLLECT_JOB=$(sbatch --parsable --job-name="sp_${KEY//\//_}_collect" \
             --dependency="afterany:${SP_JOB}" --partition="${SP_PARTITION}" \
             --mem=32G --time=04:00:00 --output="${LOGS}/collect_%j.out" \
             --export="ALL,SP_CONFIG=${CONFIG},CM_SUBMIT_DIR=${SUBMIT_DIR},CM_REGIONS_ROOT=${SP_ROOT_DIR},CM_MERGED=${OUT_ROOT}/simplace/simplace_europe.parquet" \
-            "${SUBMIT_DIR}/simplace_regions_collect.sh") \
+            "${SUBMIT_DIR}/utils/simplace_regions_collect.sh") \
             || die "collect submission failed for ${KEY}"
         echo "  SIMPLACE : array ${SP_JOB} (${N_TASKS} tasks), merge ${SP_COLLECT_JOB}"
     fi
@@ -286,13 +286,13 @@ for KEY in "${KEYS[@]}"; do
             export TC_DEPENDENCY="${WAIT[*]:+afterany:$(IFS=:; echo "${WAIT[*]}")}"
             unset TC_SHARD_DIR TC_WORK_DIR TC_CROP_FILE
             # shellcheck disable=SC1091
-            source "${SUBMIT_DIR}/torchcrop_env.sh"
+            source "${SUBMIT_DIR}/utils/torchcrop_env.sh"
             # Prepare first and inspect the fallback crop before anything queues;
             # the submit re-prepares it identically from the same inputs.
-            "${SUBMIT_DIR}/submit_torchcrop.sh" --prepare || exit 1
+            "${SUBMIT_DIR}/baseline/submit_torchcrop.sh" --prepare || exit 1
             grep -q "^source_file: .*LINTUL5_crop.xml" "${TC_CROP_FILE}" \
                 || { echo "fallback crop ${TC_CROP_FILE} is not SUSTAg-derived" >&2; exit 1; }
-            "${SUBMIT_DIR}/submit_torchcrop.sh"
+            "${SUBMIT_DIR}/baseline/submit_torchcrop.sh"
         ) > "${TC_LOG}" 2>&1 || { echo "  torchcrop submission FAILED (see ${TC_LOG})" >&2; STATUS=1; continue; }
         TC_JOB=$(sed -n 's/^Shard array submitted : *\([0-9]*\).*/\1/p' "${TC_LOG}")
         [ -n "${TC_JOB}" ] && PREV_TC="${TC_JOB}"

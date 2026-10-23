@@ -235,7 +235,7 @@ single tile the moment keys exist.
 - **Target** `/data01/FDS/muduchuru/Data/Agri/CLMS/tiles/<product>/<year>/` — beside the other
   reference datasets (`cybench`, `EnSv8`, `PEP725`, `SAGE_crop_calendar`) rather than on
   scratch, so the acquisition is a permanent pipeline input, not run output.
-- **SLURM array over tiles**, patterned on `cropmodelling4eu/submit/submit_torchcrop.sh`.
+- **SLURM array over tiles**, patterned on `cropmodelling4eu/submit/baseline/submit_torchcrop.sh`.
 
 Order the fetch by need: the EnS zones PEP725 cannot reach first, so stage 1 can start on
 the Mediterranean and Nordic gap before the full 80.7 GB lands.

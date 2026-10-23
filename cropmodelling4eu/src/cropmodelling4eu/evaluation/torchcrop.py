@@ -1,7 +1,7 @@
 """Loader for the combined TorchCrop Europe run.
 
 The run is one Parquet of ``(cell, season)`` rows written by
-``submit/torchcrop_maps.py``. This module reads it, derives the phenology
+``submit/utils/torchcrop_maps.sh``. This module reads it, derives the phenology
 day-of-year columns the evaluation needs, and does nothing else — country
 assignment lives in :mod:`utils.regions`, aggregation in
 :mod:`utils.aggregate`.

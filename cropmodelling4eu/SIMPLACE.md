@@ -13,8 +13,8 @@ cm4eu simplace build --config config.yaml --out-dir <dir> [--cells 4]
 <dir>/submit.sh --retry                  # only what did not exit zero
 cm4eu simplace collect --config config.yaml --out-dir <dir>
 
-./submit/submit_simplace.sh --dry-run    # config -> build -> the above
-./submit/submit_simplace.sh --build-only # build and validate, submit nothing
+./submit/baseline/submit_simplace.sh --dry-run    # config -> build -> the above
+./submit/baseline/submit_simplace.sh --build-only # build and validate, submit nothing
 ```
 
 | | |
@@ -439,4 +439,4 @@ simulation. `co2: annual` rewrites the solution at build time instead
 
 Verified in the container on 3 cells, 1990/91 season: yield 660 / 1089 / 1079
 g m-2 for 284/284, 800/800 and 284→800 ppm tables. The value switches mid-run;
-it is not read once at initialisation. Used by `submit/submit_production.sh` for every CMIP6 run.
+it is not read once at initialisation. Used by `submit/production/submit_production.sh` for every CMIP6 run.
