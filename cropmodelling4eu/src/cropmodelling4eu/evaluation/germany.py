@@ -36,6 +36,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from cropmodelling4eu.crops import CROP_PROFILE
+
 logger = logging.getLogger(__name__)
 
 __all__ = [
@@ -57,8 +59,8 @@ __all__ = [
 ]
 
 CYBENCH_DE = Path(
-    "/data01/FDS/muduchuru/Data/Agri/cybench/cybench-data/wheat/DE/yield_wheat_DE.csv"
-)
+    "/data01/FDS/muduchuru/Data/Agri/cybench/cybench-data"
+) / CROP_PROFILE.cybench / "DE" / f"yield_{CROP_PROFILE.cybench}_DE.csv"
 PEP725_FILES = [
     Path("/data01/FDS/muduchuru/Data/Agri/PEP725/pep725_20260807_0.csv"),
     Path("/data01/FDS/muduchuru/Data/Agri/PEP725/pep725_20260807_400000.csv"),
@@ -350,18 +352,22 @@ def validate_yield(
 
 
 def load_pep725(cells: pd.DataFrame, years: tuple[int, int]) -> pd.DataFrame:
-    """PEP725 wheat observations matched to the nearest simulated cell."""
+    """PEP725 observations of the active crop, matched to the nearest simulated cell."""
+    from data4simplace.phenology.pep725 import PEP_CROPS
+
+    crop = PEP_CROPS[CROP_PROFILE.pep725]
     pep = pd.concat(
         [pd.read_csv(path, sep=";") for path in PEP725_FILES], ignore_index=True
     )
     pep = pep[
-        (pep["genus"] == "Triticum")
+        (pep["genus"] == crop.genus)
         & pep["year"].between(*years)
         & pep["phase_id"].isin(PHASES)
     ]
     # cult_season 2 is the winter crop, 0 unspecified. Keeping the rest would
-    # mix a spring-sown series into a winter-wheat comparison.
-    if "cult_season" in pep:
+    # mix a spring-sown series into a winter-wheat comparison. A crop with no
+    # season filter (maize: every row is 0) keeps everything.
+    if "cult_season" in pep and crop.cult_seasons is not None:
         pep = pep[pep["cult_season"].isin([0, 2])]
 
     stations = pep[["s_id", "lon", "lat"]].drop_duplicates()

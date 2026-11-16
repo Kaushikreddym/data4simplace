@@ -191,12 +191,20 @@ class ClimateConfig(BaseModel):
     # ``<model>_<experiment>`` folder of a cmip6_bc source, e.g. MIROC6_hist-aer.
     experiment: Optional[str] = None
     # ``daily``  - one file per day, ``<FOLDER>/YYYYDDD.nc``: the published layout.
-    # ``yearly`` - one file per year, matched by ``yearly_pattern`` under the
+    # ``yearly`` - one file per year, matched by ``yearly_patterns`` under the
     #              source's parent root. Both store one compressed chunk per day,
     #              so the bytes decompressed are identical; yearly saves the
     #              per-file opens, measured 15x faster for a 5 degree tile.
     layout: Literal["daily", "yearly"] = "daily"
-    yearly_pattern: str = "_yearly_cache/{experiment}/*/BCSD_{var}_model_scenario_{year}.nc"
+    # Tried in order, per variable; the first that matches any year is used
+    # for every year, so one variable never mixes two generations of files.
+    # climdata's dtr scheme leaves the raw (unordered) tasmin beside dtr and
+    # writes the reconciled tasmin/tasmax -- the ones its daily output is built
+    # from -- under ordered/, so ordered/ must win.
+    yearly_patterns: list[str] = Field(default_factory=lambda: [
+        "_yearly_cache/{experiment}/*/ordered/BCSD_{var}_model_scenario_{year}.nc",
+        "_yearly_cache/{experiment}/*/BCSD_{var}_model_scenario_{year}.nc",
+    ])
     # Canonical names (values of ``variables``) that must load. A missing one
     # fails the run at --dry-run rather than leaving its weather column at the
     # sentinel: a CMIP6 model without rsds is not runnable, and filling it from

@@ -21,8 +21,9 @@ output/
 .venv/
 venv/
 
-# Personal Claude Code settings
-.claude/settings.local.json
+# Claude Code: project instructions and settings, at any depth
+CLAUDE.md
+.claude/
 
 # Demo notebook downloads
 outputs_demo/
@@ -32,4 +33,9 @@ notebooks/outputs/
 cropmodelling4eu/evaluation/outputs/
 cropmodelling4eu/simplace
 cropmodelling4eu/outputs/
-CLAUDE.md
+
+# Logs: SLURM job output (submit/logs/, cropmodelling4eu/submit/logs/) and any
+# stray log files
+**/logs/
+*.log
+slurm-*.out

@@ -23,6 +23,7 @@ the 70/15/15.
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from dataclasses import dataclass
 
 import numpy as np
@@ -171,4 +172,31 @@ def make_split(
     if split.train.empty:
         raise ValueError("the split left no training rows — the pool is too small")
     logger.info("%s", split.summarise())
+    return split
+
+
+def load_split(unit_years: pd.DataFrame, path: Path | str) -> Split:
+    """The split another run drew, applied to these unit-years.
+
+    A unit-year the file does not list is dropped, not assigned: inventing a
+    set for it would make the two runs disagree on exactly what the reuse
+    exists to hold fixed.
+
+    Raises:
+        ValueError: If no unit-year is left in training.
+    """
+    table = pd.read_parquet(path)[["unit", "year", "split"]]
+    tagged = unit_years.merge(table, on=["unit", "year"], how="inner")
+    parts = {name: tagged[tagged["split"] == name].drop(columns="split").reset_index(drop=True)
+             for name in ("train", "val", "test")}
+    if parts["train"].empty:
+        raise ValueError(f"{path} leaves no training row for this pool")
+    train_years, train_units = set(parts["train"]["year"]), set(parts["train"]["unit"])
+    split = Split(
+        **parts,
+        held_out_years=tuple(sorted(int(y) for y in set(tagged["year"]) - train_years)),
+        held_out_units=tuple(sorted(str(u) for u in set(tagged["unit"]) - train_units)),
+    )
+    logger.info("split reused from %s (%d unit-years not in it dropped): %s",
+                path, len(unit_years) - len(tagged), split.summarise())
     return split

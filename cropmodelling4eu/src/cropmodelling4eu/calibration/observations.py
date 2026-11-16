@@ -45,6 +45,7 @@ from cropmodelling4eu.calibration.config import (
     CLMS_EMERGENCE_OFFSET_DAYS,
     CLMS_HARVEST_OFFSET_DAYS,
 )
+from cropmodelling4eu.crops import CROP_PROFILE
 
 logger = logging.getLogger(__name__)
 
@@ -195,15 +196,19 @@ def _clms_rows(clms: pd.DataFrame) -> pd.DataFrame:
     frame["emergence_date"] = emergence
     frame["harvest_date"] = harvest
 
-    return pd.concat(
-        [
-            _long(frame, "emergence_date", "emergence_date", unit_kind="adm",
-                  support="adm", source="clms", weight_col="w_emergence"),
+    parts = [
+        _long(frame, "emergence_date", "emergence_date", unit_kind="adm",
+              support="adm", source="clms", weight_col="w_emergence"),
+    ]
+    if CROP_PROFILE.clms_harvest_usable:
+        parts.append(
             _long(frame, "harvest_date", "harvest_date", unit_kind="adm",
-                  support="adm", source="clms", weight_col="w_harvest"),
-        ],
-        ignore_index=True,
-    )
+                  support="adm", source="clms", weight_col="w_harvest")
+        )
+    else:
+        logger.warning("%s: CLMS harvest kept out of the calibration (crops.py)",
+                       CROP_PROFILE.key)
+    return pd.concat(parts, ignore_index=True)
 
 
 def _spread_weight(spread: pd.Series, floor_days: float = 4.0) -> pd.Series:
@@ -416,7 +421,7 @@ def load_pep725(
     years: tuple[int, int] = (1990, 2024),
     include_heading: bool = True,
 ) -> pd.DataFrame:
-    """PEP725 winter-wheat station-seasons, matched to the export's cells.
+    """PEP725 station-seasons of the active crop, matched to the export's cells.
 
     A wrapper over :mod:`data4simplace.phenology.pep725`, which owns the
     calendar-year to harvest-year alignment, the containment match and the
@@ -435,11 +440,12 @@ def load_pep725(
     """
     from data4simplace.phenology import pep725
 
+    crop = pep725.PEP_CROPS[CROP_PROFILE.pep725]
     phases = (HEADING_PHASE,) if include_heading else ()
-    observations = pep725.load_observations(root, years, extra_phases=phases)
-    known = {phase.code for phase in pep725.PHASES}
+    observations = pep725.load_observations(root, years, crop=crop, extra_phases=phases)
+    known = {phase.code for phase in crop.phases}
     seasons = pep725.station_seasons(
-        observations[observations["phase_id"].isin(known)]
+        observations[observations["phase_id"].isin(known)], crop
     )
 
     if include_heading:

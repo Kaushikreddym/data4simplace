@@ -14,6 +14,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from cropmodelling4eu.crops import CROP_PROFILE
+
 __all__ = [
     "CLMS_HARVEST_OFFSET_DAYS",
     "DISABLED_STAGES",
@@ -32,25 +34,21 @@ __all__ = [
 #: with the 2022 drought year at -16.5), so it is a product bias and not a
 #: support artefact or a hot summer. Applied as a fixed correction so ``tsum2``
 #: does not absorb it.
-CLMS_HARVEST_OFFSET_DAYS: float = 18.7
+CLMS_HARVEST_OFFSET_DAYS: float = CROP_PROFILE.clms_harvest_offset_days
 
 #: Days to **subtract** from a CLMS ``CPMCE`` emergence date, same measurement.
 #: An order of magnitude smaller than the harvest offset, which is why CLMS
 #: emergence keeps its level term at full weight.
-CLMS_EMERGENCE_OFFSET_DAYS: float = 6.0
+CLMS_EMERGENCE_OFFSET_DAYS: float = CROP_PROFILE.clms_emergence_offset_days
 
 #: A stage observed on or after this day-of-year belongs to the season harvested
 #: the *following* calendar year. The same cut
 #: :mod:`data4simplace.phenology.pep725` uses, and for the same reason: DOY 180
 #: sits in the empty middle of the autumn stages' distribution.
-AUTUMN_CUT_DOY: int = 180
+AUTUMN_CUT_DOY: int = CROP_PROFILE.autumn_cut_doy
 
 #: Parameter-spec file shipped with each stage.
-STAGE_PARAMETERS: dict[str, str] = {
-    "phenology": "params_phenology.yaml",
-    "yield": "params_yield.yaml",
-    "lai": "params_lai.yaml",
-}
+STAGE_PARAMETERS: dict[str, str] = dict(CROP_PROFILE.stage_parameters)
 
 #: Stages that exist in code but may not run, with the reason the validator
 #: quotes. Remove an entry to re-enable the stage.
@@ -162,6 +160,12 @@ class DataConfig(BaseModel):
     #: hundreds; the unit mean converges long before that and the cost is
     #: linear.
     max_cells_per_unit: int = Field(12, ge=1)
+    #: Keep ``vIRR = 1`` cells out of every unit's pool, and drop a unit whose
+    #: irrigated share of cells exceeds ``max_irrigated_share``: a CyBench yield
+    #: mixes irrigated and rainfed fields, so a unit that is mostly irrigated
+    #: has no rainfed mean to compare against.
+    exclude_irrigated: bool = CROP_PROFILE.exclude_irrigated
+    max_irrigated_share: float = Field(0.2, ge=0.0, le=1.0)
     #: Fraction of the pool drawn per epoch, stratified by region and year.
     fraction: float = Field(0.20, gt=0.0, le=1.0)
     #: Cell-years per forward pass. Not 2048: ``ModelOutput`` retains every
@@ -233,7 +237,7 @@ class LossConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     emergence_level: float = 1.0
-    emergence_anomaly_clms: float = Field(0.05, ge=0.0)
+    emergence_anomaly_clms: float = Field(CROP_PROFILE.emergence_anomaly_weight, ge=0.0)
     emergence_anomaly_pep: float = 1.0
     harvest_level: float = 1.0
     harvest_anomaly: float = 1.0
@@ -305,6 +309,27 @@ class CalibrationConfig(BaseModel):
     #: Where checkpoints, logs and the calibrated crop file are written.
     #: ``None`` puts them under ``<output_dir>/<run_name>/calibration``.
     out_dir: Path | None = None
+    #: Calibrate these regions only (the pool is filtered after it is built,
+    #: so the regions themselves are the full run's). ``None`` is every region.
+    only_regions: tuple[int, ...] | None = None
+    #: A calibration directory whose ``<stage>_split.parquet`` is reused
+    #: instead of drawn. The spatial hold-out draws per region from one shared
+    #: generator, so a run over fewer regions would otherwise hold out
+    #: different units from the run it is compared with.
+    split_from: Path | None = None
+    #: Crop scalars held at a value and removed from every stage's free set,
+    #: e.g. ``{"crop.tsumem": 152.0, "crop.tbasem": 0.0}`` once the sowing
+    #: network fixes emergence (``cm4eu sowing fit-tsumem``). Empty — the
+    #: default — is the original calibration, unchanged. With ``tsumem`` fixed,
+    #: set ``loss.emergence_level`` to 0: no free parameter reaches it.
+    fixed_parameters: dict[str, float] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _check_fixed(self) -> "CalibrationConfig":
+        bad = [k for k in self.fixed_parameters if not k.startswith("crop.") or "@" in k]
+        if bad:
+            raise ValueError(f"fixed_parameters takes scalar crop.<field> names only, got {bad}")
+        return self
 
     @model_validator(mode="after")
     def _check_stages(self) -> "CalibrationConfig":

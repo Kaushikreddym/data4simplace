@@ -241,6 +241,14 @@ class SolutionDocument:
             raise KeyError(f"solution {self.path.name} never reads {scalar}")
         return changed
 
+    def drop_output(self, output_id: str) -> bool:
+        """Remove ``<output id=output_id>``; ``True`` if it was there."""
+        element = self.root.find(f".//outputs/output[@id='{output_id}']")
+        if element is None:
+            return False
+        element.getparent().remove(element)
+        return True
+
     def write(self, path: str | Path) -> Path:
         """Write the (possibly modified) document, keeping its DOCTYPE."""
         out = Path(path)

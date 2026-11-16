@@ -71,7 +71,7 @@ from cropmodelling4eu.calibration.problem import (
     stack_crops,
 )
 from cropmodelling4eu.calibration.regions import CalibrationRegions
-from cropmodelling4eu.calibration.splits import Split, make_split
+from cropmodelling4eu.calibration.splits import Split, load_split, make_split
 from cropmodelling4eu.config import RunConfig
 from cropmodelling4eu.export import ExportBundle
 from cropmodelling4eu.torchcrop.run import (
@@ -195,6 +195,11 @@ class Calibrator:
             torch.set_num_threads(config.torchcrop.torch_threads)
 
         crop_params.iopt = torch.tensor(float(config.torchcrop.iopt))
+        for name, value in settings.fixed_parameters.items():
+            field = name.split(".", 1)[1]
+            current = getattr(crop_params, field)
+            setattr(crop_params, field, torch.as_tensor(float(value), dtype=current.dtype))
+            logger.info("fixed %s = %g (was %g)", name, value, float(current))
         self.region_crops = {
             int(region): copy.deepcopy(crop_params)
             for region in dataset.pool["region_id"].unique()
@@ -1015,8 +1020,9 @@ class Calibrator:
     def build_problem(self, stage: str, free_blocked: bool = False) -> CalibrationProblem:
         """One :class:`CalibrationProblem` for a stage, tiered per region."""
         spec_path = Path(__file__).parent / STAGE_PARAMETERS[stage]
-        base = load_stage_specs(spec_path, max_tier=1, free_blocked=free_blocked)
-        extended = load_stage_specs(spec_path, max_tier=2, free_blocked=free_blocked)
+        fixed = tuple(self.settings.fixed_parameters)
+        base = load_stage_specs(spec_path, max_tier=1, free_blocked=free_blocked, fixed=fixed)
+        extended = load_stage_specs(spec_path, max_tier=2, free_blocked=free_blocked, fixed=fixed)
 
         models = {}
         specs_by_region = {}
@@ -1390,11 +1396,16 @@ class Calibrator:
             # carry — and they do carry it, because CLMS and CyBench are both
             # reported on `adm_id`, so a CyBench unit-year in 2017-2024 brings
             # its own CLMS phenology with it.
-            split = make_split(
-                self.scorable_unit_years((stage,)),
-                mode="loyo" if stage == "phenology" else "block",
-                seed=self.settings.data.seed,
-                protect=self.settings.phenology_years,
+            split = (
+                load_split(self.scorable_unit_years((stage,)),
+                           Path(self.settings.split_from) / f"{stage}_split.parquet")
+                if self.settings.split_from is not None
+                else make_split(
+                    self.scorable_unit_years((stage,)),
+                    mode="loyo" if stage == "phenology" else "block",
+                    seed=self.settings.data.seed,
+                    protect=self.settings.phenology_years,
+                )
             )
             self.report_split_coverage(split).to_csv(
                 self.out_dir / f"{stage}_split_coverage.csv", index=False

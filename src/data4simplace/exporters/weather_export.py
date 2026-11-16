@@ -76,6 +76,22 @@ _CANONICAL_TRANSFORMS = {
 }
 
 
+def _order_temperatures(columns: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    """Rewrite ``TempMin/TempMean/TempMax`` as the per-day (min, middle, max).
+
+    Bias-corrected CMIP6 forcing adjusts each variable independently and
+    inverts ~1.2% of days; one inverted day NaN-poisons SIMPLACE's
+    carried-over soil state for the rest of a run. Days with a NaN are left
+    alone so the sentinel survives. A no-op when any of the three is absent.
+    """
+    names = ("TempMin", "TempMean", "TempMax")
+    if not all(n in columns for n in names):
+        return columns
+    stacked = np.stack([columns[n] for n in names])
+    ordered = np.where(np.isfinite(stacked).all(axis=0), np.sort(stacked, axis=0), stacked)
+    return columns | dict(zip(names, ordered))
+
+
 def _to_simplace(canonical: str, values: np.ndarray) -> np.ndarray:
     """Apply the SIMPLACE-side correction for a canonical variable, if any."""
     transform = _CANONICAL_TRANSFORMS.get(canonical)
@@ -143,10 +159,13 @@ class WeatherExporter(BaseExporter):
         point = climate.isel(lat=int(cell["row"]), lon=int(cell["col"]))
         frame = pd.DataFrame({"Date": dates})
 
-        for canonical, column in _CANONICAL_TO_SIMPLACE.items():
-            if canonical in point.data_vars:
-                values = _to_simplace(canonical, np.asarray(point[canonical].values))
-                frame[column] = np.round(values, 2)
+        columns = {
+            column: np.round(_to_simplace(canonical, np.asarray(point[canonical].values)), 2)
+            for canonical, column in _CANONICAL_TO_SIMPLACE.items()
+            if canonical in point.data_vars
+        }
+        for column, values in _order_temperatures(columns).items():
+            frame[column] = values
 
         frame["Gridcell"] = self._gridcell_id(cell)
         return frame
@@ -185,8 +204,10 @@ class WeatherExporter(BaseExporter):
                 ", ".join(unmapped),
                 ", ".join(sorted(_CANONICAL_TO_SIMPLACE)),
             )
-        cubes = {col: np.round(_to_simplace(canon, np.asarray(climate[canon].values)), 2)
-                 for canon, col in present.items()}  # each shaped (time, lat, lon)
+        cubes = _order_temperatures(
+            {col: np.round(_to_simplace(canon, np.asarray(climate[canon].values)), 2)
+             for canon, col in present.items()}
+        )  # each shaped (time, lat, lon)
         written: list[Path] = []
 
         for _, cell in cell_table.iterrows():

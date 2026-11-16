@@ -169,6 +169,13 @@ def resolve_export(
             f"require_management=False for a potential-yield run."
         )
 
+    if config.paths.cells_file is not None:
+        domain = pd.read_csv(config.paths.cells_file, usecols=["SimplaceID"])["SimplaceID"]
+        before = ids.size
+        ids = np.intersect1d(ids, domain.to_numpy(np.int64))
+        logger.info("cells_file %s: %d of %d runnable cells kept",
+                    config.paths.cells_file, ids.size, before)
+
     if ids.size == 0:
         raise RuntimeError(
             f"No cell is runnable end to end: {with_weather.size} have weather, "

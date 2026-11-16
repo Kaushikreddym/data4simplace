@@ -16,11 +16,16 @@ pytest.importorskip("torchcrop")
 
 from cropmodelling4eu.export import resolve_export  # noqa: E402
 from cropmodelling4eu.torchcrop.run import (  # noqa: E402
+    DAILY_KEYS,
+    DAILY_VARIABLES,
+    DailySink,
     build_site_params,
     build_soil_params,
     crossing_day,
     fertilizer_from_dvs,
     group_by_sowing,
+    pack_seasons,
+    region_shard,
     run_cells,
     run_shard,
     sowing_plan,
@@ -83,6 +88,24 @@ def test_sowing_table_groups_by_year_not_by_doy():
         assert len(years) == 1
         assert sorted(group.tolist()) == [1, 2, 3, 4]
         assert doy.size == 4
+
+
+def test_pack_seasons_fills_batches_across_seasons_in_sowing_order():
+    """Small regions run one call per season otherwise; packing must keep
+    every (cell, season) row exactly once and group neighbouring sowing dates."""
+    plan = [
+        ([2000], np.array([1, 2, 3]), np.array([270, 280, 290])),
+        ([2001], np.array([1, 2, 3]), np.array([275, 271, 300])),
+    ]
+    batches = pack_seasons(plan, batch_size=4)
+
+    assert [b[0].size for b in batches] == [4, 2]
+    rows = {(int(i), int(y), int(d)) for ids, years, doy in batches
+            for i, y, d in zip(ids, years, doy)}
+    assert rows == {(1, 2000, 270), (2, 2000, 280), (3, 2000, 290),
+                    (1, 2001, 275), (2, 2001, 271), (3, 2001, 300)}
+    flat = np.concatenate([doy for _, _, doy in batches])
+    assert (np.diff(flat) >= 0).all()
 
 
 # --------------------------------------------------------------------------- #
@@ -214,17 +237,24 @@ def test_shard_is_idempotent(tmp_path, run_config):
 @pytest.mark.slow
 def test_run_shard_daily_writes_a_matching_trajectory_file(tmp_path, run_config):
     """--daily writes a second Parquet beside the summary, same cells and
-    seasons, one row per (cell, day, variable) for exactly the requested set."""
-    out = run_shard(run_config, shard=0, n_shards=1, out_dir=tmp_path, daily=True)
+    seasons, one row per (cell, day) with a column per requested variable."""
+    variables = tuple(DAILY_VARIABLES)
+    out = run_shard(run_config, shard=0, n_shards=1, out_dir=tmp_path, daily=True,
+                    daily_variables=variables)
     daily_path = tmp_path / "torchcrop_daily_shard_000.parquet"
     assert daily_path.is_file()
+    assert not daily_path.with_name(daily_path.name + ".part").exists()
 
     summary = pd.read_parquet(out)
     daily = pd.read_parquet(daily_path)
-    assert set(daily["variable"].unique()) == {"LAI", "AGB", "NNI", "TRANRF"}
+    assert list(daily.columns) == [*DAILY_KEYS, *variables]
+    assert not daily.duplicated(["SimplaceID", "year", "date"]).any()
     assert set(daily["SimplaceID"]) <= set(summary["SimplaceID"])
     assert set(daily["year"]) <= set(summary["year"])
-    assert daily["value"].notna().all()
+    assert daily[list(variables)].notna().all().all()
+    assert daily["DVS"].between(0.0, 2.0, inclusive="neither").all()
+    # Grain fills inside the AGB it is part of.
+    assert (daily["WSO"] <= daily["AGB"] + 1e-6).all()
 
 
 @pytest.mark.slow
@@ -490,3 +520,68 @@ def test_the_former_scripts_are_cm4eu_subcommands():
         ["smoke", "validate", "--cells", "c.csv", "--simplace", "s.parquet", "--out-dir", "v"],
     ):
         assert parser.parse_args(argv).func is not None
+
+
+def test_region_shard_partitions_cells_and_keeps_small_regions_whole(tmp_path):
+    ids = np.arange(1000, 1400, dtype=np.int64)
+    # One region larger than a shard's share, several smaller, and cells the
+    # table does not place (they run as their own group).
+    region = np.r_[np.full(200, 1), np.full(60, 2), np.full(50, 3), np.full(40, 4),
+                   np.full(30, 5)]
+    regions_file = tmp_path / "regions.parquet"
+    pd.DataFrame({"SimplaceID": ids[:380], "region_id": region}).to_parquet(regions_file)
+    region_of = pd.Series(np.r_[region, np.full(20, -1)], index=ids)
+
+    shards = [region_shard(ids, regions_file, s, 4) for s in range(4)]
+
+    assert np.array_equal(np.sort(np.concatenate(shards)), ids)
+    for small in (2, 3, 4, 5, -1):
+        holders = [s for s, cells in enumerate(shards) if (region_of[cells] == small).any()]
+        assert len(holders) == 1, small
+    assert max(len(set(region_of[cells])) for cells in shards) < region_of.nunique()
+
+
+def test_region_shard_rejects_more_shards_than_cells(tmp_path):
+    regions_file = tmp_path / "regions.parquet"
+    pd.DataFrame({"SimplaceID": [1, 2], "region_id": [1, 1]}).to_parquet(regions_file)
+    with pytest.raises(ValueError, match="cannot fill"):
+        region_shard(np.array([1, 2], dtype=np.int64), regions_file, 0, 3)
+
+
+
+def test_daily_sink_streams_frames_into_one_file(tmp_path):
+    """Frames written batch by batch read back as their concatenation, and the
+    file only appears under its final name once the sink is closed."""
+    path = tmp_path / "torchcrop_daily_shard_000.parquet"
+    sink = DailySink(path)
+    frames = [
+        pd.DataFrame({
+            "SimplaceID": np.int64([i, i]), "year": np.int16([2000, 2000]),
+            "date": pd.to_datetime(["1999-10-01", "1999-10-02"]),
+            "doy": np.int16([274, 275]), "das": np.int16([1, 2]),
+            "LAI": np.float32([0.1, 0.2]),
+        })
+        for i in (1, 2)
+    ]
+    for frame in frames:
+        sink(frame)
+    sink(frames[0].iloc[:0])
+    assert not path.exists()
+    assert sink.close() == path and sink.rows == 4
+    pd.testing.assert_frame_equal(pd.read_parquet(path), pd.concat(frames, ignore_index=True))
+
+
+def test_daily_sink_refuses_to_close_empty(tmp_path):
+    with pytest.raises(RuntimeError):
+        DailySink(tmp_path / "x.parquet").close()
+
+
+def test_inverted_temperature_days_are_reordered():
+    from cropmodelling4eu.export.weather import ordered_temperatures
+
+    tmin, tmean, tmax = ordered_temperatures(
+        np.array([1.81, 1.29, np.nan]), np.array([1.97, 2.04, 0.0]), np.array([1.17, -0.21, 4.0])
+    )
+    np.testing.assert_array_equal(tmin, [1.17, -0.21, np.nan])
+    np.testing.assert_array_equal(tmean, [1.81, 1.29, 0.0])
+    np.testing.assert_array_equal(tmax, [1.97, 2.04, 4.0])

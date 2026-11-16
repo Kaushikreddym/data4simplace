@@ -534,6 +534,47 @@ def test_scripts_refuse_a_workspace_without_a_project(tmp_path, run_config):
         write_run_scripts(workspace, run_config)
 
 
+def test_glibc_runtime_mounts_simplace_over_the_java_image(tmp_path, run_config):
+    """java_image swaps the container; /simplace must be bound before its children."""
+    simplace_dir = tmp_path / "simplace_copy"
+    simplace_dir.mkdir()
+    (simplace_dir / "simplace").write_text("#!/bin/sh\n")
+    config = run_config.model_copy(update={"simplace": run_config.simplace.model_copy(
+        update={"java_image": tmp_path / "temurin.sif", "simplace_dir": simplace_dir})})
+    paths = write_run_scripts(_built(tmp_path), config)
+    binds = _source(paths["env"], 'echo "$SP_BINDS"').split(",")
+    assert binds[0] == f"{simplace_dir}:/simplace"
+    assert _source(paths["env"], 'echo "$SP_IMAGE"') == str(tmp_path / "temurin.sif")
+    assert _source(paths["env"], 'echo "$INSTALL4J_JAVA_HOME_OVERRIDE $MALLOC_ARENA_MAX"') == "/opt/java/openjdk 2"
+
+
+def test_direct_run_uses_the_same_runtime_as_the_array(tmp_path, run_config):
+    """cm4eu simplace run and run_task.sh must launch the same container."""
+    from cropmodelling4eu.simplace.run import build_command, runtime_env
+    simplace_dir = tmp_path / "simplace_copy"
+    simplace_dir.mkdir()
+    (simplace_dir / "simplace").write_text("#!/bin/sh\n")
+    config = run_config.model_copy(update={"simplace": run_config.simplace.model_copy(
+        update={"java_image": tmp_path / "temurin.sif", "simplace_dir": simplace_dir})})
+    command = build_command(_built(tmp_path), config, 1, 2)
+    assert command[command.index("-B") + 1].startswith(f"{simplace_dir}:/simplace,")
+    assert str(tmp_path / "temurin.sif") in command
+    assert runtime_env(config.simplace)["INSTALL4J_JAVA_HOME_OVERRIDE"] == "/opt/java/openjdk"
+    assert runtime_env(run_config.simplace) == {}
+
+
+def test_default_runtime_keeps_the_shipped_image(tmp_path, run_config):
+    paths = write_run_scripts(_built(tmp_path), run_config)
+    assert _source(paths["env"], 'echo "${INSTALL4J_JAVA_HOME_OVERRIDE:-unset}"') == "unset"
+    assert _source(paths["env"], 'echo "$SP_IMAGE"') == str(run_config.simplace.singularity_image)
+
+
+def test_java_image_needs_its_simplace_dir(tmp_path):
+    from cropmodelling4eu.config import SimplaceConfig
+    with pytest.raises(ValueError):
+        SimplaceConfig(java_image=tmp_path / "temurin.sif")
+
+
 def _source(env_path, snippet: str) -> str:
     """Run a bash snippet with the generated run.env sourced."""
     result = subprocess.run(
@@ -563,6 +604,17 @@ def test_task_ranges_agree_with_the_python_split(tmp_path, run_config):
         assert _source(paths["env"], f"sp_task_range {task}") == f"{first} {last}"
     assert _source(paths["env"], "echo ${SP_N_TASKS}") == str(len(expected))
 
+
+
+def test_run_task_caps_the_launcher_heap(tmp_path, run_config):
+    """The image's launcher hard-codes -Xmx30g; several JVMs per task only fit
+    because run_task.sh overrides it through INSTALL4J_ADD_VM_PARAMS."""
+    paths = write_run_scripts(_built(tmp_path), run_config)
+    assert _source(paths["env"], "echo ${SP_CORES_PER_TASK} ${SP_JAVA_HEAP}") == "8 4g"
+    assert _source(paths["env"], "echo ${SP_JAVA_OPTS}") == (
+        "-XX:ActiveProcessorCount=2 -XX:+UseSerialGC"
+    )
+    assert 'INSTALL4J_ADD_VM_PARAMS="${VM_PARAMS}"' in paths["task"].read_text()
 
 def test_retry_set_is_derived_from_the_stamps(tmp_path, run_config):
     """A task is outstanding until it has exited zero — not until every cell
@@ -711,3 +763,85 @@ def test_co2_annual_rewires_every_consumer(tmp_path):
     with pytest.raises(KeyError):
         again.rewire_co2_annual("x")
     assert text.count('id="co2_annual"') == 1
+
+
+# --- daily output ----------------------------------------------------------------
+@pytest.mark.skipif(not _SUSTAG.is_file(), reason="SUSTAg template not present")
+def test_daily_output_is_dropped_unless_asked_for(tmp_path):
+    doc = read_solution(_SUSTAG)
+    assert doc.drop_output("CropDaily")
+    assert not doc.drop_output("CropDaily")
+    assert doc.root.find(".//outputs/output[@id='WLOutputs']") is not None
+
+
+def _crop_daily_csv(path: Path) -> None:
+    """Two winter seasons and a fallow gap, as CropDaily writes them."""
+    rows = []
+    for sow, days in ((pd.Timestamp("1999-10-01"), 300), (pd.Timestamp("2000-10-03"), 300)):
+        for i in range(days):
+            date = sow + pd.Timedelta(days=i)
+            dvs = 0.0 if i < 10 else min(2.0, (i - 10) / 280 * 2)
+            rows.append({"DATE": date.strftime("%d.%m.%Y"), "DOY": date.dayofyear,
+                         "SowingDOY": sow.dayofyear, "DevStage": dvs, "LAI": dvs,
+                         "AGB": 0.1 * i, "WSO": 0.0, "TRANRF": 1.0, "NNI": 0.9, "TRAN": 1.5})
+    pd.DataFrame(rows).to_csv(path, sep=";", index=False)
+
+
+def test_collect_daily_matches_the_torchcrop_layout(tmp_path):
+    from cropmodelling4eu.daily import DAILY_KEYS
+    from cropmodelling4eu.simplace.collect import DAILY_FILE, collect_daily
+
+    (tmp_path / "out" / "daily").mkdir(parents=True)
+    _crop_daily_csv(tmp_path / "out" / "daily" / "42_daily.csv")
+    (tmp_path / "out" / "daily" / "43_daily.csv").write_text("")
+
+    path = collect_daily(tmp_path / "out", tmp_path)
+    assert path == tmp_path / DAILY_FILE
+    daily = pd.read_parquet(path)
+    assert list(daily.columns) == [*DAILY_KEYS, "DVS", "LAI", "AGB", "WSO", "TRANRF", "NNI", "TRAN"]
+    assert daily["DVS"].between(0.0, 2.0, inclusive="neither").all()
+    assert sorted(daily["year"].unique()) == [2000, 2001]
+    first = daily.groupby("year")["das"].min()
+    # DVS leaves 0 on the 11th crop day, so the trimmed season starts at das 11.
+    assert (first == 11).all()
+    assert daily.groupby("year")["date"].min().tolist() == [
+        pd.Timestamp("1999-10-12"), pd.Timestamp("2000-10-14")]
+
+
+def test_collect_daily_is_none_without_daily_output(tmp_path):
+    from cropmodelling4eu.simplace.collect import collect_daily
+
+    (tmp_path / "out" / "yearly").mkdir(parents=True)
+    assert collect_daily(tmp_path / "out", tmp_path) is None
+
+
+@pytest.mark.skipif(not _SUSTAG.is_file(), reason="SUSTAg template not present")
+def test_every_component_reads_the_reordered_temperatures():
+    """No component may read the raw weather.tmin/tmax pair: only weather_conv
+    puts an inverted bias-corrected day back in order (see its comment)."""
+    text = _SUSTAG.read_text()
+    assert not re.search(r"\bweather\.tm(?:in|ax)\b", text)
+    statement = read_solution(_SUSTAG).root.find(
+        ".//transform[@id='weather_conv']/input[@id='statement']").text
+    assert "AS tmin" in statement and "AS tmean" in statement and "AS tmax" in statement
+
+
+def test_fertilizer_interface_follows_the_staged_schedule(tmp_path):
+    """A maize workspace stages fertilizer_maize.csv; the template names wheat's."""
+    from cropmodelling4eu.simplace.workspace import _repoint_fertilizer
+
+    xml = tmp_path / "f.sol.xml"
+    xml.write_text(
+        "<?xml version='1.0'?><solution><interfaces>"
+        "<interface id='fertilizerfile' type='CSV'><filename>"
+        "${_WORKDIR_}/data/management/fertilizer_winter_wheat.csv</filename></interface>"
+        "</interfaces></solution>"
+    )
+    management = tmp_path / "data" / "management"
+    management.mkdir(parents=True)
+    (management / "fertilizer_maize.csv").write_text("location\n")
+    (management / "fertilizer_maize_long.csv").write_text("Location\n")
+    document = read_solution(xml)
+    _repoint_fertilizer(document, tmp_path)
+    node = document.root.find(".//interface[@id='fertilizerfile']/filename")
+    assert node.text == "${_WORKDIR_}/data/management/fertilizer_maize.csv"

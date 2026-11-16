@@ -15,9 +15,12 @@ import os
 from pathlib import Path
 from typing import Final, NamedTuple
 
+from cropmodelling4eu.crops import CROP_PROFILE
+
 __all__ = [
     "CALENDAR_STAGES",
     "CLMS_CROP",
+    "CLMS_REQUIRE_SPLIT",
     "CLMS_MIN_PIXELS",
     "CLMS_MIN_SEASON_SHARE",
     "CLMS_PHENOLOGY_DIR",
@@ -79,8 +82,8 @@ def _env_path(name: str, default: str) -> Path:
 # --------------------------------------------------------------------------- #
 
 #: Crop these notebooks evaluate. Drives both the CyBench sub-tree and the
-#: filename templates below.
-CROP: Final[str] = "wheat"
+#: filename templates below. Selected by ``CM4EU_CROP`` (:mod:`cropmodelling4eu.crops`).
+CROP: Final[str] = CROP_PROFILE.cybench
 
 #: A finished TorchCrop shard-combine (see ``submit/TORCHCROP.md``).
 TORCHCROP_RUN_DIR: Final[Path] = _env_path(
@@ -161,7 +164,10 @@ CLMS_PHENOLOGY_FILES: Final[dict[str, str]] = {
 #: ``CTY`` class 1110 is "wheat" with no winter/spring split; the reducer
 #: recovers it from the emergence year encoded in ``CPMCE``'s ``YYDOY`` and
 #: labels the two modes. ``wheat_winter`` is the half this run simulates.
-CLMS_CROP: Final[str] = "wheat_winter"
+CLMS_CROP: Final[str] = CROP_PROFILE.clms
+
+#: Gate on the reducer's winter/spring validation; only a split crop passes it.
+CLMS_REQUIRE_SPLIT: Final[bool] = CROP_PROFILE.clms_require_split
 
 #: Quality gates on a (unit, year) row, applied by
 #: :func:`~cropmodelling4eu.evaluation.clms.load_phenology`.
@@ -185,7 +191,7 @@ CLMS_MIN_SEASON_SHARE: Final[float] = 0.2
 #: stop at 79, with 12 of 1.7 M rows in between. Rows below this threshold keep
 #: their dates (``maturity_doy`` is still the day SIMPLACE wrote) and lose only
 #: their **durations**, which are the quantities the wrap corrupted.
-MIN_PLAUSIBLE_SEASON_DAYS: Final[float] = 150.0
+MIN_PLAUSIBLE_SEASON_DAYS: Final[float] = CROP_PROFILE.min_plausible_season_days
 
 
 class ClmsStage(NamedTuple):
@@ -281,7 +287,7 @@ GDHY_ROOT: Final[Path] = _env_path("GDHY_ROOT", "/data01/FDS/muduchuru/Data/Agri
 #: Sub-directory of :data:`GDHY_ROOT`. ``wheat_winter`` is the product to pair
 #: with a winter-wheat run; ``wheat`` merges winter and spring, and
 #: ``wheat_spring`` is the other half of the split.
-GDHY_CROP: Final[str] = "wheat_winter"
+GDHY_CROP: Final[str] = CROP_PROFILE.gdhy
 
 GDHY_YIELD_TEMPLATE: Final[str] = "yield_{year}.nc4"
 
@@ -300,7 +306,7 @@ SAGE_ROOT: Final[Path] = _env_path(
     "SAGE_ROOT", "/data01/FDS/muduchuru/Data/Agri/SAGE_crop_calendar"
 )
 
-SAGE_CROP: Final[str] = "Wheat.Winter"
+SAGE_CROP: Final[str] = CROP_PROFILE.sage
 SAGE_TEMPLATE: Final[str] = "{crop}.crop.calendar.fill.nc"
 
 #: Resolution of both gridded references, in degrees. The TorchCrop 10 km cells
@@ -420,7 +426,7 @@ DAYS_IN_YEAR: Final[float] = 365.0
 #: ``sowing_doy`` column. Prefer that column — :func:`utils.torchcrop.load_run`
 #: uses it when present — and read this constant only as what an older run
 #: assumed for the whole continent.
-SIM_SOWING_DOY: Final[int] = 270
+SIM_SOWING_DOY: Final[int] = CROP_PROFILE.sim_sowing_doy
 
 #: Days between maturity (``DVS = 2``) and harvest. LINTUL-5 terminates the
 #: crop at maturity and models no drydown, so the default 0 makes the simulated
@@ -433,7 +439,7 @@ HARVEST_LAG_DAYS: Final[float] = 0.0
 #: reported market-moisture yields stay on their own bases and the resulting
 #: offset shows up in Bias and MAPE. Pass ``moisture=YIELD_MOISTURE_CONTENT``
 #: to :func:`utils.aggregate.to_dry_matter` to put both sides on dry matter.
-YIELD_MOISTURE_CONTENT: Final[float] = 0.135
+YIELD_MOISTURE_CONTENT: Final[float] = CROP_PROFILE.yield_moisture_content
 
 #: A 10 km cell centre this far outside a national polygon still counts as that
 #: country: half a grid cell, so a cell whose centre falls just offshore but

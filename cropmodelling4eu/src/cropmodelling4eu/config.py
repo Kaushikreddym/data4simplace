@@ -21,6 +21,8 @@ from typing import Literal, Optional
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from cropmodelling4eu.crops import CROP_ENV, CROP_PROFILE
+
 logger = logging.getLogger(__name__)
 
 __all__ = [
@@ -82,6 +84,10 @@ class PathsConfig(BaseModel):
     #: ``fertilizer_composition.xml``. Not part of the export -- it lives next
     #: to the SIMPLACE reference the exporter was built from.
     composition_file: Optional[Path] = None
+    #: CSV with a ``SimplaceID`` column restricting the run to a domain, e.g.
+    #: the cells where the crop is grown at all. Intersected with the export's
+    #: own cell set, so it can narrow the run but never widen it.
+    cells_file: Optional[Path] = None
 
 
 class SeasonConfig(BaseModel):
@@ -94,14 +100,23 @@ class SeasonConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    start_year: int = Field(2000, ge=1900, le=2200)
-    end_year: int = Field(2024, ge=1900, le=2200)
-    crop: str = "wheat"
+    # CMIP6 historical forcing starts in 1850, so its first harvest is 1851.
+    start_year: int = Field(2000, ge=1800, le=2200)
+    end_year: int = Field(2024, ge=1800, le=2200)
+    crop: str = CROP_PROFILE.key
 
     @model_validator(mode="after")
     def _check_range(self) -> "SeasonConfig":
         if self.start_year > self.end_year:
             raise ValueError("season.start_year must be <= season.end_year")
+        # The module constants (offsets, CLMS label, moisture, ...) are fixed at
+        # import from CM4EU_CROP, so a config naming another crop would score
+        # against the wrong references without any error.
+        if self.crop != CROP_PROFILE.key:
+            raise ValueError(
+                f"season.crop is {self.crop!r} but this process runs the "
+                f"{CROP_PROFILE.key!r} profile; export {CROP_ENV}={self.crop}"
+            )
         return self
 
     @property
@@ -122,8 +137,17 @@ class TorchcropConfig(BaseModel):
     #: cost collapses as the batch grows; the ceiling is memory, since
     #: ``ModelOutput`` retains every per-day state.
     batch_size: int = Field(2048, ge=1)
-    #: Weather reads are gzip-bound and release the GIL, so threads scale.
+    #: Threads per weather read. They hold the GIL for most of a read, so
+    #: beyond ~4 they slow it down (see export.weather).
     io_workers: int = Field(16, ge=1)
+    #: Weather-reader *processes* that read batches ahead of the model, for the
+    #: packed (sowing-table) path. 0 reads in-process, between model calls:
+    #: right for many processes per CPU node, each with its own reader. A GPU
+    #: process's model outpaces one reader ~6x, so give it the node's spare
+    #: cores (e.g. 20 per GPU on a 48-core node).
+    io_processes: int = Field(0, ge=0)
+    #: Batches read ahead when ``io_processes > 0``.
+    io_prefetch: int = Field(2, ge=1)
     #: The model works on ``[B]``-shaped tensors, too small to repay many
     #: intra-op threads; the cores are better spent on ``io_workers``.
     torch_threads: int = Field(4, ge=0)
@@ -131,10 +155,11 @@ class TorchcropConfig(BaseModel):
     rootzone_m: float = Field(1.0, gt=0.0)
     profile_bottom_m: float = Field(2.0, gt=0.0)
     #: Months of crop-free spin-up before sowing, to let the water balance relax
-    #: out of the initial profile.
-    spinup_months: int = Field(6, ge=0)
+    #: out of the initial profile. Crop-dependent: the sowing latch is
+    #: ``doy >= idpl``, so a spin-up crossing New Year sows on day 0.
+    spinup_months: int = Field(CROP_PROFILE.spinup_months, ge=0)
     #: Days of weather a window must still hold after sowing to be run.
-    min_days_after_sowing: int = Field(365, ge=1)
+    min_days_after_sowing: int = Field(CROP_PROFILE.min_days_after_sowing, ge=1)
 
 
 class SimplaceConfig(BaseModel):
@@ -153,6 +178,13 @@ class SimplaceConfig(BaseModel):
     singularity_image: Path = Path(
         "/beegfs/common/singularity/simplace/simplace_5.0-3897.sif"
     )
+    #: A glibc Java image to run SIMPLACE in instead of ``singularity_image``,
+    #: with ``simplace_dir`` -- the image's ``/simplace`` copied out -- bound
+    #: over ``/simplace``. The shipped image's musl allocator aborts ~15-30% of
+    #: JVMs once 24 share a node, on MSWX and CMIP6 alike; Temurin 17 on glibc
+    #: ran 96/96 clean with byte-identical yearly output (2026-11-06).
+    java_image: Optional[Path] = None
+    simplace_dir: Optional[Path] = None
     #: Simulation window written into the solution's startdate/enddate.
     start_date: str = "1979-01-01"
     end_date: str = "2024-12-31"
@@ -165,6 +197,10 @@ class SimplaceConfig(BaseModel):
     #: completion stamp, so a retry restarts that range from its first line and
     #: the range never finishes. Scale it with the simulated window.
     lines_per_task: int = Field(500, ge=1)
+    #: Concurrent JVMs per array task, each over a contiguous sub-range of the
+    #: task's lines (see run_task.sh). Size the job at ~1.3 cores and ~3 GB per
+    #: worker: 24 workers used 27 cores and 58 GB (2026-10-25).
+    workers_per_task: int = Field(8, ge=1)
     #: Threads used to convert the weather when ``weather_contract`` is set.
     #: Gzip and CSV parsing both release the GIL, and a continental run is
     #: otherwise an hour of wall time in the build step alone.
@@ -190,12 +226,30 @@ class SimplaceConfig(BaseModel):
     #: value selects the wrong parameter set rather than failing — which is why
     #: they are configuration rather than a guess.
     project_constants: dict[str, object] = Field(default_factory=dict)
+    #: Solution ``<var>`` defaults to override, e.g. ``{vCrop: MAIZ,
+    #: vSowRuleMode: 1}`` for maize on the SUSTAg solution. Every name must be a
+    #: variable the solution declares: a misspelt ``vCrop`` would otherwise run
+    #: the template's crop without a word.
+    solution_variables: dict[str, object] = Field(default_factory=dict)
     #: Where SIMPLACE's CO2 comes from. ``scenario`` keeps the solution's own
     #: ``ClimPerCO2.csv`` row -- one value for the whole simulation. ``annual``
     #: rewires the solution to the export's ``site/co2.csv``, one value per
     #: year, which a multi-decade CMIP6 run needs and torchcrop already does.
     co2: Literal["scenario", "annual"] = "scenario"
+    #: Keep the solution's per-cell daily crop output (``daily_output_id``).
+    #: Off by default: over a CMIP6 historical window it is ~165 GB of CSV per
+    #: run, so a run that only needs harvests has the block removed.
+    daily_output: bool = False
+    daily_output_id: str = "CropDaily"
 
+
+    @model_validator(mode="after")
+    def _java_runtime_pair(self) -> "SimplaceConfig":
+        if (self.java_image is None) != (self.simplace_dir is None):
+            raise ValueError("simplace.java_image and simplace.simplace_dir go together")
+        if self.simplace_dir is not None and not (Path(self.simplace_dir) / "simplace").is_file():
+            raise ValueError(f"no SIMPLACE launcher in {self.simplace_dir}")
+        return self
 
 class RunConfig(BaseModel):
     """A validated run configuration."""

@@ -426,6 +426,22 @@ class IrrigationClassifier:
         logger.info("Irrigation classification: %s", result.summary())
         return result
 
+    def harvested_area(self) -> np.ndarray:
+        """The crop group's harvested area per target cell, ha.
+
+        The same precedence as ``merged``: ECIRA's ``Crop_A`` where ECIRA
+        classifies the cell (at least ``min_crop_area_ha``), MIRCA-OS irrigated
+        + rainfed elsewhere. Hectares are extensive, so both are regridded by
+        sum, never by mean.
+        """
+        mirca = self._mirca_harvested_area("ir") + self._mirca_harvested_area("rf")
+        irrigated_path = self._ecira_path("IR")
+        total_path = self._ecira_path("A")
+        if irrigated_path is None or total_path is None:
+            return mirca
+        ecira = self._ecira_area(total_path, irrigated_path)
+        return np.where(ecira >= self._settings.min_crop_area_ha, ecira, mirca)
+
     # ------------------------------------------------------------------ #
     # MIRCA-OS
     # ------------------------------------------------------------------ #

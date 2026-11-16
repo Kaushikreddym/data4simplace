@@ -31,6 +31,8 @@ simplace:
   solution_file: /data01/FDS/muduchuru/codes/GITHUB/data4simplace/cropmodelling4eu/templates/sustag/solution/EU_SUSTAg_data4simplace.sol.xml
   project_file: /data01/FDS/muduchuru/codes/GITHUB/data4simplace/cropmodelling4eu/templates/sustag/project/EU_SUSTAg_data4simplace.proj.xml
   singularity_image: /beegfs/common/singularity/simplace/simplace_5.0-3897.sif
+  java_image: /data01/FDS/muduchuru/Data/SIMPLACE/containers/temurin-17-jre-jammy.sif
+  simplace_dir: /data01/FDS/muduchuru/Data/SIMPLACE/containers/simplace_5.0-3897
   start_date: '1979-01-01'
   end_date: '2024-12-31'
   iopt: 3

@@ -7,6 +7,9 @@ Two families, because a date is not a number:
 * :func:`phenology_metrics` — the same error statistics built on the circular
   difference :func:`utils.doy.doy_difference`, so an error across New Year is 5
   days rather than 360.
+* :func:`agreement_metrics` — Bias, RMSE, Pearson R², Willmott's index of
+  agreement and the mean normalised bias, for either kind, as the production
+  evaluation maps them.
 
 Sign convention throughout: **error = simulated - observed**, so a positive
 bias means the model is too high (yield) or too late (phenology).
@@ -27,9 +30,13 @@ from .doy import circular_mean_doy, doy_difference, unwrap_doy
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "AGREEMENT_METRIC_ORDER",
     "METRIC_LABELS",
     "PHENOLOGY_METRIC_ORDER",
     "YIELD_METRIC_ORDER",
+    "agreement_metrics",
+    "index_of_agreement",
+    "mean_normalized_bias",
     "metrics_by_group",
     "phenology_metrics",
     "rank_countries",
@@ -47,6 +54,9 @@ PHENOLOGY_METRIC_ORDER: tuple[str, ...] = (
     "n", "obs_mean", "sim_mean", "bias", "mae", "rmse", "pearson_r",
 )
 
+#: Column order for an agreement summary table.
+AGREEMENT_METRIC_ORDER: tuple[str, ...] = ("n", "bias", "rmse", "pearson_r2", "ia", "mnb")
+
 #: Display names, including units. Used by every table and figure so a metric
 #: is never labelled two different ways.
 METRIC_LABELS: dict[str, str] = {
@@ -60,6 +70,9 @@ METRIC_LABELS: dict[str, str] = {
     "r2": "R²",
     "pearson_r": "Pearson r",
     "pearson_p": "p",
+    "pearson_r2": "R²",
+    "ia": "IA",
+    "mnb": "MNB (%)",
 }
 
 
@@ -176,6 +189,70 @@ def phenology_metrics(
         "rmse": float(np.sqrt(np.mean(error**2))),
         "pearson_r": r,
         "pearson_p": p,
+    }
+
+
+def index_of_agreement(observed, simulated) -> float:
+    """Willmott's (1981) index of agreement *d*, in ``[0, 1]``.
+
+    ``1 - Σ(S - O)² / Σ(|S - Ō| + |O - Ō|)²``: 1 is a perfect match, and unlike
+    R² it penalises an offset or a wrong amplitude as well as a scatter. It is
+    invariant to shifting both series by a constant, so it applies to dates
+    once their difference has been taken on the circle (see
+    :func:`agreement_metrics`). NaN with fewer than two pairs or when the
+    denominator vanishes (both series constant at the observed mean).
+    """
+    obs, sim = _clean(observed, simulated)
+    if obs.size < 2:
+        return float("nan")
+    centre = obs.mean()
+    potential = float(np.sum((np.abs(sim - centre) + np.abs(obs - centre)) ** 2))
+    return 1.0 - float(np.sum((sim - obs) ** 2)) / potential if potential > 0 else float("nan")
+
+
+def mean_normalized_bias(observed, simulated) -> float:
+    """``mean((S - O) / O)`` in percent, over pairs with a non-zero observation.
+
+    Only meaningful for a ratio-scale quantity — a yield, a duration. A
+    day-of-year has no natural zero, so the same 10-day error would read 5 % at
+    DOY 200 and 3 % at DOY 300.
+    """
+    obs, sim = _clean(observed, simulated)
+    nonzero = obs != 0.0
+    if not nonzero.any():
+        return float("nan")
+    return float(np.mean((sim[nonzero] - obs[nonzero]) / obs[nonzero]) * 100.0)
+
+
+def agreement_metrics(
+    observed, simulated, circular: bool = False, days_in_year: float = DAYS_IN_YEAR
+) -> dict[str, float]:
+    """``n``, ``bias``, ``rmse``, ``pearson_r2``, ``ia`` and ``mnb`` for one series.
+
+    With ``circular`` the simulated dates are first re-expressed as
+    ``observed + doy_difference(simulated, observed)``, so a harvest on 2
+    January against an observed 30 December is a 3-day error and not a
+    362-day one, and IA sees the same errors the RMSE does. ``mnb`` is NaN
+    for dates (see :func:`mean_normalized_bias`).
+
+    ``pearson_r2`` is the **squared Pearson correlation**, not the coefficient
+    of determination ``yield_metrics`` reports as ``r2``: it measures only how
+    much of the observed variation the simulation tracks, blind to offset and
+    amplitude, which is the part RMSE, IA and MNB do not isolate.
+    """
+    obs, sim = _clean(observed, simulated)
+    if obs.size == 0:
+        return {k: float("nan") for k in AGREEMENT_METRIC_ORDER} | {"n": 0}
+    if circular:
+        sim = obs + doy_difference(sim, obs, days_in_year)
+    error = sim - obs
+    return {
+        "n": int(obs.size),
+        "bias": float(error.mean()),
+        "rmse": float(np.sqrt(np.mean(error**2))),
+        "pearson_r2": _pearson(obs, sim)[0] ** 2,
+        "ia": index_of_agreement(obs, sim),
+        "mnb": float("nan") if circular else mean_normalized_bias(obs, sim),
     }
 
 

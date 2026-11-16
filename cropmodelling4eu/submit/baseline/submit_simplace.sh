@@ -59,6 +59,9 @@ cd "${SP_PROJECT_DIR}" || exit 1
 CELLS_ARG=()
 if [ "${SMOKE}" -eq 1 ]; then
     mkdir -p "${SP_SMOKE_DIR}"
+    # The main config the smoke config is derived from, kept before SP_CONFIG is
+    # repointed at the smoke file below.
+    SP_MAIN_CONFIG="${SP_CONFIG}"
     CELLS="${SP_SMOKE_DIR}/de_cells.csv"
     # SP_IOPT set (an IOPT sweep) -> its own run directory and config, since a
     # solution's vIOPT has no CLI override and each value is therefore a
@@ -78,7 +81,7 @@ if [ "${SMOKE}" -eq 1 ]; then
     # must get the same cells and the same seasons to be comparable.
     IOPT_ARG=()
     [ -n "${SP_IOPT}" ] && IOPT_ARG=(--iopt "${SP_IOPT}")
-    cm4eu smoke config --config "${SP_PROJECT_DIR}/config.yaml" \
+    cm4eu smoke config --config "${SP_MAIN_CONFIG}" \
         --out "${SP_CONFIG}" \
         --start-year "${SP_SMOKE_START}" --end-year "${SP_SMOKE_END}" \
         ${IOPT_ARG[@]:+"${IOPT_ARG[@]}"} || exit 1

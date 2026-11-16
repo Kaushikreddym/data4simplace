@@ -71,7 +71,7 @@ export TC_SMOKE_END="${TC_SMOKE_END:-2005}"
 export TC_SMOKE_IOPTS="${TC_SMOKE_IOPTS:-1 2 3}"
 
 # --- What to simulate --------------------------------------------------------
-export TC_CROP="${TC_CROP:-wheat}"
+export TC_CROP="${TC_CROP:-${CM4EU_CROP:-wheat}}"
 # Harvest years. Winter wheat sown 1 Sep of Y-1, so the earliest possible is
 # 1980 (the weather export starts 1979-01-01) and the latest is 2024.
 export TC_START_YEAR="${TC_START_YEAR:-2000}"
@@ -134,15 +134,28 @@ export TC_SIMPLACE_TEMPLATE="${TC_SIMPLACE_TEMPLATE:-/data01/FDS/muduchuru/codes
 export TC_CROP_XML="${TC_CROP_XML:-}"
 export TC_SIMPLACE_CROP="${TC_SIMPLACE_CROP:-}"
 
+# Optional domain: a CSV with a SimplaceID column (the maize run's >= 5 %
+# maize-share cells). Empty runs every exported cell.
+export TC_CELLS_FILE="${TC_CELLS_FILE:-}"
+
 # --- Sharding & batching -----------------------------------------------------
 # One SLURM array task per shard; cells are dealt round-robin so every shard
 # spans the whole domain and the tasks finish together.
 export TC_N_SHARDS="${TC_N_SHARDS:-20}"
+# cells: each shard a round-robin slice of every cell. regions: whole
+# calibration regions per shard (region mode only) -- a region costs one model
+# call per season however small, so round-robin pays that 28 regions x
+# n_shards times over (170 min/shard on EU_val, ~1 core busy). Every task of
+# one array must agree, so change it only for a fresh submission.
+export TC_SHARD_BY="${TC_SHARD_BY:-cells}"
 # Cells per model call. LINTUL-5 is a Python loop over days, so the per-cell
 # cost falls sharply with batch size: measured 40 ms/cell-year at B=128,
 # 9.4 at B=1024, 5.2 at B=2048. Peak RSS at B=2048 is 1.7 GB, so the batch is
 # limited by ModelOutput retaining every per-day state, not by the cell count.
-export TC_BATCH_SIZE="${TC_BATCH_SIZE:-2048}"
+# 4096 puts the largest calibration region (region 11, 3 173 cells) in one call
+# per season instead of two. A shard's RSS is dominated by its regions' forcing
+# (~22 GB for region 11 at B=2048), well inside an 80 GB compute node.
+export TC_BATCH_SIZE="${TC_BATCH_SIZE:-4096}"
 # Weather reads are gzip-bound and release the GIL, so threads scale here.
 export TC_IO_WORKERS="${TC_IO_WORKERS:-16}"
 # The model works on [B]-shaped tensors — too small to repay many intra-op

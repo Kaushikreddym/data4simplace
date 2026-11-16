@@ -33,7 +33,7 @@ export CAL_OUT_DIR="${CAL_OUT_DIR:-${CAL_RUN_DIR}/calibration}"
 # different crop from the one the production run uses -- different `idsl`,
 # `tsum1`, and no vernalisation block at all. Every number in CALIBRATION.md is
 # against the harmonised SUSTAg WW block, which is what this file is.
-export CAL_CROP_FILE="${CAL_CROP_FILE:-${CAL_RUN_DIR}/torchcrop/workspace/crop_wheat.yaml}"
+export CAL_CROP_FILE="${CAL_CROP_FILE:-${CAL_RUN_DIR}/torchcrop/workspace/crop_${CM4EU_CROP:-wheat}.yaml}"
 # What `submit_calibration.sh` builds CAL_CROP_FILE from when it is missing
 # (any mode but --dry-run): the SUSTAg file and block the production SIMPLACE run reads. Never
 # the Brandenburg template -- an empty crop xml falling back to it is how the
@@ -65,6 +65,11 @@ export CAL_PEP725="${CAL_PEP725:-/data01/FDS/muduchuru/Data/Agri/PEP725}"
 # each stage's fitted crop into the next. Stages accumulate terms rather than
 # replacing the objective, so running one alone is a diagnostic, not the plan.
 export CAL_STAGE="${CAL_STAGE:-all}"
+# Reuse another calibration's <stage>_split.parquet, and read its weather cache
+# read-only, so a rerun differs from it only in what changed. Empty -> draw a
+# fresh split and build <out_dir>/weather_cache.
+export CAL_SPLIT_FROM="${CAL_SPLIT_FROM:-}"
+export CAL_CACHE_DIR="${CAL_CACHE_DIR:-}"
 export CAL_EPOCHS="${CAL_EPOCHS:-}"        # empty -> optim.max_epochs (80)
 export CAL_FRACTION="${CAL_FRACTION:-}"    # empty -> data.fraction (0.20)
 
@@ -223,7 +228,7 @@ cal_build_crop() {
         --out-dir "$(dirname "$(dirname "${CAL_CROP_FILE}")")" \
         --crop-source simplace --crop-xml "${CAL_CROP_XML}" \
         --simplace-crop "${CAL_SIMPLACE_CROP}" \
-        --seeds-xml "${CAL_SEEDS_DATA}/crop/seeds.xml" --seeds-crop winter_wheat \
+        --seeds-xml "${CAL_SEEDS_DATA}/crop/seeds.xml" --seeds-crop "${CAL_SEEDS_CROP:-${TC_SEEDS_CROP:-winter_wheat}}" \
         --management-xml "${CAL_SEEDS_DATA}/management/management.xml" > /dev/null \
         || { echo "ERROR: cm4eu workspace failed" >&2; return 1; }
     [ -f "${CAL_CROP_FILE}" ] \

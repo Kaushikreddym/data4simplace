@@ -60,6 +60,8 @@ ARGS=(
 [ -n "${CAL_DEVICE:-}" ] && ARGS+=(--device "${CAL_DEVICE}")
 for _pair in ${CAL_STAGE_BATCH_SIZE:-}; do ARGS+=(--stage-batch-size "${_pair}"); done
 [ -n "${CAL_SEED:-}" ] && ARGS+=(--seed "${CAL_SEED}")
+[ -n "${CAL_SPLIT_FROM:-}" ] && ARGS+=(--split-from "${CAL_SPLIT_FROM}")
+[ -n "${CAL_CACHE_DIR:-}" ] && ARGS+=(--cache-dir "${CAL_CACHE_DIR}")
 [ "${CAL_PREPARE_ONLY:-0}" = "1" ] && ARGS+=(--prepare-only)
 
 echo "cm4eu calibrate ${ARGS[*]}"

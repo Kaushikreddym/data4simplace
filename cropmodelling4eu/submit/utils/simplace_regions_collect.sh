@@ -19,12 +19,13 @@ source "${SUBMIT_DIR}/utils/simplace_env.sh"
 sp_activate
 cd "${SP_PROJECT_DIR}" || exit 1
 
+# Regions collect in parallel: with daily output each one parses ~2,000
+# per-cell daily CSVs, ~100 min serially for a CMIP6 historical run.
 FAILED=()
-for ROOT in "${CM_REGIONS_ROOT}"/region_*/; do
-    ROOT="${ROOT%/}"
-    cm4eu simplace collect --config "${SP_CONFIG}" --out-dir "${ROOT}" \
-        || FAILED+=("$(basename "${ROOT}")")
-done
+while read -r NAME; do FAILED+=("${NAME}"); done < <(
+    printf '%s\n' "${CM_REGIONS_ROOT}"/region_*/ | xargs -P "${SLURM_CPUS_PER_TASK:-1}" -I{} \
+        bash -c 'cm4eu simplace collect --config "$1" --out-dir "${2%/}" 1>&2 || basename "$2"' _ "${SP_CONFIG}" {}
+)
 
 mkdir -p "$(dirname "${CM_MERGED}")"
 python - "${CM_REGIONS_ROOT}" "${CM_MERGED}" <<'EOF'

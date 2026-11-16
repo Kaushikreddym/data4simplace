@@ -258,14 +258,17 @@ class MSWXHandler:
     def _yearly_files(self, canonical: str) -> dict[int, Path]:
         """``{year: path}`` of the yearly files covering the window."""
         start, end = self._bounds()
-        found: dict[int, Path] = {}
-        for year in range(start.year, end.year + 1):
-            pattern = self._config.climate.yearly_pattern.format(
-                experiment=self._config.climate.experiment, var=canonical, year=year
-            )
-            if hits := sorted(self._root.glob(pattern)):
-                found[year] = hits[0]
-        return found
+        experiment = self._config.climate.experiment
+        for template in self._config.climate.yearly_patterns:
+            found = {
+                year: hits[0]
+                for year in range(start.year, end.year + 1)
+                if (hits := sorted(self._root.glob(
+                    template.format(experiment=experiment, var=canonical, year=year))))
+            }
+            if found:
+                return found
+        return {}
 
     def absent(self, canonical: str) -> bool:
         """Whether the source holds no files at all for a canonical variable."""

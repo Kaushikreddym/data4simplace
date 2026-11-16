@@ -35,6 +35,9 @@ import copy
 import logging
 import sys
 import time
+from collections import deque
+from collections.abc import Iterator
+from itertools import islice
 from pathlib import Path
 
 import numpy as np
@@ -50,10 +53,17 @@ from torchcrop import (
 )
 
 from cropmodelling4eu.config import RunConfig, load_config
+from cropmodelling4eu.daily import DAILY_KEYS, DailySink
 from cropmodelling4eu.export import ExportBundle, resolve_export
 from cropmodelling4eu.export.cells import id_to_lonlat
 from cropmodelling4eu.export.soil import SoilProfiles
-from cropmodelling4eu.export.weather import load_season_block, season_window, sowing_date
+from cropmodelling4eu.export.weather import (
+    RowBlockReader,
+    load_row_block,
+    load_season_block,
+    season_window,
+    sowing_date,
+)
 from cropmodelling4eu.torchcrop.workspace import load_crop_parameters
 
 logger = logging.getLogger("cropmodelling4eu.torchcrop.run")
@@ -159,6 +169,32 @@ def sowing_plan(
             rows["sowing_doy"].to_numpy(np.int64),
         )
         for year, rows in table.sort_values("SimplaceID").groupby("year")
+    ]
+
+
+def pack_seasons(
+    plan: list[tuple[list[int], np.ndarray, np.ndarray]], batch_size: int
+) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    """Repack a one-season-per-group plan into ``[(ids, years, sowing_doy)]`` batches.
+
+    The model costs ~12 s per call almost regardless of its size (150 cells
+    13.5 s, 2048 cells 17 s), so a region of 59 cells run one season at a time
+    pays 164 near-empty calls for a CMIP6 window. Rows are ``(cell, season)``
+    pairs instead, filled up to ``batch_size`` across seasons.
+
+    Rows are ordered by sowing day-of-year before chunking: a batch's window
+    opens before its *earliest* sower, so neighbouring dates keep every row's
+    spin-up close to its own -- closer, for a large region, than one season's
+    2048 cells spread across the whole sowing range.
+    """
+    ids = np.concatenate([group for _, group, _ in plan])
+    years = np.concatenate([np.full(g.size, y[0], dtype=np.int64) for y, g, _ in plan])
+    doy = np.concatenate([d for _, _, d in plan])
+    order = np.lexsort((ids, years, doy))
+    ids, years, doy = ids[order], years[order], doy[order]
+    return [
+        (ids[k : k + batch_size], years[k : k + batch_size], doy[k : k + batch_size])
+        for k in range(0, ids.size, batch_size)
     ]
 
 
@@ -377,7 +413,7 @@ def crossing_day(x: torch.Tensor, threshold) -> torch.Tensor:
 def _simulate(
     ids: np.ndarray,
     weather_np: np.ndarray,
-    year: int,
+    year: int | np.ndarray,
     start_doy: int,
     sowing_doy: np.ndarray,
     bundle: ExportBundle,
@@ -444,7 +480,7 @@ def _summary_frame(
     out,
     fertilizer: torch.Tensor,
     irrigated: np.ndarray,
-    year: int,
+    year: int | np.ndarray,
     start_doy: int,
     sowing_doy: np.ndarray,
     bundle: ExportBundle,
@@ -528,10 +564,46 @@ def _summary_frame(
     )
 
 
+def row_blocks(
+    batches: list[tuple[np.ndarray, np.ndarray, np.ndarray]],
+    bundle: ExportBundle,
+    config: RunConfig,
+    records: dict[int, pd.DataFrame],
+) -> Iterator[tuple[tuple[np.ndarray, np.ndarray, np.ndarray], list]]:
+    """Each packed batch with its :func:`load_row_block` weather.
+
+    With ``torchcrop.io_processes`` the weather is read in worker processes,
+    ``io_prefetch`` batches ahead, so it overlaps the model running on the
+    batch before; ``records`` is then unused (each worker caches its own cells).
+    """
+    settings = config.torchcrop
+    if settings.io_processes == 0:
+        for batch_ids, batch_years, batch_doy in batches:
+            yield (batch_ids, batch_years, batch_doy), load_row_block(
+                bundle.export_dir, batch_ids, batch_years, int(batch_doy.min()),
+                config.grid, records, settings.io_workers, settings.spinup_months,
+                settings.min_days_after_sowing,
+            )
+        return
+    with RowBlockReader(bundle.export_dir, config.grid, settings.io_processes,
+                        settings.spinup_months, settings.min_days_after_sowing) as reader:
+        def submit(batch):
+            return batch, reader.submit(batch[0], batch[1], int(batch[2].min()))
+
+        remaining = iter(batches)
+        pending = deque(submit(b) for b in islice(remaining, settings.io_prefetch))
+        while pending:
+            batch, block = pending.popleft()
+            following = next(remaining, None)
+            if following is not None:
+                pending.append(submit(following))
+            yield batch, block.result()
+
+
 def run_batch(
     ids: np.ndarray,
     weather_np: np.ndarray,
-    year: int,
+    year: int | np.ndarray,
     start_doy: int,
     sowing_doy: np.ndarray,
     bundle: ExportBundle,
@@ -561,27 +633,49 @@ def run_batch(
     return frame
 
 
-#: Daily series :func:`daily_batch` can return, and where each comes from. The
-#: state trajectories carry one extra leading entry (the initial condition),
-#: which is dropped so every series is indexed by the day that produced it.
+#: Daily series a trajectory can carry, and where each comes from. The state
+#: trajectories carry one extra leading entry (the initial condition), which is
+#: dropped so every series is indexed by the day that produced it.
+#:
+#: ``state`` fields are ``ModelOutput`` tensors, ``snapshot`` fields are read
+#: off the per-day ``ModelState`` list (the engine stacks only LAI/DVS/biomass),
+#: ``diagnostic`` fields off the per-day ``DiagnosticState`` list.
 DAILY_VARIABLES: dict[str, str] = {
     "LAI": "state",
     "DVS": "state",
     "AGB": "state",
+    "WSO": "snapshot",
+    "WA": "snapshot",
     "TRANRF": "diagnostic",
     "NNI": "diagnostic",
+    "TRAN": "diagnostic",
+    "CO2_FACTOR": "diagnostic",
+    "LEAF_HEAT_FACTOR": "diagnostic",
 }
 
-#: ``ModelOutput`` attribute and unit scale for each ``"state"`` variable.
-#: ``AGB`` is converted from torchcrop's native g/m2 to t/ha (x0.01) -- the
-#: same factor SIMPLACE's own ``AGBiomass_t_ha`` rule applies to
+#: Source attribute for every variable whose name is not simply its lower case.
+#: ``AGB`` and ``WSO`` are converted from torchcrop's native g/m2 to t/ha
+#: (x0.01) -- the factor SIMPLACE's own ``AGBiomass_t_ha`` rule applies to
 #: ``Biomass.sTAGB`` -- so the two models' daily series need no further
-#: conversion at the point they are compared.
-_STATE_FIELD = {"LAI": "lai", "DVS": "dvs", "AGB": "biomass"}
-_STATE_SCALE = {"LAI": 1.0, "DVS": 1.0, "AGB": 0.01}
+#: conversion at the point they are compared. ``WA`` is mm in the rooted zone,
+#: ``TRAN`` mm/d.
+_DAILY_FIELD = {"AGB": "biomass"}
+_DAILY_SCALE = {"AGB": 0.01, "WSO": 0.01}
+
+def _trajectory(out, name: str) -> np.ndarray:
+    """``[B, T]`` series of one :data:`DAILY_VARIABLES` entry, day-indexed."""
+    field = _DAILY_FIELD.get(name, name.lower())
+    match DAILY_VARIABLES[name]:
+        case "state":
+            series = getattr(out, field)[:, 1:]
+        case "snapshot":
+            series = torch.stack([getattr(s, field) for s in out.states[1:]], dim=1)
+        case "diagnostic":
+            series = _diagnostic_trajectory(out, field)
+    return (series * _DAILY_SCALE.get(name, 1.0)).detach().cpu().numpy()
 
 
-def _daily_frame(
+def _daily_wide(
     ids: np.ndarray,
     out,
     year: int,
@@ -590,7 +684,7 @@ def _daily_frame(
     bundle: ExportBundle,
     variables: tuple[str, ...] = ("LAI", "AGB", "NNI", "TRANRF"),
 ) -> pd.DataFrame:
-    """Per-**day** trajectories of an already-simulated batch; see :func:`daily_batch`.
+    """Per-**day** trajectories of an already-simulated batch, one row per cell-day.
 
     Same simulation as :func:`_summary_frame`; what differs is only what is
     kept. A summary cannot say *when* a crop was short of water or nitrogen,
@@ -605,24 +699,17 @@ def _daily_frame(
     Returns
     -------
     DataFrame
-        ``model, SimplaceID, year, date, doy, das, variable, value``, where
-        ``das`` is days after each row's own sowing latch (``sowing_doy`` is
-        per-cell; the shared calendar axis is anchored to the batch's
-        earliest sower, see :func:`sowing_plan`).
+        :data:`DAILY_KEYS` then one float32 column per variable, where ``das``
+        is days after each row's own sowing latch (``sowing_doy`` is per-cell;
+        the shared calendar axis is anchored to the batch's earliest sower, see
+        :func:`sowing_plan`).
     """
     unknown = set(variables) - set(DAILY_VARIABLES)
     if unknown:
         raise ValueError(f"unknown daily variable(s): {sorted(unknown)}")
 
     sowing_doy = np.asarray(sowing_doy)
-
-    def trajectory(name: str) -> np.ndarray:
-        if DAILY_VARIABLES[name] == "diagnostic":
-            return _diagnostic_trajectory(out, name.lower()).cpu().numpy()
-        field = getattr(out, _STATE_FIELD[name])[:, 1:] * _STATE_SCALE[name]
-        return field.cpu().numpy()
-
-    dvs = out.dvs[:, 1:].cpu().numpy()
+    dvs = out.dvs[:, 1:].detach().cpu().numpy()
     n_days = dvs.shape[1]
     # Step i is driven by weather row i and produces states[i + 1] and
     # diagnostics[i], so both describe the day `window start + i`. The window
@@ -630,13 +717,10 @@ def _daily_frame(
     # earliest sowing_doy, matching load_season_block), so this is the real
     # calendar axis -- leap days included, unlike the engine's wrapped
     # 365-day count.
-    anchor_doy = int(sowing_doy.min())
     dates = pd.date_range(
-        season_window(year, anchor_doy, bundle.config.torchcrop.spinup_months)[0],
+        season_window(year, int(sowing_doy.min()), bundle.config.torchcrop.spinup_months)[0],
         periods=n_days, freq="D",
     )
-    # One sowing date per row, so "days after sowing" is a [B, T] matrix, not
-    # a single axis shared by the whole batch.
     sown = np.array(
         [sowing_date(year, int(doy)) for doy in sowing_doy], dtype="datetime64[ns]"
     )
@@ -644,33 +728,44 @@ def _daily_frame(
         (dates.to_numpy()[None, :] - sown[:, None]) / np.timedelta64(1, "D")
     ).astype(np.int16)
 
-    growing = (dvs > 0.0) & (dvs < 2.0)
-    cell_index, day_index = np.nonzero(growing)
-    if cell_index.size == 0:
-        return pd.DataFrame(
-            columns=["model", "SimplaceID", "year", "date", "doy", "das",
-                     "variable", "value"]
-        )
-
-    base = pd.DataFrame(
+    cell_index, day_index = np.nonzero((dvs > 0.0) & (dvs < 2.0))
+    return pd.DataFrame(
         {
-            "model": "torchcrop",
             "SimplaceID": ids.astype(np.int64)[cell_index],
-            "year": np.int16(year),
+            "year": np.full(cell_index.size, year, dtype=np.int16),
             "date": dates.to_numpy()[day_index],
             "doy": dates.dayofyear.to_numpy()[day_index].astype(np.int16),
             "das": das[cell_index, day_index],
         }
-    )
-    frame = pd.concat(
-        [
-            base.assign(variable=name,
-                        value=trajectory(name)[cell_index, day_index].astype(np.float32))
+        | {
+            name: _trajectory(out, name)[cell_index, day_index].astype(np.float32)
             for name in variables
-        ],
-        ignore_index=True,
+        }
     )
-    return frame
+
+
+def _daily_frame(
+    ids: np.ndarray,
+    out,
+    year: int,
+    start_doy: int,
+    sowing_doy: np.ndarray,
+    bundle: ExportBundle,
+    variables: tuple[str, ...] = ("LAI", "AGB", "NNI", "TRANRF"),
+) -> pd.DataFrame:
+    """:func:`_daily_wide` in the long layout the in-memory comparisons use.
+
+    Returns
+    -------
+    DataFrame
+        ``model, SimplaceID, year, date, doy, das, variable, value``,
+        variable-major.
+    """
+    wide = _daily_wide(ids, out, year, start_doy, sowing_doy, bundle, variables)
+    long = wide.melt(id_vars=list(DAILY_KEYS), value_vars=list(variables),
+                     var_name="variable", value_name="value")
+    long.insert(0, "model", "torchcrop")
+    return long
 
 
 def daily_batch(
@@ -703,6 +798,7 @@ def run_cells(
     bundle: ExportBundle | None = None,
     sowing: pd.DataFrame | None = None,
     crop_params: "CropParameters | None" = None,
+    daily_sink: "DailySink | None" = None,
 ) -> pd.DataFrame | tuple[pd.DataFrame, pd.DataFrame]:
     """Run an explicit cell list over explicit seasons; summaries or trajectories.
 
@@ -731,9 +827,16 @@ def run_cells(
         Optional parameter set (see
         :func:`cropmodelling4eu.torchcrop.params.crop_parameters_from_simplace`)
         replacing torchcrop's bundled preset.
+    daily_sink:
+        With ``mode="summary"``, every batch's **wide** trajectory
+        (:func:`_daily_wide`) is handed to this callable as it is produced
+        instead of being collected, so a region-sized run never holds its
+        daily table in memory. Only the summary is returned.
     """
     if mode not in ("summary", "daily", "both"):
         raise ValueError(f"mode must be 'summary', 'daily' or 'both', not {mode!r}")
+    if daily_sink is not None and mode != "summary":
+        raise ValueError("daily_sink streams the trajectory; use it with mode='summary'")
     settings = config.torchcrop
     if settings.torch_threads > 0:
         torch.set_num_threads(settings.torch_threads)
@@ -758,8 +861,37 @@ def run_cells(
     device = torch.device(settings.device)
     frames: list[pd.DataFrame] = []
     daily_frames: list[pd.DataFrame] = []
+    # A sowing table batches one season at a time, so each cell's record is
+    # decoded once here and every season sliced from it (see load_season_block).
+    records: dict[int, pd.DataFrame] | None = {} if sowing is not None else None
     t_start = time.time()
     done = 0
+
+    if sowing is not None and mode == "summary" and daily_sink is None:
+        # Summary rows carry their own year; a daily frame shares one date
+        # axis per batch, so only the summary path packs across seasons.
+        batches = pack_seasons(plan, settings.batch_size)
+        logger.info("packed into %d batch(es) across seasons", len(batches))
+        for (batch_ids, batch_years, batch_doy), blocks in row_blocks(
+            batches, bundle, config, records,
+        ):
+            for rows, weather, start_doy in blocks:
+                frames.append(run_batch(
+                    batch_ids[rows], weather, batch_years[rows], start_doy,
+                    batch_doy[rows], bundle, device, crop_params,
+                ))
+            done += 1
+            elapsed = time.time() - t_start
+            logger.info(
+                "batch %d/%d (DOY %d-%d, %d rows, years %d-%d): elapsed %.1f min, "
+                "eta %.1f min",
+                done, len(batches), batch_doy.min(), batch_doy.max(), batch_ids.size,
+                batch_years.min(), batch_years.max(), elapsed / 60,
+                elapsed / done * (len(batches) - done) / 60,
+            )
+        if not frames:
+            raise SystemExit("no (cell, season) produced a result")
+        return pd.concat(frames, ignore_index=True)
     for group_years, group, doy in plan:
         for start in range(0, group.size, settings.batch_size):
             batch = group[start : start + settings.batch_size]
@@ -771,10 +903,10 @@ def run_cells(
             blocks = load_season_block(
                 bundle.export_dir, batch, group_years, anchor_doy, config.grid,
                 settings.io_workers, settings.spinup_months,
-                settings.min_days_after_sowing,
+                settings.min_days_after_sowing, records,
             )
             for year, (weather, start_doy) in blocks.items():
-                if mode == "both":
+                if mode == "both" or daily_sink is not None:
                     out, fertilizer, irrigated, tsumem = _simulate(
                         batch, weather, year, start_doy, batch_doy, bundle,
                         device, crop_params,
@@ -783,9 +915,14 @@ def run_cells(
                         batch, out, fertilizer, irrigated, year, start_doy,
                         batch_doy, bundle, tsumem,
                     ))
-                    daily_frames.append(_daily_frame(
-                        batch, out, year, start_doy, batch_doy, bundle, variables,
-                    ))
+                    if daily_sink is not None:
+                        daily_sink(_daily_wide(
+                            batch, out, year, start_doy, batch_doy, bundle, variables,
+                        ))
+                    else:
+                        daily_frames.append(_daily_frame(
+                            batch, out, year, start_doy, batch_doy, bundle, variables,
+                        ))
                     del out, fertilizer
                 else:
                     frames.append(
@@ -888,6 +1025,55 @@ def region_crop_map(
     return out
 
 
+#: A region costs one model call per season however few cells it holds -- a
+#: 1-cell region took 4.7 min over 25 seasons, a 471-cell one 9.5 min -- so in
+#: shard-balancing terms every region slice carries this many cells of overhead.
+_REGION_OVERHEAD_CELLS = 450
+
+
+def region_shard(ids: np.ndarray, regions_file: Path, shard: int, n_shards: int) -> np.ndarray:
+    """``ids`` of whole calibration regions for one task, balanced by cost.
+
+    :func:`~cropmodelling4eu.export.cells.shard_cells` deals cells round-robin,
+    which in region mode hands every shard a slice of *every* region: each
+    shard then runs ``n_regions × n_seasons`` small batches, paying the per-call
+    overhead ``n_shards`` times over. Keeping regions whole runs each region's
+    seasons once. A region larger than one shard's share is split round-robin
+    so a single large region cannot hold up the array, and the slices go to
+    shards longest-first onto the least-loaded one. The assignment depends only
+    on ``ids`` and the regions table, so every task computes the same one.
+    """
+    if not 0 <= shard < n_shards:
+        raise ValueError(f"shard {shard} out of range 0..{n_shards - 1}")
+    if ids.size < n_shards:
+        raise ValueError(f"{ids.size} cells cannot fill {n_shards} shards")
+
+    table = pd.read_parquet(Path(regions_file))[["SimplaceID", "region_id"]]
+    table = table.drop_duplicates("SimplaceID").set_index("SimplaceID")["region_id"]
+    region_of = table.reindex(ids).fillna(-1).astype(np.int64)
+
+    share = ids.size / n_shards
+    units = [
+        group[k::parts]
+        for _, sub in region_of.groupby(region_of)
+        for group in [sub.index.to_numpy(np.int64)]
+        for parts in [int(np.ceil(group.size / share))]
+        for k in range(parts)
+    ]
+    while len(units) < n_shards:
+        largest = units.pop(max(range(len(units)), key=lambda i: units[i].size))
+        units += [largest[0::2], largest[1::2]]
+
+    load = np.zeros(n_shards)
+    mine: list[np.ndarray] = []
+    for unit in sorted(units, key=lambda u: (-u.size, u[0])):
+        target = int(np.argmin(load))
+        load[target] += unit.size + _REGION_OVERHEAD_CELLS
+        if target == shard:
+            mine.append(unit)
+    return np.sort(np.concatenate(mine))
+
+
 def run_shard(
     config: RunConfig,
     shard: int,
@@ -901,6 +1087,7 @@ def run_shard(
     regions_file: Path | None = None,
     daily: bool = False,
     daily_variables: tuple[str, ...] = ("LAI", "AGB", "NNI", "TRANRF"),
+    shard_by: str = "cells",
 ) -> Path:
     """Run one shard over every requested season and write its Parquet.
 
@@ -911,9 +1098,11 @@ def run_shard(
 
     ``daily`` additionally writes ``torchcrop_daily_shard_<n>.parquet`` beside
     the summary, sharing the same ``_simulate`` call per batch (see
-    :func:`_summary_frame` / :func:`_daily_frame`) rather than re-running the
+    :func:`_summary_frame` / :func:`_daily_wide`) rather than re-running the
     model, so the trajectory is exactly the run the summary row came from and
-    costs no extra forward pass.
+    costs no extra forward pass. The file is in the **wide** layout, one row
+    per cell-day (:data:`DAILY_KEYS` + one column per variable), streamed to
+    disk batch by batch through :class:`DailySink`.
 
     ``region_crop_dir`` (with ``regions_file``) runs a calibration's per-region
     crop fit instead of the single ``crop_file`` for the whole domain: the
@@ -925,9 +1114,18 @@ def run_shard(
     batch it is given, not a per-cell field. ``crop_file`` is then what an
     uncalibrated region or an unplaced cell falls back to, same as when it is
     the only crop argument given.
+
+    ``shard_by="regions"`` (region mode only) gives each shard whole regions
+    via :func:`region_shard` instead of a round-robin slice of every region.
+    Every task of one array must use the same ``shard_by``, or cells are run
+    twice or not at all.
     """
     if bool(region_crop_dir) != bool(regions_file):
         raise ValueError("region_crop_dir and regions_file must be given together")
+    if shard_by not in ("cells", "regions"):
+        raise ValueError(f"shard_by must be 'cells' or 'regions', not {shard_by!r}")
+    if shard_by == "regions" and regions_file is None:
+        raise ValueError("shard_by='regions' needs regions_file")
 
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -947,7 +1145,10 @@ def run_shard(
 
     # A potential-yield run applies no fertilizer, so it needs no schedule.
     bundle = resolve_export(config, require_management=settings.iopt != 1)
-    ids = bundle.shard(shard, n_shards)
+    ids = (
+        region_shard(bundle.ids, regions_file, shard, n_shards)
+        if shard_by == "regions" else bundle.shard(shard, n_shards)
+    )
     if max_cells and ids.size > max_cells:
         # Even subsample, not the head: SimplaceID runs north-to-south, so
         # truncating gives a smoke test a narrow Scandinavian band.
@@ -955,7 +1156,7 @@ def run_shard(
 
     years = config.season.years
     results: list[pd.DataFrame] = []
-    daily_results: list[pd.DataFrame] = []
+    sink = DailySink(daily_path) if daily else None
     t_start = time.time()
 
     if region_crop_dir is not None:
@@ -970,16 +1171,11 @@ def run_shard(
         for region_id, (region_ids, region_params) in sorted(groups.items()):
             label = "unplaced cells" if region_id == -1 else f"region {region_id:02d}"
             logger.info("shard %d: %s, %d cells", shard, label, region_ids.size)
-            out = run_cells(
-                config, region_ids, years, mode="both" if daily else "summary",
+            results.append(run_cells(
+                config, region_ids, years, variables=daily_variables,
                 bundle=bundle, sowing=sowing, crop_params=region_params,
-            )
-            if daily:
-                summary, trajectory = out
-                results.append(summary)
-                daily_results.append(trajectory)
-            else:
-                results.append(out)
+                daily_sink=sink,
+            ))
 
         frame = pd.concat(results, ignore_index=True)
         frame.to_parquet(out_path, index=False, compression="zstd")
@@ -987,12 +1183,8 @@ def run_shard(
             "shard %d wrote %d rows to %s in %.1f min",
             shard, len(frame), out_path, (time.time() - t_start) / 60,
         )
-        if daily:
-            daily_frame = pd.concat(daily_results, ignore_index=True)
-            daily_frame.to_parquet(daily_path, index=False, compression="zstd")
-            logger.info(
-                "shard %d wrote %d daily rows to %s", shard, len(daily_frame), daily_path,
-            )
+        if sink is not None:
+            logger.info("shard %d wrote %d daily rows to %s", shard, sink.rows, sink.close())
         return out_path
 
     plan = sowing_plan(ids, years, bundle.site.sowing_doy(ids), sowing)
@@ -1010,6 +1202,7 @@ def run_shard(
     logger.info(bundle.site.summarise())
 
     done = 0
+    records: dict[int, pd.DataFrame] | None = {} if sowing is not None else None
 
     for group_years, group, doy in plan:
         for start in range(0, group.size, settings.batch_size):
@@ -1036,7 +1229,7 @@ def run_shard(
             blocks = load_season_block(
                 bundle.export_dir, batch, group_years, anchor_doy, config.grid,
                 settings.io_workers, settings.spinup_months,
-                settings.min_days_after_sowing,
+                settings.min_days_after_sowing, records,
             )
             t_io = time.time() - t0
 
@@ -1050,7 +1243,7 @@ def run_shard(
                         batch, out, fertilizer, irrigated, year, start_doy,
                         batch_doy, bundle, tsumem,
                     ))
-                    daily_results.append(_daily_frame(
+                    sink(_daily_wide(
                         batch, out, year, start_doy, batch_doy, bundle,
                         daily_variables,
                     ))
@@ -1080,12 +1273,8 @@ def run_shard(
         shard, len(frame), out_path, (time.time() - t_start) / 60,
     )
 
-    if daily:
-        daily_frame = pd.concat(daily_results, ignore_index=True)
-        daily_frame.to_parquet(daily_path, index=False, compression="zstd")
-        logger.info(
-            "shard %d wrote %d daily rows to %s", shard, len(daily_frame), daily_path,
-        )
+    if sink is not None:
+        logger.info("shard %d wrote %d daily rows to %s", shard, sink.rows, sink.close())
     return out_path
 
 
@@ -1115,6 +1304,7 @@ def _config_from_args(args: argparse.Namespace) -> RunConfig:
             ("iopt", args.iopt),
             ("batch_size", args.batch_size),
             ("io_workers", args.io_workers),
+            ("io_processes", args.io_processes),
             ("device", args.device),
         )
         if value is not None
@@ -1122,10 +1312,13 @@ def _config_from_args(args: argparse.Namespace) -> RunConfig:
     if torch_updates:
         updates["torchcrop"] = config.torchcrop.model_copy(update=torch_updates)
 
-    if args.composition is not None:
-        updates["paths"] = config.paths.model_copy(
-            update={"composition_file": args.composition}
-        )
+    paths = {
+        key: value
+        for key, value in (("composition_file", args.composition), ("cells_file", args.cells_file))
+        if value is not None
+    }
+    if paths:
+        updates["paths"] = config.paths.model_copy(update=paths)
     return config.model_copy(update=updates) if updates else config
 
 
@@ -1145,11 +1338,16 @@ def build_parser() -> argparse.ArgumentParser:
                    help="1 potential | 2 water | 3 water+N | 4 water+NPK")
     p.add_argument("--batch-size", type=int)
     p.add_argument("--io-workers", type=int)
+    p.add_argument("--io-processes", type=int,
+                   help="weather-reader processes, reading packed batches ahead "
+                        "of the model (0: in-process; a GPU wants the spare cores)")
     p.add_argument("--device")
     p.add_argument("--torch-threads", type=int, default=None,
                    help="intra-op threads. The model works on [B]-shaped "
                         "tensors, too small to repay many threads -- the cores "
                         "are better spent on --io-workers")
+    p.add_argument("--cells-file", type=Path,
+                   help="CSV with a SimplaceID column restricting the run's domain.")
     p.add_argument("--max-cells", type=int, default=0,
                    help="cap cells per shard (smoke tests)")
     p.add_argument("--crop-file", type=Path,
@@ -1173,12 +1371,17 @@ def build_parser() -> argparse.ArgumentParser:
                         "SIMPLACE run writes as sowing_from_simplace.csv")
     p.add_argument("--daily", action="store_true",
                    help="also write torchcrop_daily_shard_<n>.parquet -- the "
-                        "same simulation's day-by-day trajectory, at no extra "
-                        "model cost")
+                        "same simulation's day-by-day trajectory, one row per "
+                        "cell-day, at no extra model cost")
     p.add_argument("--daily-variables", nargs="+", choices=list(DAILY_VARIABLES),
                    default=["LAI", "AGB", "NNI", "TRANRF"],
                    help="which series --daily writes; default LAI, AGB, NNI, "
-                        "TRANRF (DVS is also available)")
+                        "TRANRF (see DAILY_VARIABLES for the rest)")
+    p.add_argument("--shard-by", choices=["cells", "regions"], default="cells",
+                   help="cells: round-robin over all cells; regions: whole "
+                        "calibration regions per shard (needs --regions-file), "
+                        "one model call per region-season instead of one per "
+                        "shard-region-season. Every task of an array must agree.")
     p.add_argument("--overwrite", action="store_true")
     return p
 
@@ -1211,6 +1414,7 @@ def main(argv: list[str] | None = None) -> int:
         regions_file=args.regions_file,
         daily=args.daily,
         daily_variables=tuple(args.daily_variables),
+        shard_by=args.shard_by,
     )
     return 0
 

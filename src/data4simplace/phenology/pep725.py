@@ -49,7 +49,11 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "DAYS_IN_YEAR",
+    "GRAIN_MAIZE",
+    "PEP_CROPS",
     "PHASES",
+    "PepCrop",
+    "WINTER_WHEAT",
     "Phase",
     "circular_mean_doy",
     "doy_difference",
@@ -104,6 +108,46 @@ PHASES: tuple[Phase, ...] = (
 )
 
 
+@dataclass(frozen=True, slots=True)
+class PepCrop:
+    """Which PEP725 rows make up one crop, and how its seasons are aligned.
+
+    Attributes:
+        genus: Botanical genus in the ``genus`` column.
+        cult_seasons: ``cult_season`` codes to keep; ``None`` keeps every row.
+        phases: Stages pivoted into a season, with their CLMS counterpart.
+        season_length_days: Plausible emergence-to-harvest span. A span outside
+            it means two endpoints were filed to the wrong season.
+    """
+
+    genus: str
+    cult_seasons: tuple[int, ...] | None
+    phases: tuple[Phase, ...]
+    season_length_days: tuple[float, float]
+
+
+#: ``cult_season == 2`` is the strict reading for wheat: CLMS's
+#: ``wheat_winter`` is the autumn-emerging mode, so the unspecified rows would
+#: compare a mixture against a split product.
+WINTER_WHEAT = PepCrop("Triticum", (2,), PHASES, (150.0, 400.0))
+
+#: Every PEP725 ``Zea`` row carries ``cult_season == 0``, so no season filter
+#: applies; a winter-only filter would drop the whole crop. All stages are
+#: spring/summer stages of the harvest year itself, so none moves.
+GRAIN_MAIZE = PepCrop(
+    "Zea",
+    None,
+    (
+        Phase(0, "sowing_doy", None, autumn=False),
+        Phase(10, "emergence_doy", "emergence_doy_median", autumn=False),
+        Phase(100, "harvest_doy", "harvest_doy_median", autumn=False),
+    ),
+    (60.0, 250.0),
+)
+
+PEP_CROPS: dict[str, PepCrop] = {"wheat": WINTER_WHEAT, "maize": GRAIN_MAIZE}
+
+
 def _files(root: Path) -> list[Path]:
     """Every PEP725 CSV export under ``root``, sorted."""
     paths = sorted(Path(root).glob("pep725_*.csv"))
@@ -116,17 +160,16 @@ def load_observations(
     root: Path | str,
     years: tuple[int, int] = (2017, 2024),
     *,
-    genus: str = "Triticum",
-    winter_only: bool = True,
+    crop: PepCrop = WINTER_WHEAT,
     extra_phases: tuple[int, ...] = (),
 ) -> pd.DataFrame:
-    """PEP725 winter-wheat stage dates, one row per (station, year, phase).
+    """PEP725 stage dates of one crop, one row per (station, year, phase).
 
     Args:
         root: Directory holding the ``pep725_*.csv`` exports.
         years: Inclusive ``(first, last)`` filter. The default is CLMS's own
             2017-2024 window, since a year outside it can never be paired.
-        genus: Botanical genus to keep.
+        crop: Genus, ``cult_season`` filter and stages; see :class:`PepCrop`.
         extra_phases: BBCH codes to keep **in addition** to :data:`PHASES`.
             ``PHASES`` is the set with a CLMS counterpart, which is what this
             module pairs against; a caller that does not need a counterpart —
@@ -135,11 +178,6 @@ def load_observations(
             handed a frame without it. :func:`station_seasons` still pivots
             only the ``PHASES`` stages, so the extra codes are the caller's to
             handle.
-        winter_only: Keep ``cult_season == 2`` only. **This is the strict
-            reading and it is the right one here**: CLMS's ``wheat_winter`` is
-            specifically the autumn-emerging mode, so admitting the
-            ``cult_season == 0`` "unspecified" rows would compare a mixture
-            against a split product and blame the difference on CLMS.
 
     Returns:
         ``s_id``, ``provider_id``, ``lon``, ``lat``, ``alt``, ``year``,
@@ -153,18 +191,18 @@ def load_observations(
         [pd.read_csv(path, sep=";") for path in _files(root)], ignore_index=True
     )
     n_all = len(frame)
-    codes = [phase.code for phase in PHASES] + [int(c) for c in extra_phases]
+    codes = [phase.code for phase in crop.phases] + [int(c) for c in extra_phases]
     keep = (
-        (frame["genus"] == genus)
+        (frame["genus"] == crop.genus)
         & frame["year"].between(*years)
         & frame["phase_id"].isin(codes)
     )
-    if winter_only:
-        keep &= frame["cult_season"] == 2
+    if crop.cult_seasons is not None:
+        keep &= frame["cult_season"].isin(crop.cult_seasons)
     frame = frame[keep]
     if frame.empty:
         raise ValueError(
-            f"no {genus} rows in {years[0]}-{years[1]} for phases {codes}"
+            f"no {crop.genus} rows in {years[0]}-{years[1]} for phases {codes}"
         )
 
     out = (
@@ -181,7 +219,7 @@ def load_observations(
     return out
 
 
-def station_seasons(observations: pd.DataFrame) -> pd.DataFrame:
+def station_seasons(observations: pd.DataFrame, crop: PepCrop = WINTER_WHEAT) -> pd.DataFrame:
     """Pivot to one row per (station, **harvest year**) with a column per stage.
 
     **PEP725 dates by calendar year; CLMS dates by harvest year.** A PEP725 row
@@ -205,14 +243,15 @@ def station_seasons(observations: pd.DataFrame) -> pd.DataFrame:
 
     Args:
         observations: :func:`load_observations` output.
+        crop: The crop the observations were loaded for.
 
     Returns:
         ``s_id``, ``lon``, ``lat``, ``harvest_year``, one column per
         :data:`PHASES` name, and ``season_length_days`` where both endpoints
         are observed.
     """
-    autumn = {phase.code: phase.autumn for phase in PHASES}
-    names = {phase.code: phase.name for phase in PHASES}
+    autumn = {phase.code: phase.autumn for phase in crop.phases}
+    names = {phase.code: phase.name for phase in crop.phases}
 
     obs = observations.copy()
     obs["stage"] = obs["phase_id"].map(names)
@@ -242,7 +281,7 @@ def station_seasons(observations: pd.DataFrame) -> pd.DataFrame:
         observations[["s_id", "lon", "lat"]].drop_duplicates("s_id"),
         on="s_id", how="left",
     )
-    for phase in PHASES:
+    for phase in crop.phases:
         if phase.name not in wide.columns:
             wide[phase.name] = np.nan
 
@@ -254,9 +293,8 @@ def station_seasons(observations: pd.DataFrame) -> pd.DataFrame:
         )
         # A negative or absurd span means the two endpoints were filed to the
         # same harvest year by mistake -- drop the duration, keep the dates.
-        wide.loc[~wide["season_length_days"].between(150, 400), "season_length_days"] = (
-            np.nan
-        )
+        lo, hi = crop.season_length_days
+        wide.loc[~wide["season_length_days"].between(lo, hi), "season_length_days"] = np.nan
     else:
         wide["season_length_days"] = np.nan
 
@@ -359,11 +397,11 @@ def match_to_admin(seasons: pd.DataFrame, admin) -> pd.DataFrame:
     return matched
 
 
-def _clms_columns(clms: pd.DataFrame) -> dict[str, str]:
+def _clms_columns(clms: pd.DataFrame, crop: PepCrop = WINTER_WHEAT) -> dict[str, str]:
     """CLMS median column -> the PEP725 stage name it pairs with."""
     pairs = {
         phase.clms_column: phase.name
-        for phase in PHASES
+        for phase in crop.phases
         if phase.clms_column and phase.clms_column in clms.columns
     }
     if "season_length_days_median" in clms.columns:
@@ -372,7 +410,7 @@ def _clms_columns(clms: pd.DataFrame) -> dict[str, str]:
 
 
 def _pair(
-    matched: pd.DataFrame, clms: pd.DataFrame, keys: list[str]
+    matched: pd.DataFrame, clms: pd.DataFrame, keys: list[str], crop: PepCrop = WINTER_WHEAT
 ) -> pd.DataFrame:
     """Aggregate stations onto ``keys`` and join the CLMS row for the same key.
 
@@ -380,7 +418,7 @@ def _pair(
     plain mean for the duration, because two stations in one cell can straddle
     New Year on emergence and their arithmetic mean would land in July.
     """
-    pairs = _clms_columns(clms)
+    pairs = _clms_columns(clms, crop)
     stage_names = list(pairs.values())
 
     aggregated = []
@@ -429,7 +467,9 @@ def _pair(
     return paired
 
 
-def pair_grid(matched: pd.DataFrame, clms_grid: pd.DataFrame) -> pd.DataFrame:
+def pair_grid(
+    matched: pd.DataFrame, clms_grid: pd.DataFrame, crop: PepCrop = WINTER_WHEAT
+) -> pd.DataFrame:
     """Pair station observations against the CLMS 10 km rows, per (cell, year).
 
     Args:
@@ -441,10 +481,12 @@ def pair_grid(matched: pd.DataFrame, clms_grid: pd.DataFrame) -> pd.DataFrame:
         One row per ``(SimplaceID, year)`` on both sides, with ``pep_*``,
         ``clms_*`` and ``residual_*`` (CLMS minus PEP725) columns.
     """
-    return _pair(matched, clms_grid, ["SimplaceID", "harvest_year"])
+    return _pair(matched, clms_grid, ["SimplaceID", "harvest_year"], crop)
 
 
-def pair_admin(matched: pd.DataFrame, clms_adm: pd.DataFrame) -> pd.DataFrame:
+def pair_admin(
+    matched: pd.DataFrame, clms_adm: pd.DataFrame, crop: PepCrop = WINTER_WHEAT
+) -> pd.DataFrame:
     """Pair station observations against the CLMS administrative rows.
 
     Args:
@@ -454,7 +496,7 @@ def pair_admin(matched: pd.DataFrame, clms_adm: pd.DataFrame) -> pd.DataFrame:
     Returns:
         One row per ``(adm_id, year)`` on both sides.
     """
-    return _pair(matched, clms_adm, ["adm_id", "harvest_year"])
+    return _pair(matched, clms_adm, ["adm_id", "harvest_year"], crop)
 
 
 def circular_mean_doy(values: np.ndarray) -> float:

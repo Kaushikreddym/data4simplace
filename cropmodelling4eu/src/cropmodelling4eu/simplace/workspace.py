@@ -503,6 +503,7 @@ def _write_manifest(
         "n_lines": workspace.n_lines,
         "lines_per_task": settings.lines_per_task,
         "singularity_image": str(settings.singularity_image),
+        "java_image": str(settings.java_image) if settings.java_image else None,
         "start_date": settings.start_date,
         "end_date": settings.end_date,
         "iopt": settings.iopt,
@@ -527,6 +528,27 @@ def _write_project_xml(
     return document.write(work_dir / "project" / document.path.name)
 
 
+def _repoint_fertilizer(document: SolutionDocument, work_dir: Path) -> None:
+    """Point the solution's wide fertilizer interface at the schedule staged here.
+
+    The template names ``fertilizer_winter_wheat.csv``; another crop's export
+    writes ``fertilizer_<crop>.csv``. Exactly one wide schedule is staged per
+    workspace, so it is unambiguous; with none or several the template stands
+    and ``validate_resources`` reports what is missing.
+    """
+    node = document.root.find(".//interfaces/interface[@id='fertilizerfile']/filename")
+    staged = [
+        p for p in sorted((work_dir / "data" / "management").glob("fertilizer_*.csv"))
+        if not p.stem.endswith("_long")
+    ]
+    if node is None or len(staged) != 1:
+        return
+    target = f"${{_WORKDIR_}}/data/management/{staged[0].name}"
+    if (node.text or "").strip() != target:
+        logger.info("fertilizer interface repointed: %s -> %s", (node.text or "").strip(), target)
+        node.text = target
+
+
 def _write_solution_xml(
     document: SolutionDocument,
     work_dir: Path,
@@ -540,7 +562,16 @@ def _write_solution_xml(
         "enddate": _to_simplace_date(settings.end_date),
         "vIOPT": settings.iopt,
     }
+    declared = {v.get("id") for v in document.root.findall(".//variables/var")}
+    unknown = sorted(set(settings.solution_variables) - declared)
+    if unknown:
+        raise KeyError(
+            f"simplace.solution_variables names {unknown}, which "
+            f"{document.path.name} does not declare"
+        )
+    overrides |= settings.solution_variables
     changed = document.set_variables(overrides)
+    _repoint_fertilizer(document, work_dir)
     logger.info(
         "Solution variables overridden: %s", ", ".join(changed) if changed else "(none)"
     )
@@ -549,6 +580,15 @@ def _write_solution_xml(
     if settings.co2 == "annual":
         n = document.rewire_co2_annual(f"${{_WORKDIR_}}/data/project/{_CO2_ANNUAL}")
         logger.info("CO2 rewired to the per-year table at %d reference(s)", n)
+    if settings.daily_output:
+        if document.root.find(f".//outputs/output[@id='{settings.daily_output_id}']") is None:
+            raise KeyError(
+                f"simplace.daily_output is on but {document.path.name} declares no "
+                f"<output id='{settings.daily_output_id}'>"
+            )
+    elif document.drop_output(settings.daily_output_id):
+        logger.info("Daily output %s removed (simplace.daily_output: false)",
+                    settings.daily_output_id)
     return document.write(work_dir / "solution" / document.path.name)
 
 

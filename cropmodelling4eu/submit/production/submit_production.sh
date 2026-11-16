@@ -22,19 +22,20 @@
 # exists. Every run uses the same calibration, CAL_DIR (stage CAL_STAGE).
 #
 # Per forcing
-#   SIMPLACE   one build per calibration region (a solution reads ONE crop.xml),
-#              then ONE array over every (region, line chunk), collected per
-#              region and merged into simplace/simplace_europe.parquet plus
-#              simplace/sowing_from_simplace.csv.
+#   SIMPLACE   MSWX only. One build per calibration region (a solution reads ONE
+#              crop.xml), then ONE array over every (region, line chunk),
+#              collected per region and merged into simplace/simplace_europe.parquet
+#              plus simplace/sowing_from_simplace.csv.
 #   torchcrop  the shard array with TC_REGION_CROP_DIR/TC_REGIONS_FILE selecting
 #              each cell's calibrated crop (SUSTAg WW fallback, never Brandenburg).
-#              It sows on SIMPLACE's simulated dates: for CMIP6 those of the same
-#              run, so it is queued behind that run's merge; for MSWX the table
-#              the calibration was fitted on (MSWX_SOWING), so it runs at once.
+#              It sows on SIMPLACE's MSWX dates: for MSWX the table the
+#              calibration was fitted on (MSWX_SOWING), for CMIP6 its per-cell
+#              median repeated every year (CMIP6_SOWING). Both run at once.
 #   CMIP6      window and harvest years from scenario.json (a winter crop sown in
 #              the first year is harvested in the second), co2 from the export's
 #              site/co2.csv per year, daily torchcrop output off (CMIP6_TC_DAILY=1
-#              restores it), lines_per_task scaled to the window (~9 h tasks).
+#              restores it), lines_per_task scaled to the window (~15 lines per
+#              JVM at SP_WORKERS=24).
 #
 # Cluster use: forcings are chained, not stacked. Each SIMPLACE array waits for
 # the previous forcing's, each torchcrop array for the previous torchcrop
@@ -56,13 +57,33 @@ CAL_DIR="${CAL_DIR:-${OUTPUT_DIR}/winter_wheat_2000_2024_euval/calibration}"
 CAL_STAGE="${CAL_STAGE:-yield}"
 MSWX_EXPORT="${MSWX_EXPORT:-${INPUTS}/exports/mswx/EU_val_nfix}"
 MSWX_SOWING="${MSWX_SOWING:-${INPUTS}/sowing_from_simplace_euval.csv}"
+# CMIP6 runs torchcrop only (user decision 2026-10-26: SIMPLACE is for MSWX).
+# Each cell sows on the median of the DOYs SIMPLACE simulated for it on MSWX
+# 1979-2024 -- the dates the calibration was fitted on -- repeated for every
+# harvest year 1851-2100, so CMIP6 sowing does not respond to the forcing.
+CMIP6_SOWING="${CMIP6_SOWING:-${INPUTS}/sowing_climatology_simplace_euval.csv}"
+# CMIP6_SIMPLACE=1 opts a CMIP6 run back into SIMPLACE (the musl JVM crash of
+# 2026-10-26 is unresolved; torchcrop still sows on CMIP6_SOWING).
+CMIP6_SIMPLACE="${CMIP6_SIMPLACE:-0}"
+# DAILY=1 writes both models' per-cell daily crop trajectories, one row per
+# cell-day: torchcrop_daily_shard_<n>.parquet and simplace_regions/region_*/
+# simplace_daily.parquet (simplace.daily_output). Overrides CMIP6_TC_DAILY.
+DAILY="${DAILY:-0}"
+DAILY_VARIABLES="${DAILY_VARIABLES:-LAI DVS AGB WSO WA TRANRF NNI TRAN CO2_FACTOR LEAF_HEAT_FACTOR}"
 CMIP6_ROOT="${CMIP6_ROOT:-${INPUTS}/exports/cmip6}"
 SUSTAG_XML="${SUSTAG_XML:-/data01/FDS/muduchuru/Data/SIMPLACE/TEMPLATES/Rotation_monocrop/data/crop/LINTUL5_crop.xml}"
 SUSTAG_BLOCK="${SUSTAG_BLOCK:-WW}"
 SP_SLOTS="${SP_SLOTS:-10}"
 TC_SLOTS="${TC_SLOTS:-4}"
-# A cell costs ~72 s of SIMPLACE over 46 years; ~20000 cell-years is a ~9 h task.
-CELL_YEARS_PER_TASK="${CELL_YEARS_PER_TASK:-20000}"
+# JVMs per SIMPLACE task and the job that holds them: 24 workers used 27 cores
+# and 58 GB with the SerialGC flags (SlurmResources.java_opts), one job a node.
+SP_WORKERS="${SP_WORKERS:-24}"
+# 24 workers ran ~2850 cell-years each in ~8 min, so 60000 cell-years keeps
+# ~15 lines per JVM -- enough to amortise its ~1 min start-up.
+CELL_YEARS_PER_TASK="${CELL_YEARS_PER_TASK:-60000}"
+# Highest array index SLURM accepts is MaxArraySize - 1.
+ARRAY_MAX=$(scontrol show config 2>/dev/null | awk '/^MaxArraySize/ {print $3 - 1}')
+ARRAY_MAX="${ARRAY_MAX:-1000}"
 
 DRY_RUN=0 AFTER="" DO_SP=1 DO_TC=1 FORCINGS=()
 while [ $# -gt 0 ]; do
@@ -97,6 +118,8 @@ done
 
 # shellcheck disable=SC1091
 source "${SUBMIT_DIR}/utils/simplace_env.sh"
+# 24 glibc JVMs peaked at 76.7 GB on CMIP6 and were OOM-killed at 72G (2026-11-06).
+SP_CPUS="${SP_JOB_CPUS:-32}" SP_MEM="${SP_JOB_MEM:-90G}"
 sp_activate
 cd "${PROJECT_DIR}" || exit 1
 
@@ -160,9 +183,11 @@ from pathlib import Path
 
 import yaml
 
-base, key, export, out_root, run_name, cal_dir, stage, per_task, dry = sys.argv[1:10]
+base, key, export, out_root, run_name, cal_dir, stage, per_task, dry, workers, daily = sys.argv[1:12]
 config = yaml.safe_load(Path(base).read_text())
 config["run_name"] = run_name
+config["simplace"]["workers_per_task"] = int(workers)
+config["simplace"]["daily_output"] = daily == "1"
 config["paths"]["export_dir"] = export
 window = None
 if key != "mswx":
@@ -206,28 +231,28 @@ for KEY in "${KEYS[@]}"; do
     TC_OUT="${OUT_ROOT}/torchcrop"
     [ -d "${EXPORT}" ] || die "no export ${EXPORT}"
 
-    read -r FIRST LAST LINES WSTART WEND < <(run_config "${BASE_CONFIG}" "${KEY}" "${EXPORT}" \
-        "${OUT_ROOT}" "${RUN_NAME}" "${CAL_DIR}" "${CAL_STAGE}" "${CELL_YEARS_PER_TASK}" "${DRY_RUN}") \
+    read -r FIRST LAST PER_TASK WSTART WEND < <(run_config "${BASE_CONFIG}" "${KEY}" "${EXPORT}" \
+        "${OUT_ROOT}" "${RUN_NAME}" "${CAL_DIR}" "${CAL_STAGE}" "${CELL_YEARS_PER_TASK}" "${DRY_RUN}" "${SP_WORKERS}" "${DAILY}") \
         || die "config generation failed for ${KEY}"
-    if [ "${KEY}" = mswx ]; then SOWING="${MSWX_SOWING}"; else SOWING="${OUT_ROOT}/simplace/sowing_from_simplace.csv"; fi
+    if [ "${KEY}" = mswx ]; then SOWING="${MSWX_SOWING}" KEY_SP="${DO_SP}"; else SOWING="${CMIP6_SOWING}" KEY_SP=$(( DO_SP && CMIP6_SIMPLACE )); fi
 
     echo ""
     echo "=== ${KEY}"
     echo "  export   : ${EXPORT}"
     echo "  run      : ${OUT_ROOT}"
-    echo "  window   : ${WSTART} .. ${WEND}  (harvests ${FIRST}-${LAST}, ${LINES} lines/task)"
+    echo "  window   : ${WSTART} .. ${WEND}  (harvests ${FIRST}-${LAST}, ${PER_TASK} lines/task)"
     echo "  sowing   : ${SOWING}"
     if [ "${DRY_RUN}" -eq 1 ]; then
-        [ "${KEY}" = mswx ] && { [ -f "${MSWX_SOWING}" ] || die "no sowing table ${MSWX_SOWING}"; }
+        [ -f "${SOWING}" ] || die "no sowing table ${SOWING}"
         continue
     fi
     mkdir -p "${LOGS}"
 
     # --- SIMPLACE: region builds, one array, merge --------------------------------
     SP_COLLECT_JOB=""
-    if [ "${DO_SP}" -eq 1 ]; then
+    if [ "${KEY_SP}" -eq 1 ]; then
         (
-            export SP_CONFIG="${CONFIG}" SP_RUN_NAME="${RUN_NAME}" SP_RUN_DIR="" SP_LINES_PER_TASK="${LINES}"
+            export SP_CONFIG="${CONFIG}" SP_RUN_NAME="${RUN_NAME}" SP_RUN_DIR="" SP_LINES_PER_TASK="${PER_TASK}"
             "${SUBMIT_DIR}/utils/submit_simplace_regions.sh" --export-dir "${REGIONS_EXPORT}" \
                 --out-root "${SP_ROOT_DIR}" --build-only > "${LOGS}/region_builds.log" 2>&1
         ) || { echo "  SKIP: region builds failed (see ${LOGS}/region_builds.log)" >&2; STATUS=1; continue; }
@@ -238,29 +263,37 @@ for KEY in "${KEYS[@]}"; do
             ROOT="${ROOT%/}"
             [ -f "${ROOT}/run.env" ] || continue
             N_LINES=$(env -u SP_N_LINES bash -c "source '${ROOT}/run.env' && echo \${SP_N_LINES}")
-            for ((A = 1; A <= N_LINES; A += LINES)); do
-                B=$(( A + LINES - 1 )); [ "${B}" -gt "${N_LINES}" ] && B="${N_LINES}"
+            for ((A = 1; A <= N_LINES; A += PER_TASK)); do
+                B=$(( A + PER_TASK - 1 )); [ "${B}" -gt "${N_LINES}" ] && B="${N_LINES}"
                 echo "${ROOT} ${A} ${B}" >> "${TABLE}"
             done
         done
         N_TASKS=$(wc -l < "${TABLE}")
         [ "${N_TASKS}" -gt 0 ] || { echo "  SKIP: empty task table ${TABLE}" >&2; STATUS=1; continue; }
 
-        DEP=(); [ -n "${PREV_SP}" ] && DEP=(--dependency="afterany:${PREV_SP}")
-        SP_JOB=$(sbatch --parsable --job-name="sp_${KEY//\//_}" "${DEP[@]+"${DEP[@]}"}" \
-            --partition="${SP_PARTITION}" --cpus-per-task="${SP_CPUS}" \
-            --mem="${SP_MEM}" --time="${SP_TIME}" --array="0-$((N_TASKS - 1))%${SP_SLOTS}" \
-            --output="${LOGS}/sp_%A_%a.out" --error="${LOGS}/sp_%A_%a.err" \
-            --export="ALL,SP_TASK_TABLE=${TABLE}" "${SUBMIT_DIR}/utils/simplace_task_table.sh") \
-            || die "SIMPLACE array submission failed for ${KEY}"
-        PREV_SP="${SP_JOB}"
+        # MaxArraySize caps one array's indices, so a long table goes in chunks,
+        # each waiting for the one before: the %SP_SLOTS cap still holds overall.
+        CHUNK_JOBS=()
+        for ((OFFSET = 0; OFFSET < N_TASKS; OFFSET += ARRAY_MAX)); do
+            SIZE=$(( N_TASKS - OFFSET < ARRAY_MAX ? N_TASKS - OFFSET : ARRAY_MAX ))
+            DEP=(); [ -n "${PREV_SP}" ] && DEP=(--dependency="afterany:${PREV_SP}")
+            SP_JOB=$(sbatch --parsable --job-name="sp_${KEY//\//_}" "${DEP[@]+"${DEP[@]}"}" \
+                --partition="${SP_PARTITION}" --cpus-per-task="${SP_CPUS}" \
+                --mem="${SP_MEM}" --time="${SP_TIME}" --array="0-$((SIZE - 1))%${SP_SLOTS}" \
+                --output="${LOGS}/sp_%A_%a.out" --error="${LOGS}/sp_%A_%a.err" \
+                --export="ALL,SP_TASK_TABLE=${TABLE},SP_TASK_OFFSET=${OFFSET}" \
+                "${SUBMIT_DIR}/utils/simplace_task_table.sh") \
+                || die "SIMPLACE array submission failed for ${KEY}"
+            PREV_SP="${SP_JOB}"
+            CHUNK_JOBS+=("${SP_JOB}")
+        done
         SP_COLLECT_JOB=$(sbatch --parsable --job-name="sp_${KEY//\//_}_collect" \
-            --dependency="afterany:${SP_JOB}" --partition="${SP_PARTITION}" \
-            --mem=32G --time=04:00:00 --output="${LOGS}/collect_%j.out" \
+            --dependency="afterany:$(IFS=:; echo "${CHUNK_JOBS[*]}")" --partition="${SP_PARTITION}" \
+            --cpus-per-task=8 --mem=64G --time=04:00:00 --output="${LOGS}/collect_%j.out" \
             --export="ALL,SP_CONFIG=${CONFIG},CM_SUBMIT_DIR=${SUBMIT_DIR},CM_REGIONS_ROOT=${SP_ROOT_DIR},CM_MERGED=${OUT_ROOT}/simplace/simplace_europe.parquet" \
             "${SUBMIT_DIR}/utils/simplace_regions_collect.sh") \
             || die "collect submission failed for ${KEY}"
-        echo "  SIMPLACE : array ${SP_JOB} (${N_TASKS} tasks), merge ${SP_COLLECT_JOB}"
+        echo "  SIMPLACE : array(s) ${CHUNK_JOBS[*]} (${N_TASKS} tasks), merge ${SP_COLLECT_JOB}"
     fi
 
     # --- torchcrop ---------------------------------------------------------------
@@ -271,8 +304,8 @@ for KEY in "${KEYS[@]}"; do
         WAIT=()
         [ "${KEY}" != mswx ] && [ -n "${SP_COLLECT_JOB}" ] && WAIT+=("${SP_COLLECT_JOB}")
         [ -n "${PREV_TC}" ] && WAIT+=("${PREV_TC}")
-        if [ "${KEY}" != mswx ] && [ -z "${SP_COLLECT_JOB}" ] && [ ! -f "${SOWING}" ]; then
-            echo "  SKIP torchcrop: no ${SOWING} and no SIMPLACE run queued to write it" >&2
+        if [ ! -f "${SOWING}" ]; then
+            echo "  SKIP torchcrop: no sowing table ${SOWING}" >&2
             STATUS=1; continue
         fi
         TC_LOG="${LOGS}/submit_torchcrop.log"
@@ -280,9 +313,16 @@ for KEY in "${KEYS[@]}"; do
             export TC_CONFIG="${CONFIG}" TC_RUN_NAME="${RUN_NAME}" TC_OUT_DIR="${TC_OUT}" TC_DATA_DIR="${EXPORT}"
             export TC_START_YEAR="${FIRST}" TC_END_YEAR="${LAST}"
             [ "${KEY}" != mswx ] && export TC_DAILY="${CMIP6_TC_DAILY:-0}"
+            [ "${DAILY}" -eq 1 ] && export TC_DAILY=1 TC_DAILY_VARIABLES="${DAILY_VARIABLES}"
             export TC_CROP_SOURCE=simplace TC_CROP_XML="${SUSTAG_XML}" TC_SIMPLACE_CROP="${SUSTAG_BLOCK}"
             export TC_REGION_CROP_DIR="${CROPS}" TC_REGIONS_FILE="${CAL_DIR}/regions.parquet"
             export TC_SOWING_FILE="${SOWING}" TC_MAX_CONCURRENT="${TC_SLOTS}"
+            # Whole regions per shard, and the cores a shard measurably uses (~2 of
+            # 16 under the round-robin split, which ran 28 regions per shard).
+            export TC_SHARD_BY="${TC_SHARD_BY:-regions}" TC_CPUS="${TC_CPUS:-8}"
+            # run_cells caches each cell's decoded weather (~4 MB) for the whole
+            # region slice; a 3200-cell slice adds ~12.5 GB to the 6.3 GB peak.
+            export TC_MEM="${TC_MEM:-32G}"
             export TC_DEPENDENCY="${WAIT[*]:+afterany:$(IFS=:; echo "${WAIT[*]}")}"
             unset TC_SHARD_DIR TC_WORK_DIR TC_CROP_FILE
             # shellcheck disable=SC1091

@@ -13,8 +13,12 @@ from data4simplace.phenology.decode import (
     decode_yydoy,
 )
 from data4simplace.phenology.pep725 import (
+    GRAIN_MAIZE,
+    PEP_CROPS,
     PHASES,
+    PepCrop,
     Phase,
+    WINTER_WHEAT,
     load_observations,
     match_to_admin,
     match_to_grid,
@@ -35,7 +39,11 @@ from data4simplace.phenology.seasons import (
 
 __all__ = [
     "CROP_CODES",
+    "GRAIN_MAIZE",
+    "PEP_CROPS",
     "PHASES",
+    "PepCrop",
+    "WINTER_WHEAT",
     "Phase",
     "CTY_CLASSES",
     "DATE_FLAGS",

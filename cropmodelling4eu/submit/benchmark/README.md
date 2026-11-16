@@ -15,5 +15,6 @@ analysis.
 ```
 
 `submit_benchmark.sh` reads an existing calibration weather cache
-(`BENCH_CACHE_FROM`). Its default, `calibration_mixcheck`, was deleted in the
-cleanup, so point it at `winter_wheat_2000_2024_euval/calibration`.
+(`BENCH_CACHE_FROM`, default `${CAL_RUN_DIR}/calibration`, the production
+calibration) and SIMPLACE task logs from the production run dirs in
+`BENCH_SIMPLACE` (`<run>/logs/sp_*.out`).

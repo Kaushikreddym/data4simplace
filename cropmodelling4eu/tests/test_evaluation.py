@@ -13,6 +13,11 @@ import pandas as pd
 import pytest
 
 from cropmodelling4eu.evaluation.config import SIM_SOWING_DOY
+from cropmodelling4eu.evaluation.metrics import (
+    agreement_metrics,
+    index_of_agreement,
+    mean_normalized_bias,
+)
 from cropmodelling4eu.evaluation.torchcrop import add_phenology_columns
 
 
@@ -74,3 +79,36 @@ def test_evaluation_library_imports_as_a_subpackage():
 
     for name in evaluation.__all__:
         assert hasattr(evaluation, name), f"{name} did not import"
+
+
+def test_index_of_agreement_matches_willmott():
+    obs = np.array([2.0, 4.0, 6.0])
+    sim = np.array([3.0, 4.0, 8.0])
+    # mean(obs) = 4: sum (S-O)^2 = 1 + 0 + 4 = 5; sum (|S-4| + |O-4|)^2 = 9 + 0 + 36 = 45
+    assert index_of_agreement(obs, sim) == pytest.approx(1.0 - 5.0 / 45.0)
+    assert index_of_agreement(obs, obs) == pytest.approx(1.0)
+
+
+def test_mean_normalized_bias_skips_zero_observations():
+    obs = np.array([2.0, 4.0, 0.0])
+    sim = np.array([3.0, 3.0, 1.0])
+    assert mean_normalized_bias(obs, sim) == pytest.approx((0.5 - 0.25) / 2 * 100.0)
+
+
+def test_agreement_metrics_takes_dates_the_short_way_round():
+    obs = np.array([360.0, 200.0, 100.0])
+    sim = np.array([3.0, 205.0, 95.0])
+    scores = agreement_metrics(obs, sim, circular=True)
+    assert scores["bias"] == pytest.approx((8.0 + 5.0 - 5.0) / 3)
+    assert scores["rmse"] == pytest.approx(np.sqrt((64.0 + 25.0 + 25.0) / 3))
+    assert np.isnan(scores["mnb"])
+    assert scores["ia"] > 0.99
+
+
+
+def test_agreement_r2_is_squared_pearson_and_blind_to_offset():
+    obs = np.array([1.0, 2.0, 3.0, 4.0, 6.0])
+    sim = 2.0 * obs + 5.0
+    scores = agreement_metrics(obs, sim)
+    assert scores["pearson_r2"] == pytest.approx(1.0)
+    assert scores["ia"] < 0.9

@@ -19,7 +19,7 @@ re-run — in whole or in part — without this package.
 This subpackage imports no torch — the SIMPLACE side needs none of it.
 """
 
-from cropmodelling4eu.simplace.collect import collect_run, read_yearly, to_run_schema
+from cropmodelling4eu.simplace.collect import collect_daily, collect_run, read_yearly, to_run_schema
 from cropmodelling4eu.simplace.project import (
     build_project_frame,
     line_ranges,
@@ -49,6 +49,7 @@ __all__ = [
     "build_command",
     "build_project_frame",
     "build_workspace",
+    "collect_daily",
     "collect_run",
     "id_column_index",
     "line_ranges",

@@ -86,6 +86,20 @@ def test_yearly_layout_matches_daily(cmip_root):
     assert pd.DatetimeIndex(yearly["time"].values).hour.max() == 0
 
 
+def test_yearly_layout_prefers_reconciled_ordered_files(cmip_root):
+    """climdata's dtr scheme: the raw tasmin sits beside ordered/tasmin."""
+    ordered = cmip_root / "_yearly_cache" / EXP / "mbcn_pr-tas" / "ordered"
+    ordered.mkdir()
+    for year in (1990, 1991):
+        sel = [(i, t) for i, t in enumerate(DAYS) if t.year == year]
+        _write(ordered / f"BCSD_tas_model_scenario_{year}.nc", "tas",
+               [t for _, t in sel], [_field(i) + 0.5 for i, _ in sel])
+    yearly = MSWXHandler(_config(cmip_root, layout="yearly")).load()
+    daily = MSWXHandler(_config(cmip_root)).load()
+    np.testing.assert_allclose(yearly["tas"].values, daily["tas"].values + 0.5)
+    xr.testing.assert_allclose(yearly["pr"].load(), daily["pr"].load())
+
+
 def test_tile_outside_regional_frame_loads_nothing(cmip_root):
     grid = {"resolution_deg": 0.1, "min_lon": 40.0, "max_lon": 42.0,
             "min_lat": 52.0, "max_lat": 54.0}

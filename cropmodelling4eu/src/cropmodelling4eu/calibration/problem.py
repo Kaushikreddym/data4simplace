@@ -603,6 +603,7 @@ def load_stage_specs(
     path: Path,
     max_tier: int = 1,
     free_blocked: bool = False,
+    fixed: Iterable[str] = (),
 ) -> StageSpecs:
     """Read a stage's parameter file and apply the tier and blocked filters.
 
@@ -630,6 +631,9 @@ def load_stage_specs(
             trainer raises it per region where a third stage is observed.
         free_blocked: Free the blocked parameters anyway. Deliberately awkward:
             every current blocker is a data problem, not a code one.
+        fixed: Parameters held at a configured value
+            (``CalibrationConfig.fixed_parameters``); never freed, whatever
+            their tier.
 
     Returns:
         The :class:`StageSpecs`.
@@ -645,17 +649,19 @@ def load_stage_specs(
         if (opts or {}).get("blocked")
     }
 
+    fixed = set(fixed)
     kept = {
         name: opts
         for name, opts in entries.items()
-        if tiers[name] <= max_tier and (free_blocked or name not in blocked)
+        if tiers[name] <= max_tier and (free_blocked or name not in blocked) and name not in fixed
     }
     dropped = sorted(set(entries) - set(kept))
     if dropped:
+        reason = lambda n: "fixed" if n in fixed else blocked.get(n, f"tier {tiers[n]}")
         logger.info(
             "%d of %d parameters not freed: %s",
             len(dropped), len(entries),
-            ", ".join(f"{n} ({blocked.get(n, f'tier {tiers[n]}')})" for n in dropped),
+            ", ".join(f"{n} ({reason(n)})" for n in dropped),
         )
 
     specs, groups = load_calibration_config({**raw, "parameters": kept})

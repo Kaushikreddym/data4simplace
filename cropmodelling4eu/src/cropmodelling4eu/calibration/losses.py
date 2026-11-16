@@ -399,8 +399,8 @@ class YieldLoss:
     """
 
     #: g DM m-2 to t/ha. `wso` is dry matter and CyBench is fresh weight at
-    #: standard moisture, so the observation is routed through
-    #: `evaluation.aggregate.to_dry_matter` before it reaches here.
+    #: standard moisture, so `calibration.prepare` routes the observation
+    #: through `evaluation.aggregate.to_dry_matter` before it reaches here.
     G_M2_TO_T_HA: float = 0.01
 
     def __init__(self, settings: LossConfig, climatology: RunningClimatology) -> None:

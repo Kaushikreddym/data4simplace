@@ -63,38 +63,26 @@ export SP_LINES_PER_TASK="${SP_LINES_PER_TASK:-500}"
 
 # --- SLURM -------------------------------------------------------------------
 export SP_PARTITION="${SP_PARTITION:-compute}"
-# SIMPLACE's `-l=START-END` is one thread in one JVM, so SP_CPUS only buys
-# concurrency through SP_CORES_PER_TASK below -- sized to it (+1 for the
-# run_task.sh wrapper), not to the node, since a lone JVM asking for a whole
-# node schedules far behind smaller jobs on a busy fair-share cluster and
-# leaves every core past SP_CORES_PER_TASK idle regardless.
-export SP_CPUS="${SP_CPUS:-3}"
-# Each SIMPLACE JVM reports its own container as "RAM: 32.0 GB" regardless of
-# what SP_MEM actually is, and several concurrent JVMs each approaching that
-# is what OOM-killed SP_CORES_PER_TASK=6 at this same SP_MEM (sacct: MaxRSS
-# pinned at the 80G cap, exit 0:125, after ~18 min -- see run 782877). 80G
-# comfortably covers one JVM with a wide margin and is unchanged from what
-# already ran successfully at up to 6 concurrent JVMs.
-export SP_MEM="${SP_MEM:-80G}"
+# SIMPLACE's `-l=START-END` is one thread in one JVM, so a task only uses
+# more cores through SP_CORES_PER_TASK below, each JVM taking ~2 (JIT and GC
+# threads). The task-table worker clears SP_* before sourcing a region's
+# run.env, so for production the worker count and heap come from the build
+# (SlurmResources), and these values only size the allocation -- keep them in
+# step.
+export SP_CPUS="${SP_CPUS:-16}"
+# The image's launcher hard-codes -Xmx30g and each JVM grows into it (~12 GB
+# RSS for one task, 70 GB for two in run 785392, OOM at six under 80G). Capped
+# at SP_JAVA_HEAP=4g, eight JVMs peaked at 21.5 GB together.
+export SP_MEM="${SP_MEM:-40G}"
 export SP_TIME="${SP_TIME:-12:00:00}"
 export SP_MAX_CONCURRENT="${SP_MAX_CONCURRENT:-20}"
-# SIMPLACE's `-l=START-END` runs in one thread of one JVM, so SP_CPUS alone
-# leaves every core past the first idle. run_task.sh fans a task's own line
-# range across this many concurrent singularity/JVM invocations instead --
-# the same pattern SP_MAX_CONCURRENT already uses across array tasks, just
-# within one.
-#
-# 1 (default) is the proven-safe setting: one JVM per task cannot oversubscribe
-# against itself. Values above 1 multiply per-JVM memory (each JVM behaves as
-# though it has ~32 GB to itself, see the SP_MEM note above) faster than
-# SP_MEM scales with it -- 6 OOM-killed most tasks of a retry at this SP_MEM.
-# 2 completed cleanly (piloted on line range 2501-3000, job 785392: 48m33s,
-# peak 70 GB of the 80G budget) -- a viable speedup for a *future* run, not
-# applied here since the array already queued at 1. Raise it only with SP_MEM
-# raised to match, and only after piloting a single range with
-# `submit.sh --lines START-END` first -- a bad value fails an entire array's
-# worth of nodes, not one task.
-export SP_CORES_PER_TASK="${SP_CORES_PER_TASK:-1}"
+# Concurrent singularity/JVM invocations per task, each over a contiguous
+# sub-range of the task's lines. Piloted on region_15 lines 501-1000
+# (2026-10-23): 8 workers at a 4g heap took 5m23s against ~35 min for one
+# worker, with byte-identical yearly output.
+export SP_CORES_PER_TASK="${SP_CORES_PER_TASK:-8}"
+# run_task.sh passes this to the launcher as -Xmx; empty keeps its 30g.
+export SP_JAVA_HEAP="${SP_JAVA_HEAP:-4g}"
 
 export HDF5_USE_FILE_LOCKING=FALSE      # BeeGFS + h5netcdf/netCDF4
 

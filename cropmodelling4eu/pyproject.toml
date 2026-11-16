@@ -52,7 +52,7 @@ cm4eu = "cropmodelling4eu.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-cropmodelling4eu = ["py.typed"]
+cropmodelling4eu = ["py.typed", "calibration/*.yaml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

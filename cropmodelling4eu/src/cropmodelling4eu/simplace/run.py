@@ -15,20 +15,52 @@ round-robin split is not expressible.
 from __future__ import annotations
 
 import logging
+import os
 import shlex
 import subprocess
 import time
 from pathlib import Path
 
-from cropmodelling4eu.config import RunConfig
+from cropmodelling4eu.config import RunConfig, SimplaceConfig
 from cropmodelling4eu.simplace.workspace import (
+    CONTAINER_DATADIR,
     CONTAINER_OUTDIR,
+    CONTAINER_PROJECTDIR,
+    CONTAINER_WORKDIR,
     Workspace,
 )
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["build_command", "run_lines"]
+__all__ = ["build_command", "run_lines", "runtime_env", "runtime_image"]
+
+
+def runtime_image(settings: SimplaceConfig) -> Path:
+    """The container a run launches: the glibc Java image when one is set."""
+    return Path(settings.java_image or settings.singularity_image)
+
+
+def runtime_env(settings: SimplaceConfig) -> dict[str, str]:
+    """Environment the glibc Java image needs to run the shipped SIMPLACE.
+
+    The launcher honours INSTALL4J_JAVA_HOME_OVERRIDE; the rest is the shipped
+    image's own environment, which the Java image does not carry.
+    MALLOC_ARENA_MAX caps glibc's per-thread arenas, which musl never made.
+    Empty for the shipped image, which needs nothing.
+    """
+    if settings.java_image is None:
+        return {}
+    return {
+        "INSTALL4J_JAVA_HOME_OVERRIDE": "/opt/java/openjdk",
+        "SIMPLACE_DIR": "/simplace",
+        "SIMPLACE_WORKDIR": CONTAINER_WORKDIR,
+        "OUTDIR": CONTAINER_OUTDIR,
+        "DATADIR": CONTAINER_DATADIR,
+        "PROJECTDIR": CONTAINER_PROJECTDIR,
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "MALLOC_ARENA_MAX": "2",
+    }
 
 
 def build_command(
@@ -43,11 +75,14 @@ def build_command(
     Returned as a list rather than a string so it is run without a shell —
     nothing here should be re-parsed, and the paths can contain anything.
     """
-    image = Path(config.simplace.singularity_image)
+    settings = config.simplace
+    binds = workspace.binds(log_dir=workspace.root / "log")
+    if settings.simplace_dir is not None:
+        binds = f"{settings.simplace_dir}:/simplace,{binds}"
     return [
         "singularity", "run",
-        "-B", workspace.binds(log_dir=workspace.root / "log"),
-        str(image),
+        "-B", binds,
+        str(runtime_image(settings)),
         "/simplace/simplace", "run",
         f"-s={workspace.container_solution}",
         f"-p={workspace.container_project}",
@@ -75,10 +110,10 @@ def run_lines(
         ``singularity`` reports a missing image the same way it reports a
         missing binary, which sends people looking in the wrong place.
     """
-    image = Path(config.simplace.singularity_image)
+    image = runtime_image(config.simplace)
     if not image.is_file():
         raise FileNotFoundError(
-            f"Singularity image not found: {image}. Set "
+            f"Singularity image not found: {image}. Set simplace.java_image or "
             f"simplace.singularity_image to one of the images on this cluster."
         )
 
@@ -88,7 +123,7 @@ def run_lines(
         return 0
 
     started = time.time()
-    result = subprocess.run(command, check=False)
+    result = subprocess.run(command, check=False, env={**os.environ, **runtime_env(config.simplace)})
     elapsed = (time.time() - started) / 60.0
     if result.returncode == 0:
         logger.info(

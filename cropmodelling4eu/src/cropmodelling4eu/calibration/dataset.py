@@ -93,15 +93,32 @@ def build_pool(
     cells = regions.table.set_index("SimplaceID")
     runnable = set(bundle.ids.tolist())
 
+    irrigated = (
+        set(bundle.irrigated[bundle.irrigated > 0].index.astype(np.int64))
+        if settings.exclude_irrigated else set()
+    )
     by_unit: dict[str, np.ndarray] = {}
+    dropped_units = 0
     for unit, block in regions.table.dropna(subset=["adm_id"]).groupby("adm_id"):
         ids = np.sort(block["SimplaceID"].to_numpy(np.int64))
         ids = ids[np.isin(ids, list(runnable))] if len(runnable) else ids
+        if irrigated and ids.size:
+            wet = np.isin(ids, list(irrigated))
+            if wet.mean() > settings.max_irrigated_share:
+                dropped_units += 1
+                continue
+            ids = ids[~wet]
         if ids.size == 0:
             continue
         step = max(1, int(np.ceil(ids.size / settings.max_cells_per_unit)))
         by_unit[str(unit)] = ids[::step][: settings.max_cells_per_unit]
 
+    if irrigated:
+        logger.info(
+            "exclude_irrigated: %d irrigated cells removed; %d units over %.0f %% "
+            "irrigated dropped", len(irrigated), dropped_units,
+            100.0 * settings.max_irrigated_share,
+        )
     unit_years = observations.unit_years()
     rows: list[pd.DataFrame] = []
     for record in unit_years.itertuples():
@@ -251,6 +268,7 @@ class WeatherCache:
         cache_dir: Path,
         workers: int = 16,
         overwrite: bool = False,
+        read_only: bool = False,
     ) -> "WeatherCache":
         """Extract every pooled cell-year's window once, to disk.
 
@@ -258,6 +276,10 @@ class WeatherCache:
         cheapest of the three memory mitigations and the only free one: the
         production run's 600+ day window costs autograd graph for six months of
         bare soil the loss never reads.
+
+        ``read_only`` refuses to rebuild: a cache shared with another run (the
+        benchmark reads the production calibration's) must fail loudly rather
+        than be overwritten for a pool it was not built for.
         """
         cache_dir = Path(cache_dir)
         cache_dir.mkdir(parents=True, exist_ok=True)
@@ -286,6 +308,12 @@ class WeatherCache:
                     np.memmap(array_path, dtype=np.float32, mode="r",
                               shape=(len(index), total, len(CHANNELS))),
                     total,
+                )
+            if read_only:
+                raise ValueError(
+                    f"{cache_dir} does not cover this pool (or its window is not "
+                    f"{total} days) and is read-only here; match the run's "
+                    "data settings or give a cache of its own"
                 )
             logger.info("%s does not cover this pool; rebuilding", cache_dir)
 

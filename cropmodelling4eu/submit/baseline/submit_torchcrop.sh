@@ -196,7 +196,7 @@ EXPORT_VARS="${EXPORT_VARS},TC_LOG_DIR,TC_COMPOSITION_XML,TC_CROP,TC_START_YEAR"
 EXPORT_VARS="${EXPORT_VARS},TC_END_YEAR,TC_IOPT,TC_N_SHARDS,TC_BATCH_SIZE"
 EXPORT_VARS="${EXPORT_VARS},TC_IO_WORKERS,TC_TORCH_THREADS,TC_SOWING_FILE"
 EXPORT_VARS="${EXPORT_VARS},TC_WORK_DIR,TC_CROP_FILE,TC_DAILY,TC_DAILY_VARIABLES"
-EXPORT_VARS="${EXPORT_VARS},TC_REGION_CROP_DIR,TC_REGIONS_FILE"
+EXPORT_VARS="${EXPORT_VARS},TC_REGION_CROP_DIR,TC_REGIONS_FILE,TC_SHARD_BY"
 
 # --- Which shards still need running -----------------------------------------
 missing_shards() {
@@ -235,7 +235,7 @@ echo "  seasons      : ${TC_START_YEAR}-${TC_END_YEAR}  (${NYEARS} harvest years
 echo "  run mode     : iopt=${TC_IOPT}  crop=${TC_CROP}"
 if [ -n "${ARRAY_SPEC}" ]; then
 echo "  array        : ${ARRAY_SPEC}%${TC_MAX_CONCURRENT}$([ "${RETRY}" -eq 1 ] && echo '  (retry of missing shards)')"
-echo "  batching     : ${TC_BATCH_SIZE} cells/call, ${TC_IO_WORKERS} io threads"
+echo "  batching     : ${TC_BATCH_SIZE} cells/call, ${TC_IO_WORKERS} io threads, shards by ${TC_SHARD_BY}"
 echo "  resources    : ${TC_PARTITION}, ${TC_CPUS} cpus, ${TC_MEM}, ${TC_TIME}"
 else
 echo "  array        : skipped (--maps-only)"
@@ -279,6 +279,20 @@ cm4eu workspace --config "${TC_CONFIG}" \
     --management-xml "${TC_TEMPLATE_DATA}/management/management.xml" \
     > /dev/null || { echo "ERROR: could not prepare the workspace" >&2; exit 1; }
 
+# Optional "name=value ..." scalars written into the workspace (fallback) crop,
+# e.g. TC_CROP_OVERRIDES="tsumem=152 tbasem=0" for a sowing-comparison arm whose
+# region crops carry the PEP725 tsumem. Unset -- the default -- changes nothing.
+if [ -n "${TC_CROP_OVERRIDES:-}" ]; then
+    python - "${TC_CROP_FILE}" ${TC_CROP_OVERRIDES} <<'EOF' || { echo "ERROR: TC_CROP_OVERRIDES failed" >&2; exit 1; }
+import sys
+from cropmodelling4eu.sowing.crops import override_crop_file
+path, *items = sys.argv[1:]
+values = {k: float(v) for k, v in (i.split("=", 1) for i in items)}
+old = override_crop_file(path, path, values)
+print(f"fallback crop overrides: {values} (was {old})")
+EOF
+fi
+
 # Which SIMPLACE crop file the workspace crop came from. An empty TC_CROP_XML
 # falls back to the Brandenburg template, which is a different crop from the
 # SUSTAg WW block the production SIMPLACE run reads -- how the euval workspace
@@ -301,6 +315,26 @@ fi
 # --- 1. Shard array -----------------------------------------------------------
 ARRAY_JOB=""
 if [ -n "${ARRAY_SPEC}" ]; then
+    # Shards already on disk are skipped, so a submission whose TC_SHARD_BY
+    # differs from theirs would complete the set with a different split and
+    # run some cells twice and others never. A directory holding shards from
+    # before the mode was recorded was split by cells.
+    MODE_FILE="${TC_SHARD_DIR}/.shard_by"
+    if [ -f "${MODE_FILE}" ]; then
+        DONE_MODE=$(cat "${MODE_FILE}")
+    elif compgen -G "${TC_SHARD_DIR}/torchcrop_shard_*.parquet" > /dev/null; then
+        DONE_MODE=cells
+    else
+        DONE_MODE="${TC_SHARD_BY}"
+    fi
+    if [ "${DONE_MODE}" != "${TC_SHARD_BY}" ]; then
+        echo "ERROR: ${TC_SHARD_DIR} holds shards split by ${DONE_MODE}, not" >&2
+        echo "       TC_SHARD_BY=${TC_SHARD_BY}. Finish it with TC_SHARD_BY=${DONE_MODE}" >&2
+        echo "       or start a fresh TC_SHARD_DIR." >&2
+        exit 1
+    fi
+    echo "${TC_SHARD_BY}" > "${MODE_FILE}"
+
     # An upstream dependency, when this array is chained behind a SIMPLACE run
     # by submit_cropmodelling.sh. Empty in a standalone run.
     ARRAY_DEP=()

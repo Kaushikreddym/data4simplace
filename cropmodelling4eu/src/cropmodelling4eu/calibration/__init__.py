@@ -114,6 +114,7 @@ def prepare(
     with_fpar: bool = False,
     out_dir: Path | None = None,
     overwrite_cache: bool = False,
+    cache_read_only: bool = False,
     workers: int = 1,
 ) -> Prepared:
     """Build regions, observations, the pool, the weather cache and the calibrator.
@@ -140,6 +141,8 @@ def prepare(
         out_dir: Run outputs. ``None`` puts them under
             ``<output_dir>/<run_name>/calibration``.
         overwrite_cache: Rebuild the weather cache even if one covers the pool.
+        cache_read_only: Fail instead of rebuilding a cache that does not cover
+            the pool — for a cache owned by another run.
         workers: Processes computing region-batches concurrently. The ceiling
             is the region count (~29 here), which one node's 80 cores already
             covers; see :mod:`cropmodelling4eu.calibration.parallel`.
@@ -148,6 +151,7 @@ def prepare(
         The :class:`Prepared` bundle.
     """
     from cropmodelling4eu.evaluation import clms, config as eval_config, cybench, regions as eval_regions
+    from cropmodelling4eu.evaluation.aggregate import to_dry_matter
     from cropmodelling4eu.export import resolve_export
     from cropmodelling4eu.torchcrop.workspace import load_crop_parameters
 
@@ -172,6 +176,13 @@ def prepare(
     ))
     regions = build_regions(
         cells, calendar, yields, settings.regions, cache=out_dir / "regions.parquet"
+    )
+    # CyBench is fresh weight at market moisture and `wso` is dry matter.
+    # Fitting one to the other left every calibrated crop 1/0.865 high against
+    # the dry-matter basis `evaluation.production` scores on. The regions are
+    # built on the raw series above, so the cached partition does not move.
+    yields = yields.assign(
+        **{"yield": to_dry_matter(yields["yield"], eval_config.YIELD_MOISTURE_CONTENT)}
     )
 
     phenology = clms.load_phenology(countries, zone="adm", years=settings.phenology_years)
@@ -202,11 +213,17 @@ def prepare(
     if sowing is not None:
         logger.info("sowing table: %s (%d rows)", sowing_file, len(sowing))
     pool = build_pool(observations, regions, bundle, settings.data, sowing)
+    if settings.only_regions is not None:
+        pool = pool[pool["region_id"].isin(settings.only_regions)].reset_index(drop=True)
+        if pool.empty:
+            raise ValueError(f"no pooled cell-year in regions {list(settings.only_regions)}")
+        logger.info("pool restricted to regions %s: %d rows", list(settings.only_regions), len(pool))
     cache = WeatherCache.build(
         pool, config, settings.data,
         settings.data.cache_dir or out_dir / "weather_cache",
         workers=config.torchcrop.io_workers,
         overwrite=overwrite_cache,
+        read_only=cache_read_only,
     )
     dataset = CellYearDataset(pool, cache)
     # Persisted so a model that is not calibrated here — SIMPLACE — can be

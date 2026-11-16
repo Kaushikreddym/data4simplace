@@ -8,8 +8,11 @@ Two properties drive the design:
 * **A gzip stream has no random access.** Whichever season is wanted, the whole
   file is decoded — so it is decoded *once* and every requested season is
   sliced out of the result. That is the difference between one pass and 45.
-* **Reads release the GIL**, being gzip-bound, so a thread pool scales here
-  without the pickling cost of processes.
+* **Reads do not scale over threads.** Decoding releases the GIL but date
+  parsing and the per-season slicing do not: 16 threads reach ~2 busy cores
+  and are slower per row than 4 (3.1 vs 5.8 ms, 2026-11-10). A run whose model
+  is fast enough to wait on its weather uses :class:`RowBlockReader`, which
+  reads in worker processes, ahead of the model.
 
 Unit conversions live here rather than in a model runner, because they are
 properties of the export rather than of a model: MSWX ``rsds`` is exported as a
@@ -20,7 +23,8 @@ temperature and relative humidity because no vapour-pressure column exists.
 from __future__ import annotations
 
 import logging
-from concurrent.futures import ThreadPoolExecutor
+import multiprocessing
+from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -33,10 +37,13 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "CHANNELS",
+    "RowBlockReader",
     "SENTINEL",
+    "load_row_block",
     "load_season_block",
     "load_seasons",
     "load_windows",
+    "ordered_temperatures",
     "saturation_vp",
     "season_window",
     "sowing_date",
@@ -120,6 +127,23 @@ def _read_file(path: Path) -> pd.DataFrame:
     ).set_index("Date")
 
 
+def ordered_temperatures(
+    tmin: np.ndarray, tmean: np.ndarray, tmax: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """``(min, middle, max)`` of the three daily temperatures, per day.
+
+    Bias-corrected CMIP6 exports correct each variable independently and so
+    invert ~1.2% of days (Tmin > Tmax, Tmean outside the pair). SIMPLACE's
+    solution applies the same reordering in its weather SQL, so both models
+    read one weather. Days with a missing value are left as they are, for the
+    sentinel handling downstream.
+    """
+    stacked = np.stack([tmin, tmean, tmax]).astype(float)
+    complete = np.isfinite(stacked).all(axis=0)
+    ordered = np.where(complete, np.sort(stacked, axis=0), stacked)
+    return ordered[0], ordered[1], ordered[2]
+
+
 def to_channels(block: pd.DataFrame, has_wind: bool) -> np.ndarray:
     """One date-indexed weather slice as a ``[T, 8]`` array in :data:`CHANNELS` order.
 
@@ -128,8 +152,9 @@ def to_channels(block: pd.DataFrame, has_wind: bool) -> np.ndarray:
     "W m-2 to MJ m-2 d-1" or of the vapour-pressure reconstruction is a second
     chance to get one of them wrong.
     """
-    tmin = block["TempMin"].to_numpy()
-    tmax = block["TempMax"].to_numpy()
+    tmin, tmean, tmax = ordered_temperatures(
+        block["TempMin"].to_numpy(), block["TempMean"].to_numpy(), block["TempMax"].to_numpy()
+    )
     frame = pd.DataFrame(
         {
             "doy": block.index.dayofyear.to_numpy(float),
@@ -140,7 +165,7 @@ def to_channels(block: pd.DataFrame, has_wind: bool) -> np.ndarray:
             "rain": np.nan_to_num(block["Precipitation"].to_numpy(), nan=0.0),
             # No vapour-pressure column exists, so it is rebuilt from the
             # saturation value at mean temperature and relative humidity.
-            "vp": saturation_vp(block["TempMean"].to_numpy())
+            "vp": saturation_vp(tmean)
             * block["RelHumCalc"].to_numpy()
             / 100.0,
             "wind": (
@@ -184,8 +209,12 @@ def load_seasons(
     grid: GridConfig,
     spinup_months: int = 6,
     min_days_after_sowing: int = 365,
+    raw: pd.DataFrame | None = None,
 ) -> dict[int, np.ndarray]:
     """Read one cell's file once and slice out every requested season.
+
+    ``raw`` is the cell's already-decoded record (see :func:`load_season_block`'s
+    ``records``); without it the file is read here.
 
     A harvest year is dropped when the record cannot cover its window's crop
     phase — it starts after sowing, or ends less than ``min_days_after_sowing``
@@ -199,7 +228,8 @@ def load_seasons(
     dict
         ``{harvest_year: [T, 8]}`` in :data:`CHANNELS` order.
     """
-    raw = _read_file(weather_path(export_dir, simplace_id, grid))
+    if raw is None:
+        raw = _read_file(weather_path(export_dir, simplace_id, grid))
 
     # Exports predating the sfcWind fix carry -99.9 in every Windspeed row,
     # which read_csv turned into NaN. Fall back to the constant only then, so a
@@ -230,6 +260,7 @@ def load_season_block(
     workers: int = 16,
     spinup_months: int = 6,
     min_days_after_sowing: int = 365,
+    records: dict[int, pd.DataFrame] | None = None,
 ) -> dict[int, tuple[np.ndarray, int]]:
     """Weather for a batch of cells, as ``{year: ([B, T, 8], start_doy)}``.
 
@@ -242,17 +273,26 @@ def load_season_block(
 
     Batching by a **single** sowing day-of-year is what makes that invariant
     hold — see :func:`cropmodelling4eu.torchcrop.run.group_by_sowing`.
+
+    ``records`` caches each cell's decoded file across calls. A caller batching
+    one season at a time (a simulated-sowing table, see
+    :func:`cropmodelling4eu.torchcrop.run.sowing_plan`) would otherwise decode
+    every cell's whole record once per season: for a 165-year CMIP6 export
+    that was 85 s of a 102 s batch. The cache costs ~4 MB per cell.
     """
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        per_cell = list(
-            pool.map(
-                lambda sid: load_seasons(
-                    export_dir, sid, years, sowing_doy, grid,
-                    spinup_months, min_days_after_sowing,
-                ),
-                ids,
-            )
+    def cell_seasons(sid: int) -> dict[int, np.ndarray]:
+        raw = None
+        if records is not None:
+            raw = records.get(sid)
+            if raw is None:
+                raw = records[sid] = _read_file(weather_path(export_dir, sid, grid))
+        return load_seasons(
+            export_dir, sid, years, sowing_doy, grid,
+            spinup_months, min_days_after_sowing, raw,
         )
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        per_cell = list(pool.map(cell_seasons, ids))
 
     blocks: dict[int, tuple[np.ndarray, int]] = {}
     for year in years:
@@ -273,3 +313,168 @@ def load_season_block(
         n_days = min(a.shape[0] for a in arrays)
         blocks[year] = (np.stack([a[:n_days] for a in arrays]), start_doys.pop())
     return blocks
+
+
+def load_row_block(
+    export_dir: Path,
+    ids: np.ndarray,
+    years: np.ndarray,
+    sowing_doy: int,
+    grid: GridConfig,
+    records: dict[int, pd.DataFrame],
+    workers: int = 16,
+    spinup_months: int = 6,
+    min_days_after_sowing: int = 365,
+) -> list[tuple[np.ndarray, np.ndarray, int]]:
+    """Weather for ``(cell, season)`` rows of *different* seasons sharing one anchor.
+
+    :func:`load_season_block`'s batch is one set of cells over shared seasons;
+    here row ``i`` is cell ``ids[i]`` in harvest year ``years[i]``, every
+    window opened ``spinup_months`` before ``sowing_doy`` of its own year. That
+    lands on one day-of-year in every year except where a leap day falls
+    between window start and sowing, so rows are grouped by their actual first
+    day, each group trimmed to its shortest window.
+
+    A row without a usable window is dropped on its own, not with its season.
+
+    Returns
+    -------
+    list
+        ``[(row_index, [B, T, 8], start_doy)]``, ``row_index`` into ``ids``.
+    """
+    def row(i: int) -> np.ndarray | None:
+        return _window_row(export_dir, int(ids[i]), int(years[i]), sowing_doy, grid,
+                           records, spinup_months, min_days_after_sowing)
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        arrays = list(pool.map(row, range(ids.size)))
+    return _group_rows(arrays)
+
+
+def _window_row(
+    export_dir: Path,
+    sid: int,
+    year: int,
+    sowing_doy: int,
+    grid: GridConfig,
+    records: dict[int, pd.DataFrame],
+    spinup_months: int,
+    min_days_after_sowing: int,
+) -> np.ndarray | None:
+    raw = records.get(sid)
+    if raw is None:
+        raw = records[sid] = _read_file(weather_path(export_dir, sid, grid))
+    return load_seasons(
+        export_dir, sid, [year], sowing_doy, grid,
+        spinup_months, min_days_after_sowing, raw,
+    ).get(year)
+
+
+def _group_rows(arrays: list[np.ndarray | None]) -> list[tuple[np.ndarray, np.ndarray, int]]:
+    """Rows grouped by their window's first day, each group trimmed to its shortest."""
+    dropped = sum(a is None for a in arrays)
+    if dropped:
+        logger.warning("%d of %d (cell, season) rows have no usable window", dropped, len(arrays))
+    by_start: dict[int, list[int]] = {}
+    for i, a in enumerate(arrays):
+        if a is not None:
+            by_start.setdefault(int(a[0, 0]), []).append(i)
+    out = []
+    for start_doy, rows in sorted(by_start.items()):
+        n_days = min(arrays[i].shape[0] for i in rows)
+        out.append((
+            np.asarray(rows), np.stack([arrays[i][:n_days] for i in rows]), start_doy,
+        ))
+    return out
+
+
+#: Per-process record cache of a :class:`RowBlockReader` worker.
+_WORKER_RECORDS: dict[int, pd.DataFrame] = {}
+
+
+def _worker_rows(
+    export_dir: Path,
+    sids: np.ndarray,
+    years: np.ndarray,
+    sowing_doy: int,
+    grid: GridConfig,
+    spinup_months: int,
+    min_days_after_sowing: int,
+) -> list[np.ndarray | None]:
+    return [
+        _window_row(export_dir, int(sid), int(year), sowing_doy, grid, _WORKER_RECORDS,
+                    spinup_months, min_days_after_sowing)
+        for sid, year in zip(sids, years)
+    ]
+
+
+class _PendingBlock:
+    """One batch's weather being read across the workers."""
+
+    __slots__ = ("size", "shards")
+
+    def __init__(self, size: int, shards: list[tuple[np.ndarray, Future]]) -> None:
+        self.size, self.shards = size, shards
+
+    def result(self) -> list[tuple[np.ndarray, np.ndarray, int]]:
+        arrays: list[np.ndarray | None] = [None] * self.size
+        for positions, future in self.shards:
+            for i, a in zip(positions, future.result()):
+                arrays[i] = a
+        return _group_rows(arrays)
+
+
+class RowBlockReader:
+    """:func:`load_row_block` in ``n_workers`` processes, submitted ahead of the model.
+
+    Each cell is pinned to one worker (``SimplaceID % n_workers``), so its
+    decoded record stays in that worker's cache across batches exactly as the
+    in-process ``records`` dict keeps it, and no file is decoded twice. One
+    single-process pool per worker is what makes the pinning possible.
+
+    Workers are spawned, not forked: the parent may already hold a CUDA
+    context, and a forked child inherits it in a state CUDA does not support.
+
+    Use as a context manager; :meth:`submit` returns at once and the block's
+    ``result()`` has the :func:`load_row_block` return value.
+    """
+
+    def __init__(
+        self,
+        export_dir: Path,
+        grid: GridConfig,
+        n_workers: int,
+        spinup_months: int = 6,
+        min_days_after_sowing: int = 365,
+    ) -> None:
+        if n_workers < 1:
+            raise ValueError(f"n_workers must be >= 1, not {n_workers}")
+        self.export_dir, self.grid = export_dir, grid
+        self.spinup_months, self.min_days_after_sowing = spinup_months, min_days_after_sowing
+        context = multiprocessing.get_context("spawn")
+        self._pools = [ProcessPoolExecutor(1, mp_context=context) for _ in range(n_workers)]
+        # Spawning imports pandas in every worker: pay it here, not in the first batch.
+        for future in [pool.submit(int, 0) for pool in self._pools]:
+            future.result()
+
+    def submit(self, ids: np.ndarray, years: np.ndarray, sowing_doy: int) -> _PendingBlock:
+        owner = np.asarray(ids, dtype=np.int64) % len(self._pools)
+        shards = []
+        for k, pool in enumerate(self._pools):
+            positions = np.flatnonzero(owner == k)
+            if positions.size:
+                shards.append((positions, pool.submit(
+                    _worker_rows, self.export_dir, ids[positions], years[positions],
+                    sowing_doy, self.grid, self.spinup_months, self.min_days_after_sowing,
+                )))
+        return _PendingBlock(len(ids), shards)
+
+    def close(self) -> None:
+        for pool in self._pools:
+            pool.shutdown(cancel_futures=True)
+
+    def __enter__(self) -> RowBlockReader:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()

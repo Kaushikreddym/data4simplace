@@ -12,6 +12,9 @@ set -uo pipefail
 
 TABLE="${SP_TASK_TABLE:?SP_TASK_TABLE must name the task table}"
 INDEX="${SLURM_ARRAY_TASK_ID:?run as an array task}"
+# A table longer than MaxArraySize is submitted in chunks; SP_TASK_OFFSET
+# is this chunk's first row.
+INDEX=$(( INDEX + ${SP_TASK_OFFSET:-0} ))
 read -r ROOT FIRST LAST < <(sed -n "$((INDEX + 1))p" "${TABLE}")
 [ -n "${ROOT:-}" ] || { echo "ERROR: no row ${INDEX} in ${TABLE}" >&2; exit 2; }
 

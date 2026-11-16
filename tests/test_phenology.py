@@ -297,3 +297,23 @@ def test_skill_separates_a_level_offset_from_the_interannual_signal():
     assert result["bias"] == pytest.approx(-19.0, abs=0.01)
     assert result["anomaly_r"] == pytest.approx(1.0, abs=0.01)
     assert result["spatial_r"] == pytest.approx(1.0, abs=0.01)
+
+
+def test_maize_keeps_unspecified_cult_season_and_never_moves_a_stage(tmp_path):
+    """Every PEP725 Zea row is cult_season 0; a winter filter would drop them all."""
+    from data4simplace.phenology import pep725
+
+    frame = pd.DataFrame(
+        [(1, 101, 10.0, 50.0, 100, 2020, code, day, 0)
+         for code, day in ((0, 115), (10, 128), (100, 280))],
+        columns=["s_id", "provider_id", "lon", "lat", "alt", "year",
+                 "phase_id", "day", "cult_season"],
+    ).assign(genus="Zea")
+    frame.to_csv(tmp_path / "pep725_test.csv", sep=";", index=False)
+
+    obs = pep725.load_observations(tmp_path, (2020, 2020), crop=pep725.GRAIN_MAIZE)
+    seasons = pep725.station_seasons(obs, pep725.GRAIN_MAIZE)
+    assert seasons["harvest_year"].tolist() == [2020]
+    assert seasons["season_length_days"].iloc[0] == 152
+    with pytest.raises(ValueError):
+        pep725.load_observations(tmp_path, (2020, 2020))

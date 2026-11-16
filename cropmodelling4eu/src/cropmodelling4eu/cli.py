@@ -117,6 +117,7 @@ def _cmd_simplace(args: argparse.Namespace) -> int:
     from cropmodelling4eu.export import resolve_export
     from cropmodelling4eu.simplace import (
         build_workspace,
+        collect_daily,
         collect_run,
         line_ranges,
         run_lines,
@@ -138,6 +139,9 @@ def _cmd_simplace(args: argparse.Namespace) -> int:
     if args.step == "collect":
         parquet = collect_run(root / "out", root, config.grid)
         print(f"\nCollected -> {parquet}")
+        daily = collect_daily(root / "out", root)
+        if daily is not None:
+            print(f"Daily     -> {daily}")
         return 0
 
     bundle = resolve_export(config, require_management=config.simplace.iopt != 1)
@@ -248,6 +252,10 @@ def _calibration_settings(args: argparse.Namespace) -> tuple[RunConfig, Any]:
         settings = settings.model_copy(
             update={"stage_order": (args.stage,)}
         )
+    if getattr(args, "regions", None):
+        settings = settings.model_copy(update={"only_regions": tuple(args.regions)})
+    if getattr(args, "split_from", None) is not None:
+        settings = settings.model_copy(update={"split_from": args.split_from})
     return config, settings
 
 
@@ -256,6 +264,10 @@ def _cmd_calibrate(args: argparse.Namespace) -> int:
     from cropmodelling4eu.calibration import prepare
 
     config, settings = _calibration_settings(args)
+    if args.cache_dir is not None:
+        settings = settings.model_copy(
+            update={"data": settings.data.model_copy(update={"cache_dir": args.cache_dir})}
+        )
 
     prepared = prepare(
         config,
@@ -267,6 +279,7 @@ def _cmd_calibrate(args: argparse.Namespace) -> int:
         with_fpar="lai" in settings.stage_order,
         out_dir=args.out_dir,
         overwrite_cache=args.rebuild_cache,
+        cache_read_only=args.cache_dir is not None,
         workers=args.workers,
     )
     if args.prepare_only:
@@ -298,6 +311,26 @@ def _cmd_benchmark(args: argparse.Namespace) -> int:
     )
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
+    if args.production:
+        from cropmodelling4eu.benchmark import bench_production
+
+        config = _resolve_config(args)
+        updates = {key: value for key, value in (
+            ("torch_threads", args.threads), ("io_processes", args.io_processes)) if value is not None}
+        if updates:
+            config = config.model_copy(update={"torchcrop": config.torchcrop.model_copy(
+                update=updates)})
+        table = pd.concat([
+            bench_production(config, [int(b) for b in args.batch_sizes.split(",")], device,
+                             crop_file=args.crop_file, sowing_file=args.sowing_file,
+                             years=tuple(args.years), n_batches=args.n_batches)
+            for device in args.devices.split(",")
+        ], ignore_index=True)
+        if args.append and args.output.is_file():
+            table = pd.concat([pd.read_parquet(args.output), table], ignore_index=True)
+        table.to_parquet(args.output, index=False)
+        print(table.drop(columns=["model", "label"]).round(2).to_string(index=False))
+        return 0
     frames = []
     if args.simplace_runs:
         timings = simplace_log_timings(args.simplace_runs)
@@ -308,19 +341,27 @@ def _cmd_benchmark(args: argparse.Namespace) -> int:
 
         args.mix_regions = not args.region_packed
         config, settings = _calibration_settings(args)
+        if args.cache_dir is not None:
+            settings = settings.model_copy(
+                update={"data": settings.data.model_copy(update={"cache_dir": args.cache_dir})}
+            )
         prepared = prepare(
             config, settings, crop_file=args.crop_file, sowing_file=args.sowing_file,
             pep725_root=args.pep725, with_yield=args.stage == "yield",
-            out_dir=args.out_dir,
+            out_dir=args.out_dir, cache_read_only=args.cache_dir is not None,
         )
-        frames.append(
-            bench_torchcrop(
-                prepared.calibrator, args.stage,
-                sorted(int(b) for b in args.batch_sizes.split(",")),
-                devices=args.devices.split(","), modes=args.modes.split(","),
-                mix=not args.region_packed, repeats=args.repeats,
-            )
+        summary, passes = bench_torchcrop(
+            prepared.calibrator, args.stage,
+            sorted(int(b) for b in args.batch_sizes.split(",")),
+            devices=args.devices.split(","), modes=args.modes.split(","),
+            mix=not args.region_packed, repeats=args.repeats,
+            n_batches=args.n_batches, steps=args.steps,
         )
+        frames.append(summary)
+        passes_path = args.output.with_name(args.output.stem + "_passes.parquet")
+        if args.append and passes_path.is_file():
+            passes = pd.concat([pd.read_parquet(passes_path), passes], ignore_index=True)
+        passes.to_parquet(passes_path, index=False)
     if not frames:
         print("nothing to do: pass --batch-sizes and/or --simplace-runs", file=sys.stderr)
         return 2
@@ -329,6 +370,45 @@ def _cmd_benchmark(args: argparse.Namespace) -> int:
         table = pd.concat([pd.read_parquet(args.output), table], ignore_index=True)
     table.to_parquet(args.output, index=False)
     print(table.to_string(index=False))
+    return 0
+
+
+def _cmd_simplace_calibrate(args: argparse.Namespace) -> int:
+    """Optuna calibration of SIMPLACE per region, on torchcrop's objective."""
+    import pandas as pd
+
+    from cropmodelling4eu.simplace.optuna_calibration import OptunaSettings, calibrate_region
+
+    config = _resolve_config(args)
+    regions = (
+        sorted(int(r) for r in pd.read_parquet(args.calibration_dir / "regions.parquet")["region_id"].unique())
+        if args.region == ["all"] else [int(r) for r in args.region]
+    )
+    stages = ("phenology", "yield") if args.stage == "all" else (args.stage,)
+    settings = OptunaSettings(
+        n_trials=args.trials, n_startup_trials=args.startup_trials, seed=args.seed,
+        workers=args.workers, java_heap=args.java_heap or None,
+        heading_from_daily=not args.no_heading, max_cells_per_unit=args.cells_per_unit,
+        spinup_years=args.spinup_years, keep_trial_dirs=args.keep_trials,
+        warm_start=not args.no_warm_start,
+    )
+    overrides = {
+        key: value for key, value in (("java_image", args.java_image), ("simplace_dir", args.simplace_dir))
+        if value is not None
+    }
+    for region in regions:
+        for stage in stages:
+            try:
+                summary = calibrate_region(
+                    region, stage, args.calibration_dir, config, args.crop_file, args.out_dir,
+                    settings=settings, simplace_overrides=overrides,
+                )
+            except ValueError as error:
+                # A region the stage's split never scores has nothing to fit.
+                print(f"region {region:02d} {stage:<9} skipped: {error}")
+                continue
+            print(f"region {region:02d} {stage:<9} best trial {summary['trial']} "
+                  f"({summary['source']}): val loss {summary.get('val/loss', float('nan')):.4g}")
     return 0
 
 
@@ -645,6 +725,20 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Build the regions, observations and weather cache, report them "
         "and stop. What to run first on a new export.",
     )
+    calibrate.add_argument(
+        "--regions", type=int, nargs="+",
+        help="Calibrate only these region ids (the regions are the full run's).",
+    )
+    calibrate.add_argument(
+        "--split-from", type=Path,
+        help="Reuse <dir>/<stage>_split.parquet instead of drawing a split, so "
+        "a run over fewer regions holds out the same unit-years.",
+    )
+    calibrate.add_argument(
+        "--cache-dir", type=Path,
+        help="Another run's weather cache, read-only (default <out-dir>/weather_cache, "
+        "built if missing). Fails rather than rebuilding one that does not cover the pool.",
+    )
     calibrate.set_defaults(func=_cmd_calibrate, no_management=False)
 
     benchmark = sub.add_parser(
@@ -663,7 +757,13 @@ def _build_parser() -> argparse.ArgumentParser:
     benchmark.add_argument("--pep725", type=Path)
     benchmark.add_argument(
         "--out-dir", type=Path,
-        help="Calibration output directory whose weather cache is (re)used.",
+        help="Scratch directory prepare() writes its pool and observations to. "
+        "Never a production calibration: prepare() overwrites both.",
+    )
+    benchmark.add_argument(
+        "--cache-dir", type=Path,
+        help="An existing weather cache to read (default <out-dir>/weather_cache). "
+        "Reused read-only when it covers the pool at the same window length.",
     )
     benchmark.add_argument(
         "--start-doy", type=int, default=200,
@@ -673,16 +773,33 @@ def _build_parser() -> argparse.ArgumentParser:
         "--batch-sizes", help="Comma-separated target cell-years, e.g. 64,256,1024,4096.",
     )
     benchmark.add_argument("--devices", default="cpu", help="e.g. cpu,cuda")
-    benchmark.add_argument("--modes", default="loader,forward,fwd+bwd")
+    benchmark.add_argument("--modes", default="loader,forward,fwd+bwd",
+                           help="Any of loader,forward,fwd+bwd,step.")
     benchmark.add_argument(
         "--region-packed", action="store_true",
         help="Time one-region batches instead of mixed ones.",
     )
     benchmark.add_argument("--repeats", type=int, default=2)
     benchmark.add_argument(
+        "--production", action="store_true",
+        help="Time the production runner (torchcrop.run: two-pass run_batch, its "
+        "own batching and weather I/O) instead of calibration batches.",
+    )
+    benchmark.add_argument("--years", type=int, nargs=2, default=[2000, 2024],
+                           help="Harvest years for --production.")
+    benchmark.add_argument(
+        "--n-batches", type=int, default=1,
+        help="Batches per size, largest first; all of them go to the pass log.",
+    )
+    benchmark.add_argument(
+        "--steps", type=int, default=0,
+        help="Passes in `step` mode (add `step` to --modes): one Adam step per "
+        "batch per pass, loss logged per pass and batch.",
+    )
+    benchmark.add_argument(
         "--simplace-runs", type=Path, nargs="*",
-        help="<run>/simplace (or simplace_regions/region_NN) directories whose "
-        "log/sp_*.out task timings to read.",
+        help="Run directories whose SIMPLACE task logs to read: production "
+        "runs (logs/sp_*.out) or <run>/simplace with log/sp_*.out.",
     )
     benchmark.add_argument("--output", type=Path, required=True, help="Parquet to write.")
     benchmark.add_argument(
@@ -690,7 +807,62 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Add to an existing --output, e.g. a GPU job after a CPU one.",
     )
     benchmark.add_argument("--threads", type=int)
+    benchmark.add_argument(
+        "--io-processes", type=int,
+        help="--production: weather-reader processes reading ahead of the model "
+        "(torchcrop.io_processes; 0 reads in-process between model calls).")
     benchmark.set_defaults(func=_cmd_benchmark, no_management=False)
+
+    simplace_calibrate = sub.add_parser(
+        "simplace-calibrate",
+        help="Calibrate SIMPLACE per region with Optuna, scored with torchcrop's "
+        "loss terms on the calibration run's pool, observations and split.",
+    )
+    simplace_calibrate.add_argument("--config", type=Path, help="Run configuration YAML (SIMPLACE block).")
+    simplace_calibrate.add_argument("--export", type=Path, help="Export directory.")
+    simplace_calibrate.add_argument("--composition", type=Path)
+    simplace_calibrate.add_argument(
+        "--calibration-dir", type=Path, required=True,
+        help="A 'cm4eu calibrate' output: pool.parquet, observations.parquet, "
+        "<stage>_split.parquet and <stage>/crops/ (the warm start).",
+    )
+    simplace_calibrate.add_argument(
+        "--crop-file", type=Path, required=True,
+        help="The harmonised SUSTAg crop_wheat.yaml torchcrop started from.",
+    )
+    simplace_calibrate.add_argument("--out-dir", type=Path, required=True)
+    simplace_calibrate.add_argument(
+        "--region", nargs="+", default=["all"], help="Region ids, or 'all'.",
+    )
+    simplace_calibrate.add_argument(
+        "--stage", default="all", choices=["phenology", "yield", "all"],
+        help="'all' runs phenology then yield per region; yield carries the "
+        "region's SIMPLACE phenology best.",
+    )
+    simplace_calibrate.add_argument("--trials", type=int, default=40, help="Per region and stage.")
+    simplace_calibrate.add_argument("--startup-trials", type=int, default=10,
+                                    help="Random trials before TPE takes over.")
+    simplace_calibrate.add_argument("--seed", type=int, default=0)
+    simplace_calibrate.add_argument("--workers", type=int, default=24, help="JVMs per trial.")
+    simplace_calibrate.add_argument("--java-heap", default="4g", help="Per JVM; '' keeps the launcher's.")
+    simplace_calibrate.add_argument("--java-image", type=Path,
+                                    help="glibc Java image (simplace.java_image).")
+    simplace_calibrate.add_argument("--simplace-dir", type=Path,
+                                    help="The image's /simplace, copied out (simplace.simplace_dir).")
+    simplace_calibrate.add_argument("--cells-per-unit", type=int, default=4,
+                                    help="Pooled cells kept per unit (0 = all of them).")
+    simplace_calibrate.add_argument("--spinup-years", type=int, default=2)
+    simplace_calibrate.add_argument(
+        "--no-heading", action="store_true",
+        help="Skip daily output; the heading (DVS 0.87) term is then dropped.",
+    )
+    simplace_calibrate.add_argument(
+        "--no-warm-start", action="store_true",
+        help="Do not try torchcrop's calibrated values: start only where torchcrop starts.",
+    )
+    simplace_calibrate.add_argument("--keep-trials", action="store_true",
+                                    help="Keep every trial's workspace and raw output.")
+    simplace_calibrate.set_defaults(func=_cmd_simplace_calibrate, no_management=False)
 
     export_regions = sub.add_parser(
         "export-regions",
@@ -811,6 +983,10 @@ def _build_parser() -> argparse.ArgumentParser:
     step.add_argument("--torchcrop", type=Path)
     step.add_argument("--out-dir", type=Path, required=True)
     smoke_parser.set_defaults(func=_cmd_smoke)
+
+    from cropmodelling4eu.sowing.cli import add_parser as add_sowing_parser
+
+    add_sowing_parser(sub)
     return parser
 
 

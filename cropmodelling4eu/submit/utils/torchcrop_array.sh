@@ -67,6 +67,13 @@ if [ -n "${TC_SOWING_FILE:-}" ]; then
     echo "Sowing dates : ${TC_SOWING_FILE} (SIMPLACE-simulated)"
 fi
 
+CELLS_ARG=()
+if [ -n "${TC_CELLS_FILE:-}" ]; then
+    [ -f "${TC_CELLS_FILE}" ] || { echo "ERROR: TC_CELLS_FILE=${TC_CELLS_FILE} does not exist" >&2; exit 1; }
+    CELLS_ARG=(--cells-file "${TC_CELLS_FILE}")
+    echo "Domain       : ${TC_CELLS_FILE}"
+fi
+
 DAILY_ARG=()
 if [ "${TC_DAILY:-0}" -eq 1 ]; then
     # shellcheck disable=SC2206
@@ -87,10 +94,12 @@ srun --cpu-bind=none python -m cropmodelling4eu.torchcrop.run \
     --batch-size "${TC_BATCH_SIZE}" \
     --io-workers "${TC_IO_WORKERS}" \
     --torch-threads "${TC_TORCH_THREADS}" \
+    --shard-by "${TC_SHARD_BY:-cells}" \
     --device cpu \
     ${CROP_ARG[@]:+"${CROP_ARG[@]}"} \
     ${REGION_ARG[@]:+"${REGION_ARG[@]}"} \
     ${SOWING_ARG[@]:+"${SOWING_ARG[@]}"} \
+    ${CELLS_ARG[@]:+"${CELLS_ARG[@]}"} \
     ${DAILY_ARG[@]:+"${DAILY_ARG[@]}"}
 STATUS=$?
 

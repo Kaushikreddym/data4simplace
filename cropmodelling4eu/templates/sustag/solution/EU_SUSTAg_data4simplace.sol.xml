@@ -125,6 +125,14 @@ WIKI_END</description>
     <var id="vSowTmin7Max" datatype="DOUBLE" unit="degC" description="rule 1: sow if the 7-day mean minimum temperature is at or below this value">12.0</var>
     <var id="vSowRain3Sum" datatype="DOUBLE" unit="mm" description="rule 2: sow if the accumulated rainfall of the last 3 days is at or above this value">20.0</var>
     <var id="vSowMoistFracAW" datatype="DOUBLE" unit="-" description="rule 3: sow if top-5cm volumetric soil moisture is at or above wilting point plus this fraction of plant-available water (FC-WP)">0.5</var>
+    <!-- Rule mode. 0 = the winter-cereal rule above (any of: cool, wet, moist), the default.
+         1 = the warm-soil rule a spring crop needs: the 7-day mean temperature at or above
+         vSowTmean7Min AND the top 5 cm no wetter than WP + vSowMoistMaxFracAW*(FC-WP).
+         Under mode 0, "Tmin7 le 12" is true on every April day, so a spring window would
+         always sow on its first day. -->
+    <var id="vSowRuleMode" datatype="INT" unit="-" description="0 = winter-cereal rule (cool OR wet OR moist); 1 = warm-soil rule (warm AND not waterlogged)">0</var>
+    <var id="vSowTmean7Min" datatype="DOUBLE" unit="degC" description="mode 1: sow once the 7-day mean air temperature is at or above this value">10.0</var>
+    <var id="vSowMoistMaxFracAW" datatype="DOUBLE" unit="-" description="mode 1: do not sow while top-5cm moisture exceeds wilting point plus this fraction of plant-available water">0.9</var>
 
   </variables>
   <!-- __________________________________I N P U T S______________________________________________________________________________ -->
@@ -228,6 +236,15 @@ WIKI_END</description>
       <divider>,</divider>
       <filename>${_OUTPUTDIR_}/yearly/${vLocationId}_yearly.csv</filename>
     </interface>
+    <!-- Per-cell daily crop trajectory, crop days only (see the CropDaily
+         output). Same file convention as Brandenburg's daily output, which
+         cropmodelling4eu.evaluation.germany.load_simplace_daily reads:
+         <vLocationID>_daily.csv, ";"-separated, DATE/DOY/DevStage. -->
+    <interface id="CropDaily" type="CSV">
+      <poolsize>100</poolsize>
+      <divider>;</divider>
+      <filename>${_OUTPUTDIR_}/daily/${vLocationId}_daily.csv</filename>
+    </interface>
     <!-- Daily sowing-trigger debug output. Enable for a few test grids only (one row per day is very large over all Europe). -->
     <interface id="SowingDebugDaily" type="CSV">
       <poolsize>1000</poolsize>
@@ -308,6 +325,14 @@ WIKI_END</description>
          es(Tmin) dewpoint approximation, which is what the Brandenburg
          solution uses for e_a unconditionally.
 
+         Temperatures are put back in order, min <= mean <= max, by taking the
+         smallest, middle and largest of the three. The bias-corrected CMIP6
+         exports correct each variable independently and invert ~1.2% of days;
+         on such a day the diurnal model drives transpiration negative, NNI goes
+         NaN and the carried-over soil state stays NaN for the rest of the run
+         (MIROC6/hist-aer: 34 179 of 60 658 cells, 2026-11-09). Every component
+         therefore reads weather_conv.tmin/tmax, never the raw weather.* pair.
+
          SQL, not a rule transformer, because EXP() and CASE are needed and this
          is the same transformer class the Brandenburg run already relies on. -->
     <!-- resource="weather" documents its source explicitly, matching every
@@ -318,6 +343,7 @@ WIKI_END</description>
       <header>
         <res id="CURRENTDATE" datatype="DATE" key="CURRENT.DATE" />
         <res id="tmin" unit="°C" datatype="DOUBLE" />
+        <res id="tmean" unit="°C" datatype="DOUBLE" />
         <res id="tmax" unit="°C" datatype="DOUBLE" />
         <res id="rain" unit="mm" datatype="DOUBLE" />
         <res id="srad" unit="MJ*m**-2" datatype="DOUBLE" />
@@ -326,8 +352,9 @@ WIKI_END</description>
       </header>
       <input id="statement">SELECT
         CURRENTDATE,
-        tmin,
-        tmax,
+        CASE WHEN tmin &lt;= tmax AND tmin &lt;= tmean THEN tmin WHEN tmax &lt;= tmean THEN tmax ELSE tmean END AS tmin,
+        tmin + tmean + tmax - (CASE WHEN tmin &lt;= tmax AND tmin &lt;= tmean THEN tmin WHEN tmax &lt;= tmean THEN tmax ELSE tmean END) - (CASE WHEN tmax &gt;= tmin AND tmax &gt;= tmean THEN tmax WHEN tmin &gt;= tmean THEN tmin ELSE tmean END) AS tmean,
+        CASE WHEN tmax &gt;= tmin AND tmax &gt;= tmean THEN tmax WHEN tmin &gt;= tmean THEN tmin ELSE tmean END AS tmax,
         CASE WHEN rain &lt; -99 THEN 0.0 ELSE rain END AS rain,
         CASE WHEN srad_wm2 &lt; -99 THEN 0.0 ELSE srad_wm2 * 0.0864 END AS srad,
         CASE WHEN rhumd &lt; 0
@@ -913,14 +940,24 @@ WIKI_END</description>
       <description title="Rolling climate window for rule-based sowing">Short daily buffers of minimum temperature and rainfall shift back one day each step; from them the 7-day mean minimum temperature, the 3-day accumulated rainfall and the volumetric soil moisture of the top 5 cm layer are derived.</description>
       <process>
         <!-- minimum temperature buffer: Tmin0 = today, Tmin1..Tmin5 = 1..5 days ago -->
-        <var id="Tmin0" datatype="DOUBLE" rule="${weather.tmin}" />
+        <var id="Tmin0" datatype="DOUBLE" rule="${weather_conv.tmin}" />
         <var id="Tmin1" datatype="DOUBLE" rule="${SowingWindowClimate.Tmin0}" />
         <var id="Tmin2" datatype="DOUBLE" rule="${SowingWindowClimate.Tmin1}" />
         <var id="Tmin3" datatype="DOUBLE" rule="${SowingWindowClimate.Tmin2}" />
         <var id="Tmin4" datatype="DOUBLE" rule="${SowingWindowClimate.Tmin3}" />
         <var id="Tmin5" datatype="DOUBLE" rule="${SowingWindowClimate.Tmin4}" />
+        <!-- maximum temperature buffer, as for Tmin: the warm-soil rule (vSowRuleMode 1) needs the daily mean -->
+        <var id="Tmax0" datatype="DOUBLE" rule="${weather_conv.tmax}" />
+        <var id="Tmax1" datatype="DOUBLE" rule="${SowingWindowClimate.Tmax0}" />
+        <var id="Tmax2" datatype="DOUBLE" rule="${SowingWindowClimate.Tmax1}" />
+        <var id="Tmax3" datatype="DOUBLE" rule="${SowingWindowClimate.Tmax2}" />
+        <var id="Tmax4" datatype="DOUBLE" rule="${SowingWindowClimate.Tmax3}" />
+        <var id="Tmax5" datatype="DOUBLE" rule="${SowingWindowClimate.Tmax4}" />
         <!-- 7-day mean minimum temperature (today plus the six buffered days) -->
-        <var id="Avg7Tmin" datatype="DOUBLE" rule="if(check:isNull(${SowingWindowClimate.Tmin5})) { ${weather.tmin} } else { (${weather.tmin} + ${SowingWindowClimate.Tmin0} + ${SowingWindowClimate.Tmin1} + ${SowingWindowClimate.Tmin2} + ${SowingWindowClimate.Tmin3} + ${SowingWindowClimate.Tmin4} + ${SowingWindowClimate.Tmin5}) / 7.0 }" />
+        <var id="Avg7Tmin" datatype="DOUBLE" rule="if(check:isNull(${SowingWindowClimate.Tmin5})) { ${weather_conv.tmin} } else { (${weather_conv.tmin} + ${SowingWindowClimate.Tmin0} + ${SowingWindowClimate.Tmin1} + ${SowingWindowClimate.Tmin2} + ${SowingWindowClimate.Tmin3} + ${SowingWindowClimate.Tmin4} + ${SowingWindowClimate.Tmin5}) / 7.0 }" />
+        <!-- 7-day mean air temperature, (Tmin + Tmax) / 2 over the same seven days. Built from the raw buffers,
+             not from Avg7Tmin: a same-component reference reads the previous day's value. -->
+        <var id="Avg7Tmean" datatype="DOUBLE" rule="if(check:isNull(${SowingWindowClimate.Tmin5}) or check:isNull(${SowingWindowClimate.Tmax5})) { (${weather_conv.tmin} + ${weather_conv.tmax}) / 2.0 } else { (${weather_conv.tmin} + ${weather_conv.tmax} + ${SowingWindowClimate.Tmin0} + ${SowingWindowClimate.Tmax0} + ${SowingWindowClimate.Tmin1} + ${SowingWindowClimate.Tmax1} + ${SowingWindowClimate.Tmin2} + ${SowingWindowClimate.Tmax2} + ${SowingWindowClimate.Tmin3} + ${SowingWindowClimate.Tmax3} + ${SowingWindowClimate.Tmin4} + ${SowingWindowClimate.Tmax4} + ${SowingWindowClimate.Tmin5} + ${SowingWindowClimate.Tmax5}) / 14.0 }" />
         <!-- rainfall buffer: Rain0 = today, Rain1 = yesterday -->
         <var id="Rain0" datatype="DOUBLE" rule="${weather.rain}" />
         <var id="Rain1" datatype="DOUBLE" rule="${SowingWindowClimate.Rain0}" />
@@ -938,8 +975,8 @@ WIKI_END</description>
       <process>
         <var id="HasSown" datatype="BOOLEAN" rule="if(${CURRENT.DOY} == ${vSowWindowStartDOY}) { false } else { if(${SowingRule.DoSow} or ${SowingRule.HasSown}) { true } else { false } }" />
         <!-- RuleMet = true when at least one weather rule holds today (used to flag forced vs rule-driven sowing) -->
-        <var id="RuleMet" datatype="BOOLEAN" rule="${SowingWindowClimate.Avg7Tmin} le ${vSowTmin7Max} or ${SowingWindowClimate.Rain3Sum} ge ${vSowRain3Sum} or ( not check:isNull(${SowingWindowClimate.MoistTop5}) and ${SowingWindowClimate.MoistTop5} ge (${SowingWindowClimate.WP5} + ${vSowMoistFracAW} * (${SowingWindowClimate.FC5} - ${SowingWindowClimate.WP5})) )" />
-        <var id="DoSow" datatype="BOOLEAN" rule="if( ${CURRENT.DOY} ge ${vSowWindowStartDOY} and ${CURRENT.DOY} le (${vSowWindowStartDOY} + ${vSowWindowLengthDays}) and not (${SowingRule.HasSown} or ${SowingRule.DoSow}) and not ${CropManagement.WithCrop} and ( ${SowingWindowClimate.Avg7Tmin} le ${vSowTmin7Max} or ${SowingWindowClimate.Rain3Sum} ge ${vSowRain3Sum} or ( not check:isNull(${SowingWindowClimate.MoistTop5}) and ${SowingWindowClimate.MoistTop5} ge (${SowingWindowClimate.WP5} + ${vSowMoistFracAW} * (${SowingWindowClimate.FC5} - ${SowingWindowClimate.WP5})) ) or (${vSowForceAtWindowEnd} == 1 and ${CURRENT.DOY} == (${vSowWindowStartDOY} + ${vSowWindowLengthDays})) ) ) { true } else { false }" />
+        <var id="RuleMet" datatype="BOOLEAN" rule="( ${vSowRuleMode} == 0 and ( ${SowingWindowClimate.Avg7Tmin} le ${vSowTmin7Max} or ${SowingWindowClimate.Rain3Sum} ge ${vSowRain3Sum} or ( not check:isNull(${SowingWindowClimate.MoistTop5}) and ${SowingWindowClimate.MoistTop5} ge (${SowingWindowClimate.WP5} + ${vSowMoistFracAW} * (${SowingWindowClimate.FC5} - ${SowingWindowClimate.WP5})) ) ) ) or ( ${vSowRuleMode} == 1 and ( ${SowingWindowClimate.Avg7Tmean} ge ${vSowTmean7Min} and ( check:isNull(${SowingWindowClimate.MoistTop5}) or ${SowingWindowClimate.MoistTop5} le (${SowingWindowClimate.WP5} + ${vSowMoistMaxFracAW} * (${SowingWindowClimate.FC5} - ${SowingWindowClimate.WP5})) ) ) )" />
+        <var id="DoSow" datatype="BOOLEAN" rule="if( ${CURRENT.DOY} ge ${vSowWindowStartDOY} and ${CURRENT.DOY} le (${vSowWindowStartDOY} + ${vSowWindowLengthDays}) and not (${SowingRule.HasSown} or ${SowingRule.DoSow}) and not ${CropManagement.WithCrop} and ( ( ${vSowRuleMode} == 0 and ( ${SowingWindowClimate.Avg7Tmin} le ${vSowTmin7Max} or ${SowingWindowClimate.Rain3Sum} ge ${vSowRain3Sum} or ( not check:isNull(${SowingWindowClimate.MoistTop5}) and ${SowingWindowClimate.MoistTop5} ge (${SowingWindowClimate.WP5} + ${vSowMoistFracAW} * (${SowingWindowClimate.FC5} - ${SowingWindowClimate.WP5})) ) ) ) or ( ${vSowRuleMode} == 1 and ( ${SowingWindowClimate.Avg7Tmean} ge ${vSowTmean7Min} and ( check:isNull(${SowingWindowClimate.MoistTop5}) or ${SowingWindowClimate.MoistTop5} le (${SowingWindowClimate.WP5} + ${vSowMoistMaxFracAW} * (${SowingWindowClimate.FC5} - ${SowingWindowClimate.WP5})) ) ) ) or (${vSowForceAtWindowEnd} == 1 and ${CURRENT.DOY} == (${vSowWindowStartDOY} + ${vSowWindowLengthDays})) ) ) { true } else { false }" />
         <!-- Per-season flag (1/0): was the sowing forced by the deadline (no rule met) rather than rule-driven? Reset when the window opens. -->
         <var id="SeasonSowForced" datatype="INT" rule="if(${CURRENT.DOY} == ${vSowWindowStartDOY}) { 0 } else { if(${SowingRule.DoSow} and not ${SowingRule.RuleMet}) { 1 } else { if(check:isNull(${SowingRule.SeasonSowForced})) { 0 } else { ${SowingRule.SeasonSowForced} } } }" />
       </process>
@@ -995,8 +1032,8 @@ WIKI_END</description>
       <input id="cVERSAT" source="crop.VERSAT" />
       <input id="cVERNRT" source="crop.VERNRT" />
       <input id="iDDLP" source="at.PhotoperiodicDayLength" />
-      <input id="iTMIN" source="weather.tmin" />
-      <input id="iTMAX" source="weather.tmax" />
+      <input id="iTMIN" source="weather_conv.tmin" />
+      <input id="iTMAX" source="weather_conv.tmax" />
       <input id="iDoSow" source="DefaultManagement.DoSow" />
       <input id="iDoHarvest" source="HarvestManagement.DoHarvest" />
     </simcomponent>
@@ -1004,8 +1041,8 @@ WIKI_END</description>
     <simcomponent id="NetRadiation" class="net.simplace.sim.components.radiation.fao56.NetRadiationFromSolarRadiation">
       <input id="cLatitude" source="vLatitude" />
       <input id="cUseAngstromVariables" datatype="BOOLEAN">true</input>
-      <input id="iTMax" source="weather.tmax" />
-      <input id="iTMin" source="weather.tmin" />
+      <input id="iTMax" source="weather_conv.tmax" />
+      <input id="iTMin" source="weather_conv.tmin" />
       <input id="iActualVapourPressure" source="weather_conv.vprsd" />
       <input id="iSolarRadiation" source="weather_conv.srad" />
     </simcomponent>
@@ -1017,15 +1054,15 @@ WIKI_END</description>
       <input id="cRUETB" source="crop.RUETB" />
       <input id="cTMPFTB" source="crop.TMPFTB" />
       <input id="cTMNFTB" source="crop.TMNFTB" />
-      <input id="iTMIN" source="weather.tmin" />
-      <input id="iTMAX" source="weather.tmax" />
+      <input id="iTMIN" source="weather_conv.tmin" />
+      <input id="iTMAX" source="weather_conv.tmax" />
       <input id="iDVS" source="Phenology.sDVS" />
     </simcomponent>
 
     <simcomponent id="ET0" class="net.simplace.sim.components.evapotran.fao56.ReferenceETPM">
       <input id="cAltitude" source="vAltitude" />
-      <input id="iTMax" source="weather.tmax" />
-      <input id="iTMin" source="weather.tmin" />
+      <input id="iTMax" source="weather_conv.tmax" />
+      <input id="iTMin" source="weather_conv.tmin" />
       <input id="iWindspeed" source="ToDiurnal.Wind_m_s" />
       <input id="iNetRadiation" source="NetRadiation.NetRadiation" />
       <input id="iActualVapourPressure" source="weather_conv.vprsd" />
@@ -1150,8 +1187,8 @@ WIKI_END</description>
       <input id="cSandPercentage" source="soil_transform.sand" />
       <input id="iSoilTemperature" source="STMPsimCalculator.SoilTempArray" />
       <input id="iDryFactor" source="SlimWater.DRYFAC" />
-      <input id="iTMIN" source="weather.tmin" />
-      <input id="iTMAX" source="weather.tmax" />
+      <input id="iTMIN" source="weather_conv.tmin" />
+      <input id="iTMAX" source="weather_conv.tmax" />
       <input id="iDevStage" source="Phenology.sDVS" />
       <input id="iRWRT" source="SeedsToSprouts.RWRT" />
       <input id="iIsHarvest" source="HarvestManagement.DoHarvest" />
@@ -1352,8 +1389,8 @@ WIKI_END</description>
 <!--       <input id="cVERSAT" source="crop.VERSAT" /> -->
 <!--       <input id="cVERNRT" source="crop.VERNRT" /> -->
 <!--       <input id="iDDLP" source="at.PhotoperiodicDayLength" /> -->
-<!--       <input id="iTMIN" source="weather.tmin" /> -->
-<!--       <input id="iTMAX" source="weather.tmax" /> -->
+<!--       <input id="iTMIN" source="weather_conv.tmin" /> -->
+<!--       <input id="iTMAX" source="weather_conv.tmax" /> -->
 <!--       <input id="iDoSow" source="DefaultManagement.DoSow" /> -->
 <!--       <input id="iDoHarvest" source="HarvestManagement.DoHarvest" /> -->
 <!--     </simcomponent> -->
@@ -1385,8 +1422,8 @@ WIKI_END</description>
 <!--       <input id="cRUETB" source="crop.RUETB" /> -->
 <!--       <input id="cTMPFTB" source="crop.TMPFTB" /> -->
 <!--       <input id="cTMNFTB" source="crop.TMNFTB" /> -->
-<!--       <input id="iTMIN" source="weather.tmin" /> -->
-<!--       <input id="iTMAX" source="weather.tmax" /> -->
+<!--       <input id="iTMIN" source="weather_conv.tmin" /> -->
+<!--       <input id="iTMAX" source="weather_conv.tmax" /> -->
 <!--       <input id="iDVS" source="Phenology.sDVS" /> -->
 <!--     </simcomponent> -->
 
@@ -1417,8 +1454,8 @@ WIKI_END</description>
       <input id="cNLUE" source="crop.NLUE" />
       <input id="cNPART" source="crop.NPART" />
       <input id="cNSLA" source="crop.NSLA" />
-      <input id="iTMIN" source="weather.tmin" />
-      <input id="iTMAX" source="weather.tmax" />
+      <input id="iTMIN" source="weather_conv.tmin" />
+      <input id="iTMAX" source="weather_conv.tmax" />
       <input id="iAVRAD" source="Irradiation.AVRAD" />
       <input id="iTRANRF" source="LintulWaterStress.TRANRF" />
       <input id="iRDM" source="soil.maxRootingDepth" />
@@ -1543,8 +1580,8 @@ WIKI_END</description>
     <simcomponent id="SnowCoverCalculator" class="net.simplace.sim.components.soil.temperature.SnowCoverCalculator">
       <input id="iDoInitialize" source="DefaultManagement.ReInitialize" />
       <input id="cCarbonContent" source="vCarbonContent" />
-      <input id="iTempMax" source="weather.tmax" />
-      <input id="iTempMin" source="weather.tmin" />
+      <input id="iTempMax" source="weather_conv.tmax" />
+      <input id="iTempMin" source="weather_conv.tmin" />
       <input id="iRadiation" source="weather_conv.srad" />
       <input id="iRAIN" source="IrrigationManagement.IrrigationOrRain" />
       <input id="iCropResidues" source="Biomass.sTAGB" />
@@ -1606,7 +1643,7 @@ WIKI_END</description>
       <input id="z_crop" source="crop.vZ_crop" />
       <input id="rc" source="rcCO2.vrc" />
       <input id="TempHourly" source="diurnal.Temperature" />
-      <input id="iTMax" source="weather.tmax" />
+      <input id="iTMax" source="weather_conv.tmax" />
       <input id="iVAP" source="weather_conv.vprsd" />
       <input id="RNCsHourly" source="Radiationhourly.NetRadiation" />
       <input id="HaveHeaters" source="vHaveHeaters" />
@@ -1640,12 +1677,12 @@ WIKI_END</description>
   </simmodel>
 
   <outputs>
-    <!-- Daily trace of the sowing-trigger variables, for debugging on a few test grids. Comment out (or point at a small grid subset) before the full Europe run. -->
+    <!-- Daily trace of the sowing-trigger variables, for debugging on a few test grids. Off for production: every concurrent JVM appends to this one file, so it comes out with lost and interleaved rows, and it is ~7x the size of all other output. Uncomment for a small grid subset only.
     <output id="SowingDebug" interface="SowingDebugDaily" frequence="DAILY">
       <header>
         <out id="Date" datatype="DATE" mode="LAST" rule="CURRENT.DATE" />
         <out id="DOY" datatype="INT" mode="LAST" rule="CURRENT.DOY" />
-        <out id="TminRaw" datatype="DOUBLE" mode="LAST" rule="weather.tmin" />
+        <out id="TminRaw" datatype="DOUBLE" mode="LAST" rule="weather_conv.tmin" />
         <out id="RainRaw" datatype="DOUBLE" mode="LAST" rule="weather.rain" />
         <out id="Avg7Tmin" datatype="DOUBLE" mode="LAST" rule="SowingWindowClimate.Avg7Tmin" />
         <out id="Rain3Sum" datatype="DOUBLE" mode="LAST" rule="SowingWindowClimate.Rain3Sum" />
@@ -1658,7 +1695,7 @@ WIKI_END</description>
         <out id="SowingDOY" datatype="INT" mode="LAST" rule="SowingDate.SowingDOY" />
         <out id="DVS" datatype="DOUBLE" mode="LAST" rule="Phenology.sDVS" />
       </header>
-    </output>
+    </output> -->
     <output id="WLOutputs" interface="WLOutput" frequence="BOOLEAN" resetrule="DefaultManagement.DoSow" rule="HarvestManagement.DoHarvest" cachesize="2">
       <header>
        <out id="vCrop" datatype="CHAR" rule="vCrop" />
@@ -1733,5 +1770,27 @@ WIKI_END</description>
             <out id="ActualTranspiration" datatype="DOUBLE" rule="SlimWater.Transpiration" />
         </header>
 	</output-->
+    <!-- The emulator's daily targets, paired with torchcrop's DAILY_VARIABLES
+         (cropmodelling4eu.torchcrop.run). Written only while a crop is on the
+         field, so the fallow and spin-up never reach disk; collect trims to
+         0 < DVS < 2 as torchcrop does. AGB and WSO are g/m2 * 0.01 = t/ha,
+         the same factor torchcrop applies. WSO is BiomassTranslocation.WSO,
+         the series Yield_noHS takes its last value from, so the daily grain
+         weight at maturity is the yearly yield. SowingDOY is the realized,
+         latched date, so days after sowing count from sowing, not emergence. -->
+    <output id="CropDaily" interface="CropDaily" frequence="BOOLEAN" rule="CropManagement.WithCrop" cachesize="2">
+      <header>
+        <out id="DATE" datatype="DATE" mode="LAST" rule="CURRENT.DATE" />
+        <out id="DOY" datatype="INT" mode="LAST" rule="CURRENT.DOY" />
+        <out id="SowingDOY" datatype="INT" mode="LAST" rule="SowingDate.SowingDOY" />
+        <out id="DevStage" datatype="DOUBLE" mode="LAST" rule="Phenology.sDVS" />
+        <out id="LAI" datatype="DOUBLE" mode="LAST" rule="Biomass.sLAI" />
+        <out id="AGB" datatype="DOUBLE" mode="LAST" rule="${Biomass.sTAGB} * 0.01" />
+        <out id="WSO" datatype="DOUBLE" mode="LAST" rule="${BiomassTranslocation.WSO} * 0.01" />
+        <out id="TRANRF" datatype="DOUBLE" mode="LAST" rule="LintulWaterStress.TRANRF" />
+        <out id="NNI" datatype="DOUBLE" mode="LAST" rule="NPKDemandSlimNitrogen.NNI" />
+        <out id="TRAN" datatype="DOUBLE" mode="LAST" rule="SlimWater.Transpiration" />
+      </header>
+    </output>
   </outputs>
 </solution>

@@ -89,7 +89,7 @@ if [[ "${SMOKE}" -eq 1 ]]; then
     fi
 
     cm4eu smoke config \
-        --config "${SP_PROJECT_DIR}/config.yaml" \
+        --config "${SP_CONFIG}" \
         --out "${SMOKE_CONFIG}" \
         --start-year "${SP_SMOKE_START}" \
         --end-year "${SP_SMOKE_END}" || exit 1

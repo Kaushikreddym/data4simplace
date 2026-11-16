@@ -50,6 +50,8 @@ nav:
       - 2 · The 10 km target grid: examples/02_target_grid.ipynb
       - 3 · Pedotransfer functions: examples/03_pedotransfer_functions.ipynb
       - 4 · Running the full pipeline: examples/04_full_pipeline.ipynb
+  - Experiments:
+      - Learned sowing dates: experiments/sowing_network.md
   - API reference:
       - Overview: api/index.md
       - Configuration: api/config.md

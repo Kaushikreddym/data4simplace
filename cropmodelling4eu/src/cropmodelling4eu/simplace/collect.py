@@ -26,14 +26,28 @@ import pandas as pd
 import xarray as xr
 
 from cropmodelling4eu.config import GridConfig
+from cropmodelling4eu.daily import DAILY_KEYS, DailySink
 from cropmodelling4eu.export.cells import id_to_lonlat
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["COLUMN_MAP", "collect_run", "read_yearly", "to_grid"]
+__all__ = ["COLUMN_MAP", "DAILY_FILE", "collect_daily", "collect_run", "daily_frame", "read_yearly", "to_grid"]
 
 #: ``<vLocationID>_yearly.csv``.
 _YEARLY_NAME = re.compile(r"^(\d+)_yearly\.csv$")
+
+#: ``<vLocationID>_daily.csv``, the solution's ``CropDaily`` output.
+_DAILY_NAME = re.compile(r"^(\d+)_daily\.csv$")
+
+#: The collected daily table, beside ``simplace_europe.parquet``.
+DAILY_FILE = "simplace_daily.parquet"
+
+#: ``CropDaily`` column -> the wide daily layout's (torchcrop's DAILY_VARIABLES
+#: names; the solution already writes AGB/WSO in t/ha).
+DAILY_COLUMNS = {
+    "DevStage": "DVS", "LAI": "LAI", "AGB": "AGB", "WSO": "WSO",
+    "TRANRF": "TRANRF", "NNI": "NNI", "TRAN": "TRAN",
+}
 
 #: SIMPLACE column -> the shared schema's, with the factor applied on the way.
 COLUMN_MAP: dict[str, tuple[str, float]] = {
@@ -316,3 +330,66 @@ def collect_run(
         )
         logger.info("Wrote %s", netcdf)
     return parquet
+
+
+def daily_frame(raw: pd.DataFrame, simplace_id: int) -> pd.DataFrame:
+    """One cell's ``CropDaily`` rows in the wide daily layout (:mod:`cropmodelling4eu.daily`).
+
+    Trimmed to ``0 < DVS < 2`` as torchcrop's are. A season is a contiguous run
+    of such days (a calendar gap or a new ``SowingDOY`` starts the next one),
+    labelled with the year its last day falls in. ``das`` counts from the
+    realized sowing date, the latest ``SowingDOY`` on or before the row's date.
+    """
+    date = pd.to_datetime(raw["DATE"], format="%d.%m.%Y")
+    dvs = raw["DevStage"].to_numpy(float)
+    crop = (dvs > 0.0) & (dvs < 2.0)
+    if not crop.any():
+        return pd.DataFrame(columns=[*DAILY_KEYS, *DAILY_COLUMNS.values()])
+    raw, date = raw.loc[crop], date[crop]
+    sow_doy = raw["SowingDOY"].to_numpy(np.int64)
+    new_season = np.r_[True, (np.diff(date.to_numpy()) != np.timedelta64(1, "D"))
+                       | (np.diff(sow_doy) != 0)]
+    season = np.cumsum(new_season)
+    harvest_year = pd.Series(date.dt.year.to_numpy()).groupby(season).transform("max")
+
+    doy = date.dt.dayofyear.to_numpy(np.int64)
+    sow_year = date.dt.year.to_numpy(np.int64) - (doy < sow_doy)
+    sown = pd.to_datetime({"year": sow_year, "month": 1, "day": 1}) + pd.to_timedelta(
+        sow_doy - 1, unit="D"
+    )
+
+    present = {k: v for k, v in DAILY_COLUMNS.items() if k in raw.columns}
+    return pd.DataFrame(
+        {
+            "SimplaceID": np.full(len(raw), simplace_id, dtype=np.int64),
+            "year": harvest_year.to_numpy(np.int16),
+            "date": date.to_numpy("datetime64[ns]"),
+            "doy": doy.astype(np.int16),
+            "das": ((date.to_numpy() - sown.to_numpy()) // np.timedelta64(1, "D")).astype(np.int16),
+        }
+        | {name: raw[column].to_numpy(np.float32) for column, name in present.items()}
+    )
+
+
+def collect_daily(out_dir: str | Path, target_dir: str | Path) -> Path | None:
+    """Stream every ``<id>_daily.csv`` under ``out_dir`` into :data:`DAILY_FILE`.
+
+    Cell by cell through :class:`~cropmodelling4eu.daily.DailySink`: a CMIP6
+    region holds ~10^8 daily rows, which never need to be in memory at once.
+    Returns ``None`` when the run wrote no daily output.
+    """
+    files = sorted(Path(out_dir).rglob("*_daily.csv"))
+    files = [(f, _DAILY_NAME.match(f.name)) for f in files]
+    files = [(f, int(m.group(1))) for f, m in files if m is not None]
+    if not files:
+        return None
+    sink = DailySink(Path(target_dir) / DAILY_FILE)
+    for path, simplace_id in files:
+        try:
+            raw = pd.read_csv(path, sep=";")
+        except pd.errors.EmptyDataError:
+            continue
+        sink(daily_frame(raw, simplace_id))
+    written = sink.close()
+    logger.info("Wrote %s (%d daily rows from %d files)", written, sink.rows, len(files))
+    return written

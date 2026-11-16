@@ -228,3 +228,20 @@ def test_weather_exporter_drops_unmapped_variables(tmp_path, config):
 
     frame = pd.read_csv(written[0], sep="\t")
     assert "sfcWindmax" not in frame.columns
+
+
+def test_temperatures_are_put_in_order_without_touching_missing_days():
+    from data4simplace.exporters.weather_export import _order_temperatures
+
+    columns = {
+        "TempMin": np.array([1.81, -2.0, np.nan]),
+        "TempMean": np.array([1.97, 5.0, 3.0]),
+        "TempMax": np.array([1.17, 1.0, 9.0]),
+        "Precipitation": np.array([0.6, 0.0, 1.0]),
+    }
+    out = _order_temperatures(columns)
+    np.testing.assert_array_equal(out["TempMin"], [1.17, -2.0, np.nan])
+    np.testing.assert_array_equal(out["TempMean"], [1.81, 1.0, 3.0])
+    np.testing.assert_array_equal(out["TempMax"], [1.97, 5.0, 9.0])
+    assert out["Precipitation"] is columns["Precipitation"]
+    assert _order_temperatures({"TempMin": np.ones(2)}).keys() == {"TempMin"}

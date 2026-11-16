@@ -1504,3 +1504,20 @@ def test_a_worker_killed_mid_batch_raises_instead_of_hanging():
     with parallel.RegionPool(_Calibrator(), _Problem(), (), {}, workers=2) as pool:
         with pytest.raises(RuntimeError, match="worker died"):
             pool.run([pd.DataFrame({"region_id": [1]})])
+
+
+def test_load_split_reuses_assignments_and_drops_unknown_rows(tmp_path) -> None:
+    import pandas as pd
+
+    from cropmodelling4eu.calibration.splits import load_split
+
+    pd.DataFrame({"unit": ["A", "A", "B", "C"], "year": [2017, 2024, 2017, 2017],
+                  "region_id": 1, "split": ["train", "val", "test", "train"]}
+                 ).to_parquet(tmp_path / "phenology_split.parquet")
+    unit_years = pd.DataFrame({"unit": ["A", "A", "B", "D"], "year": [2017, 2024, 2017, 2017],
+                               "region_id": 1})
+    split = load_split(unit_years, tmp_path / "phenology_split.parquet")
+    assert split.train[["unit", "year"]].values.tolist() == [["A", 2017]]
+    assert split.val[["unit", "year"]].values.tolist() == [["A", 2024]]
+    assert split.test["unit"].tolist() == ["B"]
+    assert split.held_out_years == (2024,) and split.held_out_units == ("B",)

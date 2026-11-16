@@ -1,0 +1,41 @@
+# =============================================================================
+# Stage 1 — phenology, grain maize (SUSTAg `MAIZ` block). Same schema as
+# params_phenology.yaml.
+#
+# `idsl` is 0 in the MAIZ block (no photoperiod, no vernalisation), so every
+# vernalisation and photoperiod parameter of the wheat spec is inert here and
+# absent: freed, it would take no gradient and fail the identifiability check.
+#
+# Two dated stages, as for wheat: CLMS emergence (-16.4 d) and CLMS harvest
+# (+4.6 d late against PEP725 BBCH 100, anomaly r 0.80). The emergence anomaly
+# term is off (loss.emergence_anomaly_clms = 0 in the maize config): r 0.35
+# against the ground.
+# =============================================================================
+
+parameters:
+  # --- Tier 1 ---------------------------------------------------------------
+  # MAIZ 90 C.d over tbasem 4. A May mean of 13-15 C gives ~10 C.d per day, so
+  # 90 is ~9 days; the bounds span 5-20 days.
+  crop.tsumem:  {bounds: [50, 200]}
+  # MAIZ 845 / 840 over a 6 C base (DTSMTB), capped at 24 C.d per day.
+  crop.tsum1:   {bounds: [600, 1200]}
+  crop.tsum2:   {bounds: [500, 1100]}
+
+  # --- Tier 2: freed only where a third dated stage is observed -------------
+  # Maize germination base is 6-10 C in the agronomic literature against the
+  # file's 4; correlated with tsumem when emergence is the only early stage.
+  crop.tbasem:  {bounds: [2, 10], tier: 2}
+
+priors:
+  # The SUSTAg values. There is no JRC maize prior on disk.
+  crop.tsumem: {value: 90,  spread: 40}
+  crop.tsum1:  {value: 845, spread: 150}
+  crop.tsum2:  {value: 840, spread: 150}
+
+ratio_priors:
+  # The same near-singular direction as wheat: two dates fix tsum1 + tsum2,
+  # not the split. PEP725 BBCH 51 (tassel) releases it where it exists.
+  - numerator: crop.tsum1
+    denominator: crop.tsum2
+    value: 0.501         # MAIZ 845 / (845 + 840): the trainer scores a / (a + b)
+    spread: 0.06          # the wheat spec's spread

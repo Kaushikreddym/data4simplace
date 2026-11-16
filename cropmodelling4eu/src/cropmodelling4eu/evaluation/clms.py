@@ -83,7 +83,7 @@ def load_phenology(
     years: tuple[int, int] | None = None,
     min_pixels: int = config.CLMS_MIN_PIXELS,
     min_season_share: float = config.CLMS_MIN_SEASON_SHARE,
-    require_split: bool = True,
+    require_split: bool = config.CLMS_REQUIRE_SPLIT,
     path: Path | str | None = None,
 ) -> pd.DataFrame:
     """The observed crop calendar, one row per (unit, year).
